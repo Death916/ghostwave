@@ -1,0 +1,30 @@
+[package]
+name = "ghostwave"
+version = "0.1.0"
+edition = "2024"
+description = "A waveterm-style terminal built on libghostty-vt (Rust), with zellij-style keybindings"
+license = "MIT"
+
+[dependencies]
+# Ghostty terminal emulation, safe Rust bindings (vendored zig build of libghostty-vt)
+libghostty-vt = { version = "0.2.1", features = ["png"] }
+# windowing + rendering (same stack as ghostling-rs)
+macroquad = "0.4.14"
+# PTY handling (forkpty, winsize) — pty module lives under the "term" feature
+nix = { version = "0.31.2", features = ["term", "fs", "signal", "process", "user", "ioctl"] }
+# file previews (images)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+# kitty graphics PNG decode (DecodePng impl in term.rs)
+png = "0.17"
+# config file
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# AI assistant pane (blocking HTTP in a thread)
+ureq = "2.10"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = true
