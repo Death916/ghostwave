@@ -938,6 +938,17 @@ impl App {
         }
         match self.mode {
             Mode::Normal | Mode::Locked => {
+                // Only forward releases for keys the app did NOT consume on
+                // press (bound/entry/quit keys would spam the terminal with
+                // stray release events).
+                let k = kp.key;
+                let m = kp.mods;
+                if keymap::is_quit(k, m)
+                    || keymap::entry_bind(k, m).is_some()
+                    || keymap::global_binds(k, m).is_some()
+                {
+                    return;
+                }
                 if let Some(t) = self.active_term_mut() {
                     let _ = t.handle_key(
                         kp.key,
@@ -1028,6 +1039,12 @@ impl App {
         let Some((pane_id, pane_rect)) = hit else {
             return;
         };
+        // Click focuses the pane (hover alone must not steal focus).
+        if is_mouse_button_pressed(MouseButton::Left) || is_mouse_button_pressed(MouseButton::Right) {
+            if self.current_tab().active != pane_id {
+                self.current_tab_mut().active = pane_id;
+            }
+        }
         self.mouse_pane = Some((self.active_tab, pane_id));
 
         let mods = keymap::current_mods();

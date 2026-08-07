@@ -211,7 +211,7 @@ fn hjkl_dir(k: Key) -> Option<Dir> {
 }
 
 /// Global waveterm-style binds (active in most modes).
-fn global_binds(k: Key, m: Mods) -> Option<Action> {
+pub fn global_binds(k: Key, m: Mods) -> Option<Action> {
     use Key::*;
     Some(match k {
         _ if ctrl_shift(k, m, P) => Action::OpenCommandBar,

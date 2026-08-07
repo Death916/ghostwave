@@ -564,15 +564,19 @@ impl TermPane {
                             has_bg = true;
                         }
 
-                        // Search match highlight (after selection, before draw).
+                        // Search match highlight (after selection, before draw):
+                        // fill the cell bg with the match color, draw the glyph
+                        // in the theme bg for contrast.
                         let matched = self.search.contains(row_idx, col_idx);
 
-                        if has_bg {
+                        if matched {
+                            draw_rectangle(x, y, cell.w as f32, cell.h as f32, color_theme(theme.search_match));
+                        } else if has_bg {
                             draw_rectangle(x, y, cell.w as f32, cell.h as f32, color_theme(bg));
                         }
 
                         let draw_color = if matched {
-                            theme.search_match
+                            theme.bg
                         } else {
                             fg
                         };
