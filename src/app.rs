@@ -780,12 +780,15 @@ impl App {
         let cell = self.cell;
         let pad = self.config.padding;
         let tab = self.current_tab_mut();
-        let rects = tab.pane_rects(content, frames);
-        let zoomed = tab.zoomed.clone();
-        for (id, rect) in rects {
-            if zoomed.contains(&id) {
-                continue;
+        // Zoomed pane gets the full content rect (and a matching grid).
+        let mut rects = tab.pane_rects(content, frames);
+        if !tab.zoomed.is_empty() {
+            rects.retain(|(id, _)| tab.zoomed.contains(id));
+            for (_, r) in rects.iter_mut() {
+                *r = content;
             }
+        }
+        for (id, rect) in rects {
             if let Some(Pane::Term(t)) = tab.panes.get_mut(id) {
                 let cols = ((rect.w - 2.0 * pad) / cell.w as f32).max(1.0) as u16;
                 let rows = ((rect.h - 2.0 * pad) / cell.h as f32).max(1.0) as u16;
