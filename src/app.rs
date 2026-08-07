@@ -390,6 +390,26 @@ impl App {
                 self.active_tab = next;
             }
             Action::Toast(msg) => self.toast(msg),
+            Action::ExitMode => self.mode = Mode::Normal,
+            Action::ConfirmSearch => {
+                // Enter in the search box: switch to Search navigation mode.
+                self.mode = Mode::Search;
+                if let Some(t) = self.active_term_mut() {
+                    t.search.dirty = true;
+                }
+            }
+            Action::ConfirmRename => {
+                let name = std::mem::take(&mut self.rename_buf);
+                let was_tab = self.mode == Mode::RenameTab;
+                self.mode = Mode::Normal;
+                if !name.is_empty() {
+                    if was_tab {
+                        self.current_tab_mut().name = name;
+                    } else if let Some(t) = self.active_term_mut() {
+                        t.name = name;
+                    }
+                }
+            }
         }
     }
 
@@ -1160,6 +1180,16 @@ impl App {
                 if let Pane::Term(t) = pane {
                     t.flush_response();
                 }
+            }
+        }
+
+        // Tab label follows the active pane's OSC title (unless renamed).
+        let tab = self.current_tab_mut();
+        let active = tab.active;
+        if let Some(Pane::Term(t)) = tab.panes.get_mut(active) {
+            let title = t.title();
+            if !title.is_empty() && (tab.name.is_empty() || tab.name.starts_with("Tab ")) {
+                tab.name = title;
             }
         }
     }

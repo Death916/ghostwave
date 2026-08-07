@@ -43,13 +43,13 @@ impl Mode {
     pub fn hints(&self) -> &'static str {
         match self {
             Mode::Normal => "Ctrl+p pane | Ctrl+t tab | Ctrl+n resize | Ctrl+s scroll | Ctrl+h move | Ctrl+o session | Ctrl+g lock | Ctrl+q quit",
-            Mode::Pane => "n new | d down | r right | s stacked | x close | h/j/k/l focus | p cycle | f zoom | z frames | c rename",
-            Mode::Tab => "n new | x close | h/l prev/next | r rename | b break | 1-9 goto | Tab last",
-            Mode::Resize => "h/j/k/l resize | H/J/K/L shrink | =/+ grow | - shrink",
-            Mode::Scroll => "j/k scroll | d/u half page | s search | Ctrl+c bottom | e edit",
-            Mode::Search => "n/p next/prev | c case | w wrap | o whole word | Ctrl+s done",
+            Mode::Pane => "n new | d down | r right | s stacked | x close | h/j/k/l focus | p cycle | f zoom | z frames | c rename | Esc exit",
+            Mode::Tab => "n new | x close | h/l prev/next | r rename | b break | 1-9 goto | Tab last | Esc exit",
+            Mode::Resize => "h/j/k/l resize | H/J/K/L shrink | =/+ grow | - shrink | Esc exit",
+            Mode::Scroll => "j/k scroll | d/u half page | s search | Ctrl+c bottom | e edit | Esc exit",
+            Mode::Search => "n/p next/prev | c case | w wrap | o whole word | Ctrl+s done | Esc exit",
             Mode::EnterSearch => "type to search | Enter done | Esc cancel",
-            Mode::Move => "h/j/k/l move pane | n next | p previous",
+            Mode::Move => "h/j/k/l move pane | n next | p previous | Esc exit",
             Mode::Session => "sessions deferred (durable sessions not implemented)",
             Mode::Locked => "Ctrl+g unlock (input passes through)",
             Mode::RenameTab => "type new tab name | Enter confirm | Esc cancel",
@@ -100,10 +100,15 @@ pub enum Action {
     SearchToggleCase,
     SearchToggleWrap,
     SearchToggleWholeWord,
+    ConfirmSearch,
     // move mode
     MovePane(Dir),
     MovePaneNext,
     MovePanePrev,
+    // rename
+    ConfirmRename,
+    // generic
+    ExitMode,
     // global
     Quit,
     Lock,
@@ -288,10 +293,10 @@ pub fn handle(mode: Mode, kp: &KeyPress) -> Dispatch {
     // Rename modes: text capture.
     if mode == Mode::RenameTab || mode == Mode::RenamePane {
         if kp.key == Key::Escape || ctrl(k, m, Key::C) {
-            return Dispatch::Action(Action::Toast("rename cancelled"));
+            return Dispatch::Action(Action::ExitMode);
         }
         if kp.key == Key::Enter {
-            return Dispatch::Action(Action::Toast("rename done"));
+            return Dispatch::Action(Action::ConfirmRename);
         }
         if kp.key == Key::Backspace {
             return Dispatch::Action(Action::Toast("backspace"));
@@ -305,10 +310,10 @@ pub fn handle(mode: Mode, kp: &KeyPress) -> Dispatch {
     // EnterSearch: text capture.
     if mode == Mode::EnterSearch {
         if kp.key == Key::Escape || ctrl(k, m, Key::C) {
-            return Dispatch::Action(Action::Toast("search cancelled"));
+            return Dispatch::Action(Action::ExitMode);
         }
         if kp.key == Key::Enter {
-            return Dispatch::Action(Action::Toast("search done"));
+            return Dispatch::Action(Action::ConfirmSearch);
         }
         if kp.key == Key::Backspace {
             return Dispatch::Action(Action::Toast("backspace"));
@@ -322,6 +327,12 @@ pub fn handle(mode: Mode, kp: &KeyPress) -> Dispatch {
     // Global waveterm binds.
     if let Some(action) = global_binds(k, m) {
         return Dispatch::Action(action);
+    }
+
+    // Esc exits any modal mode back to Normal (zellij behavior). Locked
+    // mode is handled above and stays Ctrl+g-only on purpose.
+    if kp.key == Key::Escape && mode != Mode::Normal {
+        return Dispatch::Action(Action::ExitMode);
     }
 
     // Mode-specific binds.
@@ -448,7 +459,7 @@ fn scroll_binds(k: Key, m: Mods) -> Option<Action> {
 fn search_binds(k: Key, m: Mods) -> Option<Action> {
     use Key::*;
     Some(match k {
-        _ if ctrl(k, m, S) => Action::ScrollToBottom,
+        _ if ctrl(k, m, S) => Action::ExitMode,
         _ if ctrl(k, m, C) => Action::ScrollToBottom,
         _ if plain(k, m, N) => Action::SearchNext,
         _ if plain(k, m, P) => Action::SearchPrev,

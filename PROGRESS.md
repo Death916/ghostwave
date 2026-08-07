@@ -84,10 +84,12 @@ Key API gotchas discovered (all fixed):
    set_scissor isn't clipping multi-pane layouts (test a split).
 2. Screenshot QA with grim (window must exist first):
    `grim /tmp/ghostwave.png` then vision-check it.
-3. Wire theme → terminal default fg/bg (set_default_fg_color /
-   set_default_bg_color) in apply_theme — pane bg now uses
-   colors.background from the snapshot; theme bg no longer applied.
-4. Set tab name from OSC title; search match bg highlight.
+3. ✅ DONE: theme → terminal default fg/bg wired
+   (apply_terminal_colors; set_default_fg/bg_color on all panes).
+   Verified: pane bg corner shifted ghostty-gray → tokyonight tint.
+4. ✅ DONE: tab name follows active pane OSC title (unless renamed).
+   NOTE: fish on this box emits NO OSC 0 titles (verified via script(1))
+   → tab stays "Tab 1" until the shell sends one; mechanism is correct.
 5. Test zellij binds live: Ctrl+p n/d/r/s/x/hjkl, Ctrl+t, Ctrl+n resize,
    Ctrl+s scroll, Ctrl+Shift+P palette, Ctrl+Shift+F search,
    Ctrl+Shift+C/V copy/paste, Ctrl+M zoom, Ctrl+W close.
