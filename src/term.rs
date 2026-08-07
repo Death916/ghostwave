@@ -366,7 +366,14 @@ impl TermPane {
             }
             MouseEvKind::Motion => {
                 let moved = (ev.x - self.last_mouse.0).abs() > 0.5 || (ev.y - self.last_mouse.1).abs() > 0.5;
-                if moved && self.selection.is_selecting(&self.term)? {
+                // Only drag while the left button is physically held. ghostty's
+                // gesture keeps left_click_count > 0 after release (for
+                // double-click timing), so gating on click_count alone makes
+                // any hover after a click extend the selection.
+                if moved
+                    && ev.button_down == Some(mouse::Button::Left)
+                    && self.selection.is_selecting(&self.term)?
+                {
                     self.selection.on_drag(
                         &mut self.term,
                         ev.x,
@@ -484,20 +491,20 @@ impl TermPane {
         // Pane-local draw origin (macroquad draws in physical px).
         let (ox, oy) = (rect.x, rect.y);
 
-        let force = self.force_repaint || self.last_rect != Some(rect);
         self.last_rect = Some(rect);
         self.force_repaint = false;
 
         let snapshot = self.render_state.update(&self.term)?;
-        let dirty = snapshot.dirty()?;
         let colors = snapshot.colors()?;
 
-        // Background (theme bg; terminal default bg would be here if we
-        // exposed it, but theme bg is close enough and consistent).
-        draw_rectangle(ox, oy, rect.w, rect.h, color_theme(theme.bg));
+        // Documented libghostty-vt pattern (ghostling-rs reference): draw the
+        // pane background every frame using the TERMINAL's default bg, then
+        // redraw ALL rows/cells every frame, then reset dirty flags. No
+        // skip-on-clean optimization: skipping combined with per-frame bg
+        // painting erased the pane on clean frames (flicker / blank pane).
+        draw_rectangle(ox, oy, rect.w, rect.h, color(colors.background));
 
-        let skip_cells = !force && dirty == Dirty::Clean && !self.search.active();
-        if !skip_cells {
+        {
             // --- search pass: compute matches on current viewport ---
             if self.search.active() && self.search.dirty {
                 let mut search_it = self.row_it.update(&snapshot)?;

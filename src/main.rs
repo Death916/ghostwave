@@ -344,15 +344,8 @@ fn reset_scissor() {
 /// Clip drawing to a logical-pixel rect. macroquad has no public scissor
 /// API; quad_gl.scissor works in physical px (Y flipped internally).
 fn set_scissor(x: f32, y: f32, w: f32, h: f32) {
-    let dpi = macroquad::window::screen_dpi_scale();
-    unsafe {
-        macroquad::window::get_internal_gl().quad_gl.scissor(Some((
-            (x * dpi) as i32,
-            (y * dpi) as i32,
-            (w * dpi) as i32,
-            (h * dpi) as i32,
-        )));
-    }
+    // TEMP: disabled to test whether the scissor clips everything away.
+    let _ = (x, y, w, h);
 }
 
 fn macroquad_conf() -> macroquad::conf::Conf {
