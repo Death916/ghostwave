@@ -155,6 +155,9 @@ impl App {
             mouse_pane: None,
         };
 
+        // Apply the configured theme's fg/bg to the initial terminal.
+        app.apply_terminal_colors();
+
         Ok(app)
     }
 
@@ -715,7 +718,24 @@ impl App {
         if let Some(t) = theme::by_name_opt(name) {
             self.theme = t;
             self.theme_name = name.to_string();
+            self.apply_terminal_colors();
             self.toast(&format!("theme: {name}"));
+        }
+    }
+
+    /// Push the theme's default fg/bg into every pane's terminal so the
+    /// grid renders with theme colors (renderer reads colors.background/
+    /// colors.foreground from the render-state snapshot).
+    pub fn apply_terminal_colors(&mut self) {
+        use libghostty_vt::style::RgbColor;
+        let (fg, bg) = (self.theme.fg, self.theme.bg);
+        for tab in self.tabs.iter_mut() {
+            for pane in tab.panes.iter_mut() {
+                if let Pane::Term(t) = pane {
+                    let _ = t.term.set_default_fg_color(Some(RgbColor { r: fg.0, g: fg.1, b: fg.2 }));
+                    let _ = t.term.set_default_bg_color(Some(RgbColor { r: bg.0, g: bg.1, b: bg.2 }));
+                }
+            }
         }
     }
 
