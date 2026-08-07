@@ -9,7 +9,7 @@ Binary name: `ghostwave`
 
 ---
 
-## STATUS: runtime debugging in progress — compiles; ran; fixed 2 runtime bugs
+## STATUS: runtime debugging in progress — compiles; runs; render + mouse fixed
 
 ### Timeline
 - build6: ✅ compiles, 0 errors. Binary: target/debug/ghostwave
@@ -26,17 +26,39 @@ Binary name: `ghostwave`
   libxcb]` (nix.dev: any string-coercible attr becomes an env var).
   Verified: LDPATH now lists all 9 lib dirs, no deprecation warnings.
   devenv.nix uses `libs = [...]` (devenv's equivalent mechanism).
+  NOTE: must use PROJECT shell.nix (`nix-shell ./shell.nix`); the
+  ~/.hermes shell.nix lacks these libs → runtime dlopen failure.
 - run3: ✅ windowing init works now (Wayland path succeeded, no more X11
   fallback) → NEW panic: `src/app.rs:173 index out of bounds (len 0)`.
   Cause: `App::new` called `new_term_pane` (which does
-  `tabs[active_tab]`) before any tab existed.
-- FIX APPLIED, NOT YET REBUILT: App::new now creates the initial
-  TermPane first, then `tabs: vec![Tab::new(Pane::Term(initial), ...)]`.
-  Next: `cargo build` + `cargo run` + screenshot verify (grim + hyprctl
-  both available on this machine).
+  `tabs[active_tab]`) before any tab existed. FIXED: initial TermPane
+  created first, then `tabs: vec![Tab::new(Pane::Term(initial), ...)]`.
+- run4+: pane rendering was broken two ways:
+  1. Original: `clear_background` + pane bg painted EVERY frame, but
+     cells only when the render-state snapshot was dirty → every clean
+     frame painted over the text → blank/flicker (text only during
+     typing/force-repaint).
+  2. Debug detour: added skip-on-clean + TEMP red probe rect + [dbg]
+     logging → pane stayed RED (probe drawn every frame over skipped
+     cells). Red probe was the "all red" the user saw.
+  3. Scissor detour: `quad_gl.scissor` with dpi-scaled coords was
+     suspected of clipping pane draws; disabled it as a test. NOT the
+     root cause; set_scissor is still active in main.rs but untested
+     for correctness after the render rewrite.
+- FINAL FIX (commit 2571ca2): follow the documented libghostty-vt
+  pattern (ghostling-rs reference + example/c-vt-render): update render
+  state + redraw ALL rows/cells EVERY frame, pane bg = terminal default
+  (`snapshot.colors().background`, not theme bg), reset dirty flags at
+  end. Removed skip_cells, red probe, [dbg] logging. VERIFIED: prompt,
+  text output, and block cursor all render and persist at idle.
+- Mouse: selection drag now requires left button physically held
+  (`ev.button_down == Some(Left)`). ghostty's SelectionGesture keeps
+  `left_click_count > 0` after release (for double/triple-click timing —
+  see SelectionGesture.zig release() docs), so gating drag on click_count
+  alone made any hover after a click extend the selection.
 
 Build log history: /tmp/ghostwave-build{1..6}.log; run logs:
-/tmp/ghostwave-run{1,2,3}.log
+/tmp/ghostwave-run{1..11}.log
 - build1: nix feature `pty` doesn't exist → fixed
 - build2: zig 0.16.0 rejected → shell.nix now uses `zig_0_15` (0.15.2)
 - build3: 52 errors in our crate → fixed in batches (see below)
@@ -58,19 +80,19 @@ Key API gotchas discovered (all fixed):
   (&Terminal, &mut PlacementIterator, &Graphics).
 
 ## TODO next (in order)
-1. REBUILD + RERUN: `nix-shell` → `cargo build` → `cargo run` (the
-   App::new fix is applied but unverified). Expect further runtime bugs:
-   render skip-clear flicker, key mapping quirks, mouse hit-test, split/
-   focus logic, first-shell-spawn issues (forkpty in the macroquad main).
+1. Re-verify scissor: pane draws no longer rely on skip; confirm
+   set_scissor isn't clipping multi-pane layouts (test a split).
 2. Screenshot QA with grim (window must exist first):
    `grim /tmp/ghostwave.png` then vision-check it.
 3. Wire theme → terminal default fg/bg (set_default_fg_color /
-   set_default_bg_color) in apply_theme.
+   set_default_bg_color) in apply_theme — pane bg now uses
+   colors.background from the snapshot; theme bg no longer applied.
 4. Set tab name from OSC title; search match bg highlight.
 5. Test zellij binds live: Ctrl+p n/d/r/s/x/hjkl, Ctrl+t, Ctrl+n resize,
    Ctrl+s scroll, Ctrl+Shift+P palette, Ctrl+Shift+F search,
    Ctrl+Shift+C/V copy/paste, Ctrl+M zoom, Ctrl+W close.
-6. cargo build --release for perf check.
+6. cargo build --release for perf check (always-redraw may need
+   per-row dirty optimization later; fine for now).
 
 ---
 
