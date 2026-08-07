@@ -9,9 +9,25 @@ Binary name: `ghostwave`
 
 ---
 
-## STATUS: runtime debugging in progress — compiles; runs; render + mouse fixed
+## STATUS: main terminal features solid — render/mouse/keybinds fixed, parity work in progress
 
-### Timeline
+### Recent work (commits 2571ca2 → 7d9eac7)
+- Render: always-redraw per libghostty-vt docs (ghostling-rs pattern);
+  pane bg = terminal default from snapshot.colors(). Fixed blank/flicker.
+- Mouse: drag selection only while left button held; click focuses pane.
+- Esc exits all modal modes; rename/search Enter+Esc actually work now.
+- Theme → terminal fg/bg wired (set_default_fg/bg_color).
+- Tab label follows active pane OSC title (fish emits none → stays "Tab 1").
+- Search matches get solid bg highlight.
+- Key releases only forwarded for unbound keys (no spam to apps).
+- Zoomed pane re-grids to full content rect.
+- waveterm command blocks: LEGACY feature (new waveterm dropped them) —
+  NOT implementing. AI pane context injection: deferred by user.
+- Scrollback search: libghostty-vt 0.2.1 has NO scrollback traversal API
+  (RowIterator = viewport only, no search API) → search stays viewport-
+  scoped. Would need ghostty upgrades or scroll-crawl; deferred.
+
+### Timeline (older)
 - build6: ✅ compiles, 0 errors. Binary: target/debug/ghostwave
 - run1/run2: `Failed to initialize through wayland! Trying X11 instead` →
   panic `LibraryNotFound(DlOpenError("libX11.so.6"))`. Cause: miniquad
