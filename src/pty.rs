@@ -53,10 +53,13 @@ impl Pty {
                 let (shell, extra_args): (PathBuf, Vec<&str>) = match program {
                     Some(p) if !p.is_empty() => (PathBuf::from(p), args.to_vec()),
                     _ => {
-                        let s = match std::env::var_os("SHELL") {
-                            Some(s) if !s.is_empty() => PathBuf::from(s),
-                            _ => match unistd::User::from_uid(unistd::getuid()) {
-                                Ok(Some(user)) => user.shell,
+                        // Prefer the passwd entry: $SHELL can be overridden by
+                        // wrappers (nix-shell sets it to bash regardless of the
+                        // user's real login shell). Real terminals use passwd.
+                        let s = match unistd::User::from_uid(unistd::getuid()) {
+                            Ok(Some(user)) if !user.shell.as_os_str().is_empty() => user.shell,
+                            _ => match std::env::var_os("SHELL") {
+                                Some(s) if !s.is_empty() => PathBuf::from(s),
                                 _ => PathBuf::from("/bin/sh"),
                             },
                         };

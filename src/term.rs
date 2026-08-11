@@ -51,6 +51,9 @@ struct Shared {
 pub struct CellDims {
     pub w: u32,
     pub h: u32,
+    /// Baseline offset within the cell: glyph baseline y = cell_top + baseline.
+    /// Keeps glyphs and the block cursor aligned in the same cell.
+    pub baseline: f32,
 }
 
 /// A single terminal pane (one shell session).
@@ -480,8 +483,7 @@ impl TermPane {
         rect: crate::layout::Rect,
         cell: CellDims,
         padding: f32,
-        row_gap: f32,
-        font: &macroquad::text::Font,
+        font_stack: &crate::fonts::FontStack,
         font_px: u16,
         theme: Theme,
         focused: bool,
@@ -537,6 +539,22 @@ impl TermPane {
                         }
                     } else {
                         c.graphemes_utf8(&mut text)?;
+                        // Strip zero-width format chars (variation selectors,
+                        // ZWJ/ZWNJ/ZWSP, word joiner, BOM): they carry no ink
+                        // and almost no font has them, so drawing them yields
+                        // tofu boxes (e.g. starship's nix "❄️" = U+2744 + VS16).
+                        text.retain(|ch| {
+                            !matches!(
+                                ch,
+                                '\u{FE00}'..='\u{FE0F}'   // variation selectors
+                                    | '\u{200B}'..='\u{200D}' // ZWSP, ZWNJ, ZWJ
+                                    | '\u{2060}'             // word joiner
+                                    | '\u{FEFF}'             // BOM / ZWNBSP
+                            )
+                        });
+                        // Font fallback: first stack font that covers the glyph
+                        // (primary = bundled JetBrains Mono).
+                        let font = font_stack.get(font_stack.font_for(text.chars().next().unwrap_or(' ')));
                         let mut fg = crate::theme::Rgb(colors.foreground.r, colors.foreground.g, colors.foreground.b);
                         let mut bg = theme.bg;
                         let mut has_bg = false;
@@ -584,7 +602,7 @@ impl TermPane {
                         draw_text_ex(
                             &text,
                             x,
-                            y + font_px as f32 + row_gap,
+                            y + cell.baseline,
                             TextParams {
                                 font: Some(font),
                                 font_size: font_px,
@@ -597,7 +615,7 @@ impl TermPane {
                             draw_text_ex(
                                 &text,
                                 x + 1.0,
-                                y + font_px as f32 + row_gap,
+                                y + cell.baseline,
                                 TextParams {
                                     font: Some(font),
                                     font_size: font_px,

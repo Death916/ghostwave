@@ -9,6 +9,7 @@ mod ai;
 mod app;
 mod clipboard;
 mod config;
+mod fonts;
 mod keymap;
 mod layout;
 mod palette;
@@ -112,9 +113,9 @@ fn render(app: &mut App) {
     let theme = app.theme;
     let cell = app.cell;
     let padding = app.config.padding;
-    let row_gap = app.config.row_gap;
     let font_px = app.font_px;
     let font = app.font.clone();
+    let font_stack = app.font_stack.clone();
     let active_id = app.active_pane_id();
     let show_frames = app.show_frames;
 
@@ -130,8 +131,7 @@ fn render(app: &mut App) {
                     rect,
                     cell,
                     padding,
-                    row_gap,
-                    &font,
+                    &font_stack,
                     font_px,
                     theme,
                     id == active_id,
@@ -384,7 +384,8 @@ async fn main() -> Result<()> {
     }
 
     let font = load_ttf_font_from_bytes(include_bytes!("../assets/JetBrainsMono-Medium.ttf"))?;
-    let mut app = App::new(config, font)?;
+    let font_stack = fonts::FontStack::new(include_bytes!("../assets/JetBrainsMono-Medium.ttf"), font.clone())?;
+    let mut app = App::new(config, font, font_stack)?;
 
     loop {
         app.update();

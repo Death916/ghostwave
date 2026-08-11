@@ -8,6 +8,7 @@ use libghostty_vt::key::{self, Key, Mods};
 use crate::{
     ai::AiPane,
     config::Config,
+    fonts::FontStack,
     keymap::{self, Action, Dispatch, KeyPress, Mode},
     layout::{self, Dir, Node, Rect, SplitDir},
     palette::CommandPalette,
@@ -93,6 +94,7 @@ pub struct App {
     pub font_px: u16,
     pub config: Config,
     pub font: macroquad::text::Font,
+    pub font_stack: FontStack,
     /// Repeat synthesis state: (code, last_press, last_repeat).
     repeats: std::collections::HashMap<macroquad::prelude::KeyCode, (Instant, Instant)>,
     pub quit: bool,
@@ -101,11 +103,15 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config, font: macroquad::text::Font) -> crate::Result<Self> {
+    pub fn new(config: Config, font: macroquad::text::Font, font_stack: FontStack) -> crate::Result<Self> {
         let theme_name = config.theme.clone();
         let theme = theme::by_name(&theme_name);
 
-        // Cell metrics from the font at the configured size.
+        // Cell metrics: width from the font's advance, height from real line
+        // metrics (ascent + descent) so ascenders/descenders and the block
+        // cursor fit inside the cell. Baseline anchors glyphs in the cell so
+        // cursor and text line up (measure_text on "M" returns cap-height and
+        // offset_y≈0 — unusable as a baseline, that caused the offset cursor).
         let dpi = macroquad::window::screen_dpi_scale();
         let measured = macroquad::text::measure_text(
             "M",
@@ -113,11 +119,21 @@ impl App {
             config.font_size as u16,
             dpi,
         );
-        let cell_w = (measured.width.max(1.0)).ceil() as u32;
-        let cell_h = (measured.height + config.row_gap).max(8.0).ceil() as u32;
         let font_px = (config.font_size * dpi).round() as u16;
+        let (ascent, descent) = font_stack.line_metrics(font_px as f32);
+        let cell_w = (measured.width.max(1.0)).ceil() as u32;
+        let cell_h = (ascent + descent + config.row_gap).max(8.0).ceil() as u32;
+        let cell = CellDims { w: cell_w, h: cell_h, baseline: ascent + config.row_gap / 2.0 };
 
-        let cell = CellDims { w: cell_w, h: cell_h };
+        eprintln!(
+            "ghostwave dbg: dpi={dpi} font_size={} font_px={font_px} cell={}x{} baseline={} asc={ascent} desc={descent} screen={}x{}",
+            config.font_size,
+            cell_w,
+            cell_h,
+            cell.baseline,
+            macroquad::window::screen_width(),
+            macroquad::window::screen_height(),
+        );
 
         // Create the initial shell pane BEFORE building the App (there are
         // no tabs yet, so new_term_pane would index an empty vec).
@@ -150,6 +166,7 @@ impl App {
             font_px,
             config,
             font,
+            font_stack,
             repeats: std::collections::HashMap::new(),
             quit: false,
             mouse_pane: None,
@@ -173,9 +190,15 @@ impl App {
     ) -> crate::Result<usize> {
         let shell = program.or(self.config.shell.as_deref());
         let pane = TermPane::new(cols, rows, self.cell, shell, args, cwd, self.config.scrollback)?;
-        let tab = self.current_tab_mut();
-        let id = tab.panes.len();
-        tab.panes.push(Pane::Term(pane));
+        let id = {
+            let tab = self.current_tab_mut();
+            let id = tab.panes.len();
+            tab.panes.push(Pane::Term(pane));
+            id
+        };
+        // Fresh terminals start with libghostty's default colors (near-black);
+        // push the theme's default fg/bg so new panes match existing ones.
+        self.apply_terminal_colors();
         Ok(id)
     }
 
@@ -441,6 +464,7 @@ impl App {
         let name = format!("Tab {}", self.tabs.len() + 1);
         self.tabs.push(Tab::new(pane, name));
         self.active_tab = self.tabs.len() - 1;
+        self.apply_terminal_colors();
         self.layout_all();
     }
 
@@ -470,6 +494,7 @@ impl App {
             tab.root = Node::Leaf { pane: 0 };
             tab.active = 0;
             tab.zoomed.clear();
+            self.apply_terminal_colors();
             return;
         }
         self.tabs.remove(self.active_tab);
@@ -574,6 +599,7 @@ impl App {
             tab.panes.push(Pane::Term(pane));
             tab.root = Node::Leaf { pane: 0 };
             tab.active = 0;
+            self.apply_terminal_colors();
             self.layout_all();
             return;
         }
@@ -792,6 +818,7 @@ impl App {
             if let Some(Pane::Term(t)) = tab.panes.get_mut(id) {
                 let cols = ((rect.w - 2.0 * pad) / cell.w as f32).max(1.0) as u16;
                 let rows = ((rect.h - 2.0 * pad) / cell.h as f32).max(1.0) as u16;
+                eprintln!("ghostwave dbg: pane {id} rect={rect:?} cols={cols} rows={rows}");
                 let _ = t.set_grid(cols, rows, cell);
             }
         }
