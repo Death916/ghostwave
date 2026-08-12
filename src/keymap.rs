@@ -236,6 +236,8 @@ pub fn global_binds(k: Key, m: Mods) -> Option<Action> {
         _ if plain(k, m, F2) => Action::RenameTab,
         _ if ctrl(k, m, BracketLeft) => Action::PrevTab,
         _ if ctrl(k, m, BracketRight) => Action::NextTab,
+        _ if ctrl(k, m, Tab) => Action::NextTab,
+        _ if ctrl_shift(k, m, Tab) => Action::PrevTab,
         _ if ctrl(k, m, Digit0) => Action::FocusPane(9),
         _ if digit_key(k).is_some() && mods_match(m, true, false, false, false) => {
             Action::GoToTab(digit_key(k).unwrap())

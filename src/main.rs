@@ -418,7 +418,18 @@ fn macroquad_conf() -> macroquad::conf::Conf {
             window_resizable: true,
             high_dpi: true,
             platform: miniquad::conf::Platform {
-                linux_backend: miniquad::conf::LinuxBackend::WaylandOnly, // TEMP: force wayland to see init error
+                linux_backend: miniquad::conf::LinuxBackend::WaylandOnly,
+                // Never block in poll() (default)…
+                blocking_event_loop: false,
+                // …and never wait on the compositor's frame callback:
+                // with vsync (swap_interval 1), eglSwapBuffers blocks until
+                // the next wl_surface.frame callback — Hyprland stops
+                // sending those when the window is on another workspace,
+                // so the loop stalls forever and Hyprland flags the app
+                // as "not responding". swap_interval 0 makes every swap
+                // return immediately; the main loop caps the frame rate
+                // itself (see main()).
+                swap_interval: Some(0),
                 ..Default::default()
             },
             ..Default::default()
@@ -449,6 +460,7 @@ async fn main() -> Result<()> {
     let mut app = App::new(config, font, font_stack)?;
 
     loop {
+        let frame_start = std::time::Instant::now();
         app.update();
 
         // Recompute pane grids when the window/layout changes (no-op otherwise).
@@ -462,6 +474,15 @@ async fn main() -> Result<()> {
         if app.quit {
             app.save_session();
             std::process::exit(0);
+        }
+
+        // Manual frame cap (vsync is disabled — see macroquad_conf). Sleeping
+        // keeps CPU sane while guaranteeing the loop NEVER blocks on the
+        // compositor, so a hidden window stays responsive.
+        const FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(16_667);
+        let elapsed = frame_start.elapsed();
+        if elapsed < FRAME_TIME {
+            std::thread::sleep(FRAME_TIME - elapsed);
         }
 
         next_frame().await

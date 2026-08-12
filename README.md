@@ -30,6 +30,7 @@ tab and it comes back — screen *and* scrollback — after a restart.
 |------|--------|
 | `Ctrl+p` | pane mode (n new, d down, r right, s stacked, x close, h/j/k/l move) |
 | `Ctrl+t` | tab mode (n new, d close, o next, p prev, r rename) |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | next / previous tab |
 | `Ctrl+n` | resize mode (h/j/k/l) |
 | `Ctrl+s` | scroll mode (arrow keys; Ctrl+s exit) |
 | `Ctrl+h` | move focus mode (h/j/k/l) |
