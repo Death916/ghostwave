@@ -392,7 +392,6 @@ fn pane_binds(k: Key, m: Mods) -> Option<Action> {
         _ if plain(k, m, W) => Action::CycleStack,
         _ if plain(k, m, C) => Action::RenamePane,
         _ if plain(k, m, E) => Action::Toast("embed/floating not implemented"),
-        _ if plain(k, m, I) => Action::Toast("pane pinning not implemented"),
         _ if let Some(d) = dir => Action::MoveFocus(d),
         _ => return None,
     })

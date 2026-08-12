@@ -11,11 +11,11 @@ tab and it comes back — screen *and* scrollback — after a restart.
 ## Features
 
 - Tabs, split panes (right/down/stacked), zoom, resize via mode keys
-- **Durable sessions**: every pane's pty output is tee'd to a log; pin tabs
-  (right-click → *Pin tab*) or use the session manager (Ctrl+o → w) to
-  switch between named sessions, each restored with full scrollback on
-  launch. Session state persists continuously, so even a crash loses at
-  most a couple of seconds. Logs are capped (`max_log_mb`) and pruned.
+- **Durable sessions**: every pane's output is logged; the session manager
+  (Ctrl+o → w) switches between named sessions, each restoring ALL of its
+  tabs and panes with full scrollback on launch. Session state persists
+  continuously, so even a crash loses at most a couple of seconds. Logs
+  are capped (`max_log_mb`) and pruned.
 - zellij-style modal keybinds (Esc exits any mode)
 - Command palette (Ctrl+Shift+P), find-in-viewport (Ctrl+Shift+F),
   copy/paste (Ctrl+Shift+C/V), scroll wheel, mouse selection + click-to-focus
@@ -40,7 +40,7 @@ tab and it comes back — screen *and* scrollback — after a restart.
 | `Ctrl+Shift+P` | command palette |
 | `Ctrl+Shift+F` | find |
 | `Ctrl+Shift+C` / `V` | copy / paste |
-| right-click tab | tab menu: pin/unpin (durable), rename, close |
+| right-click tab | tab menu: rename, close |
 
 ## Build & run
 

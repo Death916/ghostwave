@@ -204,26 +204,15 @@ fn render(app: &mut App) {
             TAB_BAR_H / 2.0 + 4.0,
             TextParams { font: Some(&font), font_size: 14, color: color_theme(col), ..Default::default() },
         );
-        // Pin marker for durable tabs (drawn with primitives — no font in the
-        // stack has the 📌 emoji; a shape can't tofu).
-        if tab.durable {
-            let pin_x = x + 10.0 + measure_text(&label, Some(&font), 14, 1.0).width + 14.0;
-            let pin_y = TAB_BAR_H / 2.0;
-            let col = color_theme(theme.search_match);
-            draw_rectangle(pin_x - 1.0, pin_y - 5.0, 2.0, 9.0, col); // shaft
-            draw_circle(pin_x, pin_y - 6.0, 3.0, col);               // head
-        }
         }
 
         // ---- tab context menu -------------------------------------------------
         if let Some((tab_idx, mx, my)) = app.tab_menu {
         use app::{TAB_MENU_ITEM_H, TAB_MENU_ITEMS, TAB_MENU_PAD, TAB_MENU_W};
         let menu_h = TAB_MENU_PAD + TAB_MENU_ITEMS as f32 * TAB_MENU_ITEM_H + TAB_MENU_PAD;
-        let durable = app.tabs.get(tab_idx).map(|t| t.durable).unwrap_or(false);
         draw_rectangle(mx, my, TAB_MENU_W, menu_h, color_theme(theme.bg));
         draw_rectangle_lines(mx, my, TAB_MENU_W, menu_h, 1.0, color_theme(theme.tab_bg));
         let items = [
-            if durable { "Unpin tab (stop restoring)" } else { "Pin tab (restore on restart)" },
             "Rename tab",
             "Close tab",
         ];

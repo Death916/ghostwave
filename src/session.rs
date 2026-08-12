@@ -7,8 +7,7 @@
 //! scrollback.
 //!
 //! Design decisions:
-//! - ALL panes log (cheap; a pane designated durable mid-session keeps its
-//!   full history). Only durable tabs are restored.
+//! - ALL panes log (cheap; the whole session is saved, no per-tab opt-in).
 //! - Logs are raw pty bytes, replayed with vt_write. Exact restoration.
 //! - Log cap: config max_log_mb per pane; when exceeded the log is truncated
 //!   at the front — the restored terminal then shows the tail, and the screen
@@ -29,7 +28,6 @@ pub struct SessionState {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TabState {
     pub name: String,
-    pub durable: bool,
     pub panes: Vec<PaneState>,
 }
 
@@ -259,7 +257,6 @@ mod tests {
         let state = SessionState {
             tabs: vec![TabState {
                 name: "work".into(),
-                durable: true,
                 panes: vec![PaneState {
                     program: None,
                     args: vec![],
@@ -271,7 +268,6 @@ mod tests {
         save("test-sess", &state);
         let loaded = load("test-sess").expect("session should reload");
         assert_eq!(loaded.tabs.len(), 1);
-        assert!(loaded.tabs[0].durable);
         assert_eq!(loaded.tabs[0].panes[0].cwd.as_deref(), Some("/home/user"));
         assert!(list_sessions().iter().any(|s| s == "test-sess"));
         delete("test-sess");

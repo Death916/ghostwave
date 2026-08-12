@@ -41,12 +41,16 @@ Binary name: `ghostwave`
   w = session manager (↑/↓ + Enter switch, n new, r rename, d delete),
   d = detach (save + quit), Esc exit. Startup resumes the last-used
   session; legacy session.json auto-migrates to sessions/default.json.
-  Pinned tabs restore with FULL scrollback via log replay; session.json
-  saved CONTINUOUSLY (every 2s) so a kill/crash loses at most seconds.
-  Preview/AI panes not restored. Unit-tested (save/load/delete/rename,
-  front truncation).
+  THE WHOLE SESSION IS SAVED/RESTORED (all tabs + all terminal panes,
+  full scrollback via log replay) — pin concept REMOVED (it only ever
+  filtered restore, causing "only the pinned tab came back"); right-click
+  tab menu is now rename/close only. Saved CONTINUOUSLY (every 2s) so a
+  kill/crash loses at most seconds. Preview/AI panes not restored.
+  Unit-tested (save/load/delete/rename, front truncation).
   NOTE: each restore spawns a fresh shell whose greeting appends to the
   log — shell greetings accumulate across restarts (cosmetic).
+  TODO (waveterm "durable"): remote-TTY rejoin (attach to a remote
+  session like tmux/zellij) — deferred until local sessions are solid.
 - REMOVED dead Ctrl+Shift+A bind + ToggleAi action + ai_visible flag
   (never wired to anything; AI pane reachable only via palette
   "New AI Chat" and is untested/not a real feature yet).

@@ -21,7 +21,7 @@ use crate::{
 pub const TAB_MENU_W: f32 = 230.0;
 pub const TAB_MENU_ITEM_H: f32 = 24.0;
 pub const TAB_MENU_PAD: f32 = 8.0;
-pub const TAB_MENU_ITEMS: usize = 3;
+pub const TAB_MENU_ITEMS: usize = 2;
 
 pub const TAB_BAR_H: f32 = 30.0;
 pub const STATUS_BAR_H: f32 = 26.0;
@@ -40,8 +40,6 @@ pub struct Tab {
     pub panes: Vec<Pane>,
     pub active: usize,
     pub zoomed: HashSet<usize>,
-    /// Durable tab: restored with full scrollback on restart (session.json).
-    pub durable: bool,
 }
 
 impl Tab {
@@ -52,7 +50,6 @@ impl Tab {
             panes: vec![initial],
             active: 0,
             zoomed: HashSet::new(),
-            durable: false,
         }
     }
 
@@ -63,7 +60,6 @@ impl Tab {
             panes,
             active: 0,
             zoomed: HashSet::new(),
-            durable: true,
         }
     }
 
@@ -888,7 +884,6 @@ impl App {
                 .iter()
                 .map(|tab| crate::session::TabState {
                     name: tab.name.clone(),
-                    durable: tab.durable,
                     panes: tab
                         .panes
                         .iter()
@@ -911,15 +906,6 @@ impl App {
 
     // ---- tab context menu -------------------------------------------------
 
-    /// Toggle a tab's durable flag (right-click tab → pin/unpin).
-    pub fn toggle_tab_durable(&mut self, tab_idx: usize) {
-        let Some(tab) = self.tabs.get_mut(tab_idx) else { return };
-        tab.durable = !tab.durable;
-        let state = if tab.durable { "pinned" } else { "unpinned" };
-        let name = tab.name.clone();
-        self.toast(&format!("tab {state}: {name} (restored on restart)"));
-    }
-
     // ---- sessions ---------------------------------------------------------
 
     /// Build tabs (with replayed scrollback) from a saved session state.
@@ -931,7 +917,7 @@ impl App {
         config: &Config,
     ) -> crate::Result<Vec<Tab>> {
         let mut tabs: Vec<Tab> = Vec::new();
-        for ts in sess.tabs.iter().filter(|t| t.durable && !t.panes.is_empty()) {
+        for ts in sess.tabs.iter().filter(|t| !t.panes.is_empty()) {
             let mut panes: Vec<Pane> = Vec::new();
             for ps in &ts.panes {
                 let args: Vec<&str> = ps.args.iter().map(String::as_str).collect();
@@ -1392,12 +1378,11 @@ impl App {
                 if mx >= mx0 && mx <= mx0 + TAB_MENU_W && my >= my0 && my <= my0 + menu_h {
                     let item = ((my - my0 - TAB_MENU_PAD) / TAB_MENU_ITEM_H) as usize;
                     match item {
-                        0 => self.toggle_tab_durable(tab_idx),
-                        1 => {
+                        0 => {
                             self.goto_tab(tab_idx);
                             self.mode = Mode::RenameTab;
                         }
-                        2 => {
+                        1 => {
                             self.goto_tab(tab_idx);
                             self.close_tab();
                         }
