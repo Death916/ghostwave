@@ -30,6 +30,15 @@ Binary name: `ghostwave`
   workspace switches cleanly. (Panics on X11-only sessions; fine here.)
 - Removed per-frame "pane rect" debug spam from layout_all.
 - Cursor blink (500ms phase) driven by terminal blink mode.
+- NO-FREEZE ON HIDDEN WORKSPACES (Hyprland "not responding"): root cause —
+  with vsync (eglSwapInterval 1), eglSwapBuffers blocks until the next
+  wl_surface.frame callback; Hyprland stops sending those when the window
+  is on another workspace → loop stalls forever → no wl_display pong →
+  "not responding" overlay. Fix: platform swap_interval = Some(0) (swap
+  never waits on the compositor) + manual 60fps cap (sleep to 16.6ms per
+  iteration) in main() so CPU stays sane. User verified switching
+  workspaces leaves the app responsive.
+- Ctrl+Tab = next tab, Ctrl+Shift+Tab = previous tab (global binds).
 - PIN MARKER: drawn with primitives (no 📌 in the font stack → tofu).
 - FONT STACK: JetBrains Nerd variants (6 family NAMES, same design)
   collapsed to one slot → Noto Sans Symbols 2 / Symbols / Liberation
