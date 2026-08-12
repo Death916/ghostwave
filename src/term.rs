@@ -84,6 +84,9 @@ pub struct TermPane {
     last_rect: Option<Rect>,
     last_mouse: (f32, f32),
     scroll_active: bool,
+    /// Cursor blink phase (terminal reports cursor_blinking from modes).
+    blink_on: bool,
+    last_blink: std::time::Instant,
 }
 
 impl TermPane {
@@ -227,6 +230,8 @@ impl TermPane {
             last_rect: None,
             last_mouse: (0.0, 0.0),
             scroll_active: false,
+            blink_on: true,
+            last_blink: std::time::Instant::now(),
         })
     }
 
@@ -645,18 +650,29 @@ impl TermPane {
                 row_idx += 1;
             }
 
-            // Cursor
+            // Cursor (with blink: ghostty reports cursor_blinking from
+            // terminal modes; we toggle visibility on a 500ms phase).
             if snapshot.cursor_visible()?
                 && let Some(vp) = snapshot.cursor_viewport()?
                 && focused
             {
+                let mut draw_cursor = true;
+                if snapshot.cursor_blinking()? {
+                    let now = std::time::Instant::now();
+                    if now.duration_since(self.last_blink).as_millis() >= 500 {
+                        self.blink_on = !self.blink_on;
+                        self.last_blink = now;
+                    }
+                    draw_cursor = self.blink_on;
+                }
                 let cursor_color = colors.cursor.unwrap_or(colors.foreground);
                 let style = snapshot.cursor_visual_style()?;
                 let (cx, cy) = (
                     ox + padding + vp.x as f32 * cell.w as f32,
                     oy + padding + vp.y as f32 * cell.h as f32,
                 );
-                match style {
+                if draw_cursor {
+                    match style {
                     libghostty_vt::render::CursorVisualStyle::Block => {
                         draw_rectangle(cx, cy, cell.w as f32, cell.h as f32, color(cursor_color));
                     }
@@ -683,6 +699,7 @@ impl TermPane {
                         );
                     }
                     _ => {}
+                    }
                 }
             }
         }
