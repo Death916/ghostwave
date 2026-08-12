@@ -15,6 +15,19 @@ Binary name: `ghostwave`
 - Render: always-redraw per libghostty-vt docs (ghostling-rs pattern);
   pane bg = terminal default from snapshot.colors(). Fixed blank/flicker.
 - Mouse: drag selection only while left button held; click focuses pane.
+- SELECTION OFFSET FIX: SelectionExt::point() subtracted rect.x/y but
+  app.rs already passes pane-local coords → double-subtract put the
+  highlight ~1.2 rows ABOVE the mouse (pane y=32, cell_h=26). Removed.
+- CLIPBOARD FREEZE FIX: clipboard tools were waited on synchronously on
+  the main thread. wl-copy can stay alive as clipboard daemon (freeze on
+  Ctrl+Shift+C), wl-paste blocks forever on an empty clipboard (freeze on
+  Ctrl+Shift+V). Now: children reaped on background threads, paste reads
+  have a 1s timeout.
+- BACKEND: forced LinuxBackend::WaylandOnly — the WaylandWithX11Fallback
+  build silently ran on XWayland (workspace switches → Hyprland "not
+  responding" popup when the X11 loop blocked). Wayland-only handles
+  workspace switches cleanly. (Panics on X11-only sessions; fine here.)
+- Removed per-frame "pane rect" debug spam from layout_all.
 - Esc exits all modal modes; rename/search Enter+Esc actually work now.
 - Theme → terminal fg/bg wired (set_default_fg/bg_color).
 - Tab label follows active pane OSC title (fish emits none → stays "Tab 1").

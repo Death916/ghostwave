@@ -892,9 +892,12 @@ impl SelectionState<'_> {
         Ok(self.gesture.click_count(terminal)? > 0)
     }
 
+    /// Convert pane-local pointer pos (already relative to the pane rect,
+    /// i.e. surface-space) to a viewport cell. Padding is the grid inset.
     fn point(&self, x: f32, y: f32, rect: Rect, cell: CellDims, padding: f32, cols: u16, rows: u16) -> Point {
-        let px = ((x - rect.x - padding) / cell.w as f32).clamp(0.0, cols as f32) as u16;
-        let py = ((y - rect.y - padding) / cell.h as f32).clamp(0.0, rows as f32) as u32;
+        let _ = rect;
+        let px = ((x - padding) / cell.w as f32).clamp(0.0, cols as f32) as u16;
+        let py = ((y - padding) / cell.h as f32).clamp(0.0, rows as f32) as u32;
         Point::Viewport(PointCoordinate { x: px, y: py })
     }
 

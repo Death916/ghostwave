@@ -818,7 +818,6 @@ impl App {
             if let Some(Pane::Term(t)) = tab.panes.get_mut(id) {
                 let cols = ((rect.w - 2.0 * pad) / cell.w as f32).max(1.0) as u16;
                 let rows = ((rect.h - 2.0 * pad) / cell.h as f32).max(1.0) as u16;
-                eprintln!("ghostwave dbg: pane {id} rect={rect:?} cols={cols} rows={rows}");
                 let _ = t.set_grid(cols, rows, cell);
             }
         }

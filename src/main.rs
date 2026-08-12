@@ -357,7 +357,7 @@ fn macroquad_conf() -> macroquad::conf::Conf {
             window_resizable: true,
             high_dpi: true,
             platform: miniquad::conf::Platform {
-                linux_backend: miniquad::conf::LinuxBackend::WaylandWithX11Fallback,
+                linux_backend: miniquad::conf::LinuxBackend::WaylandOnly, // TEMP: force wayland to see init error
                 ..Default::default()
             },
             ..Default::default()
