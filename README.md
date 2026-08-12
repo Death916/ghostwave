@@ -10,16 +10,15 @@ tab and it comes back — screen *and* scrollback — after a restart.
 
 ## Features
 
-- Tabs, split panes (right/down/stacked), zoom, drag-to-resize
+- Tabs, split panes (right/down/stacked), zoom, resize via mode keys
 - **Durable sessions**: every pane's pty output is tee'd to a log;
   right-click a tab → *Pin tab* → the tab (with full scrollback) is restored
   on next launch. Session state persists continuously, so even a crash loses
   at most a couple of seconds
 - zellij-style modal keybinds (Esc exits any mode)
 - Command palette (Ctrl+Shift+P), find-in-viewport (Ctrl+Shift+F),
-  copy/paste (Ctrl+Shift+C/V), middle-scroll, mouse selection + click-to-focus
-- File preview panes (text, images, directories), SSH connections,
-  AI chat pane (any OpenAI-compatible endpoint)
+  copy/paste (Ctrl+Shift+C/V), scroll wheel, mouse selection + click-to-focus
+- File preview panes (text, images, directories), SSH connections
 - Themes (tokyonight default), cursor blink, kitty graphics protocol,
   font fallback stack (nerd-font glyphs + emoji via system fonts)
 - Native Wayland backend (miniquad); clipboard via wl-copy/wl-paste
@@ -40,7 +39,6 @@ tab and it comes back — screen *and* scrollback — after a restart.
 | `Ctrl+Shift+P` | command palette |
 | `Ctrl+Shift+F` | find |
 | `Ctrl+Shift+C` / `V` | copy / paste |
-| `Ctrl+Shift+A` | AI chat pane |
 | right-click tab | tab menu: pin/unpin (durable), rename, close |
 
 ## Build & run
@@ -65,11 +63,6 @@ theme = "tokyonight"
 scrollback = 10000
 padding = 6.0
 row_gap = 4.0
-
-[ai]
-base_url = "https://api.minimax.chat/v1"   # any OpenAI-compatible endpoint
-model = "MiniMax-M2"
-api_key_env = "MINIMAX_API_KEY"            # read from the environment
 ```
 
 Session data (pane logs + session state) lives in
