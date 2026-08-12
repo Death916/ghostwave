@@ -122,6 +122,8 @@ pub struct App {
     pub quit: bool,
     /// Pane id whose terminal gets the next mouse event (hit test cache).
     mouse_pane: Option<(usize, usize)>, // (tab, pane)
+    /// Last time the durable session was persisted (continuous save).
+    last_session_save: std::time::Instant,
 }
 
 impl App {
@@ -225,6 +227,7 @@ impl App {
             quit: false,
             mouse_pane: None,
             tab_menu: None,
+            last_session_save: std::time::Instant::now(),
         };
 
         // Apply the configured theme's fg/bg to the initial terminal.
@@ -1343,6 +1346,13 @@ impl App {
     // ---- per-frame updates ----------------------------------------------
 
     pub fn update(&mut self) {
+        // Persist the durable session every 2s so a crash/kill loses at most
+        // a couple of seconds (quit also saves explicitly).
+        if self.last_session_save.elapsed().as_secs() >= 2 {
+            self.save_session();
+            self.last_session_save = std::time::Instant::now();
+        }
+
         // Drain pty output for every pane in every tab.
         for tab in self.tabs.iter_mut() {
             let mut i = 0;

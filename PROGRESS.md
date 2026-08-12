@@ -34,10 +34,13 @@ Binary name: `ghostwave`
   collapsed to one slot → Noto Sans Symbols 2 / Symbols / Liberation
   Mono now load; emoji in terminal output render via fallback.
 - DURABLE SESSIONS: pty output tee'd to ~/.local/share/ghostwave/panes/
-  (32MB cap, front-truncate); session.json saved on quit; right-click a
+  (32MB cap, front-truncate); session.json saved CONTINUOUSLY (every 2s,
+  not just on quit) so a kill/crash loses at most seconds; right-click a
   tab → Pin/Unpin/Rename/Close menu; pinned tabs restore with FULL
-  scrollback via log replay (verified end-to-end). Preview/AI panes not
-  restored. Session module unit-tested.
+  scrollback via log replay (verified end-to-end with real user content).
+  Preview/AI panes not restored. Session module unit-tested.
+  NOTE: each restore spawns a fresh shell whose greeting appends to the
+  log — shell greetings accumulate across restarts (cosmetic).
 - Esc exits all modal modes; rename/search Enter+Esc actually work now.
 - Theme → terminal fg/bg wired (set_default_fg/bg_color).
 - Tab label follows active pane OSC title (fish emits none → stays "Tab 1").
