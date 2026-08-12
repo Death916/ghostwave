@@ -17,8 +17,6 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
-
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct SessionState {
     pub tabs: Vec<TabState>,
@@ -145,13 +143,17 @@ pub fn truncate_log_front(path: &PathBuf, keep: u64) -> Vec<u8> {
 }
 
 /// Replay a pane's logged pty output into a fresh terminal (restores the
-/// screen AND scrollback). Oversized logs are truncated at the front first.
-/// Returns the replayed bytes (caller seeds the new pane's log with them so
-/// history survives further restarts).
-pub fn replay_pane_log(name: &str, term: &mut libghostty_vt::Terminal<'_, '_>) -> Vec<u8> {
+/// screen AND scrollback). Oversized logs are truncated at the front first
+/// (cap in bytes). Returns the replayed bytes (caller seeds the new pane's
+/// log with them so history survives further restarts).
+pub fn replay_pane_log(
+    name: &str,
+    term: &mut libghostty_vt::Terminal<'_, '_>,
+    cap_bytes: u64,
+) -> Vec<u8> {
     let path = pane_log_path(name);
     let data = match std::fs::read(&path) {
-        Ok(d) if d.len() as u64 > MAX_LOG_BYTES => truncate_log_front(&path, MAX_LOG_BYTES),
+        Ok(d) if d.len() as u64 > cap_bytes => truncate_log_front(&path, cap_bytes),
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };

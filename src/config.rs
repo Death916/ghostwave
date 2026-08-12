@@ -18,6 +18,10 @@ pub struct Config {
     pub padding: f32,
     /// Row gap in px between terminal lines.
     pub row_gap: f32,
+    /// Per-pane durable-session log cap in MiB. Logs are front-truncated
+    /// when they exceed this; raise it to keep more history, lower it to
+    /// bound disk usage.
+    pub max_log_mb: u64,
     /// AI assistant pane configuration (OpenAI-compatible chat completions).
     pub ai: AiConfig,
 }
@@ -55,6 +59,7 @@ impl Default for Config {
             shell: None,
             padding: 6.0,
             row_gap: 4.0,
+            max_log_mb: 32,
             ai: AiConfig::default(),
         }
     }

@@ -94,6 +94,10 @@ pub struct TermPane {
     /// Pane output log (name + file) for durable sessions.
     pub log_name: String,
     log_file: Option<std::fs::File>,
+    /// Session log cap in bytes; the log is front-truncated when exceeded.
+    log_cap: u64,
+    /// Bytes written to the log since the last truncation.
+    log_bytes: u64,
 }
 
 impl TermPane {
@@ -105,6 +109,7 @@ impl TermPane {
         args: &[&str],
         cwd: Option<&str>,
         scrollback: usize,
+        log_cap_bytes: u64,
     ) -> Result<Self> {
         let shared = Arc::new(Shared {
             size: Mutex::new((cols, rows, cell.w, cell.h)),
@@ -249,6 +254,8 @@ impl TermPane {
             cwd: cwd.map(String::from),
             log_name,
             log_file: Some(log_file),
+            log_cap: log_cap_bytes.max(1024),
+            log_bytes: 0,
         })
     }
 
@@ -286,11 +293,19 @@ impl TermPane {
         }
         match self.pty.read() {
             Ok(data) => {
-                // Tee output into the session log (durable sessions).
+                // Tee output into the session log (durable sessions). The log
+                // is front-truncated when it exceeds the configured cap so it
+                // cannot balloon indefinitely (see session::truncate_log_front).
                 if !data.is_empty() {
                     if let Some(f) = self.log_file.as_mut() {
                         use std::io::Write;
                         let _ = f.write_all(&data);
+                        self.log_bytes += data.len() as u64;
+                        if self.log_bytes > self.log_cap && !self.log_name.is_empty() {
+                            let path = crate::session::pane_log_path(&self.log_name);
+                            let _ = crate::session::truncate_log_front(&path, self.log_cap);
+                            self.log_bytes = self.log_cap;
+                        }
                     }
                     self.term.vt_write(&data);
                 }
@@ -317,6 +332,7 @@ impl TermPane {
         if let Some(f) = self.log_file.as_mut() {
             use std::io::Write;
             let _ = f.write_all(data);
+            self.log_bytes += data.len() as u64;
         }
     }
 

@@ -60,7 +60,8 @@ cargo run
 # font_size is in points (12 = 12pt, like ghostty/waveterm)
 font_size = 12.0
 theme = "tokyonight"
-scrollback = 10000
+scrollback = 10000          # terminal scrollback lines per pane
+max_log_mb = 32             # per-pane session log cap (MiB), front-truncated
 padding = 6.0
 row_gap = 4.0
 ```

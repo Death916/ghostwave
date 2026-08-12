@@ -105,7 +105,6 @@ pub struct App {
     pub theme_name: String,
     pub show_frames: bool,
     pub palette: Option<CommandPalette>,
-    pub ai_visible: bool,
     pub toast: Option<(String, Instant)>,
     pub last_tab: Option<usize>,
     pub rename_buf: String,
@@ -179,11 +178,16 @@ impl App {
                         &args,
                         ps.cwd.as_deref(),
                         config.scrollback,
+                        config.max_log_mb * 1024 * 1024,
                     ) else {
                         continue;
                     };
                     let mut pane = pane;
-                    let seeded = crate::session::replay_pane_log(&ps.log, &mut pane.term);
+                    let seeded = crate::session::replay_pane_log(
+                        &ps.log,
+                        &mut pane.term,
+                        config.max_log_mb * 1024 * 1024,
+                    );
                     pane.log_seed(&seeded);
                     panes.push(Pane::Term(pane));
                 }
@@ -201,6 +205,7 @@ impl App {
                 &[],
                 None,
                 config.scrollback,
+                config.max_log_mb * 1024 * 1024,
             )?;
             tabs.push(Tab::new(Pane::Term(initial), "Tab 1".into()));
         }
@@ -213,7 +218,6 @@ impl App {
             theme_name,
             show_frames: true,
             palette: None,
-            ai_visible: false,
             toast: None,
             last_tab: None,
             rename_buf: String::new(),
@@ -247,7 +251,16 @@ impl App {
         cwd: Option<&str>,
     ) -> crate::Result<usize> {
         let shell = program.or(self.config.shell.as_deref());
-        let pane = TermPane::new(cols, rows, self.cell, shell, args, cwd, self.config.scrollback)?;
+        let pane = TermPane::new(
+            cols,
+            rows,
+            self.cell,
+            shell,
+            args,
+            cwd,
+            self.config.scrollback,
+            self.config.max_log_mb * 1024 * 1024,
+        )?;
         let id = {
             let tab = self.current_tab_mut();
             let id = tab.panes.len();
@@ -453,7 +466,6 @@ impl App {
             Action::OpenFile(path) => self.open_file(path),
             Action::ConnectSsh(host) => self.connect_ssh(&host),
             Action::NewAi => self.new_ai_pane(),
-            Action::ToggleAi => self.ai_visible = !self.ai_visible,
             Action::Theme(name) => self.apply_theme(&name),
             Action::FocusPane(i) => {
                 let leaves = self.current_tab().root.leaves();
@@ -511,6 +523,7 @@ impl App {
             &[],
             None,
             self.config.scrollback,
+            self.config.max_log_mb * 1024 * 1024,
         ) {
             Ok(p) => Pane::Term(p),
             Err(e) => {
@@ -539,6 +552,7 @@ impl App {
                 &[],
                 None,
                 self.config.scrollback,
+                self.config.max_log_mb * 1024 * 1024,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -645,6 +659,7 @@ impl App {
                 &[],
                 None,
                 self.config.scrollback,
+                self.config.max_log_mb * 1024 * 1024,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -804,7 +819,6 @@ impl App {
     pub fn new_ai_pane(&mut self) {
         let pane = Pane::Ai(AiPane::new(self.config.ai.clone()));
         self.push_side_pane(pane);
-        self.ai_visible = true;
     }
 
     /// Add a non-terminal pane as a right split.

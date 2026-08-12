@@ -114,7 +114,6 @@ impl CommandPalette {
             PaletteItem { label: "Paste".into(), action: Paste },
             PaletteItem { label: "Clear Terminal".into(), action: ClearTerminal },
             PaletteItem { label: "New AI Chat".into(), action: NewAi },
-            PaletteItem { label: "Toggle AI Panel".into(), action: ToggleAi },
             PaletteItem { label: "Quit".into(), action: Quit },
         ];
         for t in themes {
