@@ -130,21 +130,19 @@ Key API gotchas discovered (all fixed):
   (&Terminal, &mut PlacementIterator, &Graphics).
 
 ## TODO next (in order)
-1. Re-verify scissor: pane draws no longer rely on skip; confirm
-   set_scissor isn't clipping multi-pane layouts (test a split).
-2. Screenshot QA with grim (window must exist first):
-   `grim /tmp/ghostwave.png` then vision-check it.
+1. ✅ DONE: splits/scissor verified live (user tested pane creation; renders fine).
+2. ✅ DONE: screenshot QA with grim + vision at every step.
 3. ✅ DONE: theme → terminal default fg/bg wired
    (apply_terminal_colors; set_default_fg/bg_color on all panes).
-   Verified: pane bg corner shifted ghostty-gray → tokyonight tint.
 4. ✅ DONE: tab name follows active pane OSC title (unless renamed).
-   NOTE: fish on this box emits NO OSC 0 titles (verified via script(1))
-   → tab stays "Tab 1" until the shell sends one; mechanism is correct.
-5. Test zellij binds live: Ctrl+p n/d/r/s/x/hjkl, Ctrl+t, Ctrl+n resize,
-   Ctrl+s scroll, Ctrl+Shift+P palette, Ctrl+Shift+F search,
-   Ctrl+Shift+C/V copy/paste, Ctrl+M zoom, Ctrl+W close.
-6. cargo build --release for perf check (always-redraw may need
-   per-row dirty optimization later; fine for now).
+5. ✅ DONE: zellij binds tested live by user (Esc-cancel added on request).
+6. ✅ DONE: release build; perf fine (24% CPU idle; always-redraw kept —
+   per-row dirty optimization deferred).
+7. ✅ DONE: durable sessions (pin via right-click tab, restore with
+   scrollback, continuous 2s saves).
+8. NEXT — polish queue: middle-click paste; kitty graphics clipping;
+   preview pane zoom/pan; config extras (cursor style); shell-greeting
+   accumulation on restore (cosmetic).
 
 ---
 
