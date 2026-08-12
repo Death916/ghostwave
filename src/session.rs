@@ -174,7 +174,7 @@ mod tests {
                 panes: vec![PaneState {
                     program: None,
                     args: vec![],
-                    cwd: Some("/home/death916".into()),
+                    cwd: Some("/home/user".into()),
                     log: "pane-test.log".into(),
                 }],
             }],
@@ -183,7 +183,7 @@ mod tests {
         let loaded = load().expect("session should reload");
         assert_eq!(loaded.tabs.len(), 1);
         assert!(loaded.tabs[0].durable);
-        assert_eq!(loaded.tabs[0].panes[0].cwd.as_deref(), Some("/home/death916"));
+        assert_eq!(loaded.tabs[0].panes[0].cwd.as_deref(), Some("/home/user"));
     }
 
     #[test]

@@ -2,9 +2,10 @@
 
 waveterm-style terminal built on **libghostty-vt** (the Rust crate from
 `Uzaaft/libghostty-rs`) + macroquad, with **zellij-style keybindings**.
-Durable sessions deliberately skipped (zellij session mode shows a toast).
+Durable sessions (pin tabs, scrollback restore) implemented — see the
+README.
 
-Project root: `/home/death916/Documents/code/vibed/ghost/`
+Project root: repo checkout.
 Binary name: `ghostwave`
 
 ---
@@ -76,8 +77,8 @@ Binary name: `ghostwave`
   libxcb]` (nix.dev: any string-coercible attr becomes an env var).
   Verified: LDPATH now lists all 9 lib dirs, no deprecation warnings.
   devenv.nix uses `libs = [...]` (devenv's equivalent mechanism).
-  NOTE: must use PROJECT shell.nix (`nix-shell ./shell.nix`); the
-  ~/.hermes shell.nix lacks these libs → runtime dlopen failure.
+  NOTE: must use PROJECT shell.nix (`nix-shell ./shell.nix`); a minimal
+  dev shell lacks these libs → runtime dlopen failure.
 - run3: ✅ windowing init works now (Wayland path succeeded, no more X11
   fallback) → NEW panic: `src/app.rs:173 index out of bounds (len 0)`.
   Cause: `App::new` called `new_term_pane` (which does
@@ -152,7 +153,7 @@ Key API gotchas discovered (all fixed):
     nix-shell ./shell.nix --run "cargo run 2>&1"
     # or interactively:  nix-shell   then   cargo run
 
-- `~/.hermes/shell.nix` was extended with: cargo, rustc 1.95, rustfmt,
+- `a full dev shell (cargo/rustc/zig/fontconfig)` was extended with: cargo, rustc 1.95, rustfmt,
   clippy, **zig_0_15 (0.15.2)** (required by libghostty-vt-sys vendored
   build; plain `zig` = 0.16.0 BREAKS ghostty's build), pkg-config,
   fontconfig, jetbrains-mono.
@@ -317,7 +318,8 @@ remote connection switcher (Ctrl+G — clashes with zellij locked).
 
 ## External facts
 
-- User's machine: ASUS S16, AMD AI 465 (RDNA 3.5 iGPU), 32GB, Hyprland
+- Target platform: Linux/Wayland (Hyprland dev machine), wl-copy/wl-paste
+  clipboard, fish shell dev environment
   Wayland session (WAYLAND_DISPLAY=wayland-1). wl-copy/wl-paste present.
 - nixpkgs zig attr currently resolves to 0.16.0 (ghostty needs ≥0.15.2).
 - rustc 1.95.0 in nixpkgs (crate needs ≥1.90).
