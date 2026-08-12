@@ -29,6 +29,10 @@ Binary name: `ghostwave`
   workspace switches cleanly. (Panics on X11-only sessions; fine here.)
 - Removed per-frame "pane rect" debug spam from layout_all.
 - Cursor blink (500ms phase) driven by terminal blink mode.
+- PIN MARKER: drawn with primitives (no 📌 in the font stack → tofu).
+- FONT STACK: JetBrains Nerd variants (6 family NAMES, same design)
+  collapsed to one slot → Noto Sans Symbols 2 / Symbols / Liberation
+  Mono now load; emoji in terminal output render via fallback.
 - DURABLE SESSIONS: pty output tee'd to ~/.local/share/ghostwave/panes/
   (32MB cap, front-truncate); session.json saved on quit; right-click a
   tab → Pin/Unpin/Rename/Close menu; pinned tabs restore with FULL
