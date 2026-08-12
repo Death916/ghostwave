@@ -11,7 +11,7 @@ Binary name: `ghostwave`
 
 ## STATUS: main terminal features solid — render/mouse/keybinds fixed, parity work in progress
 
-### Recent work (commits 2571ca2 → 7d9eac7)
+### Recent work (commits 2571ca2 → HEAD)
 - Render: always-redraw per libghostty-vt docs (ghostling-rs pattern);
   pane bg = terminal default from snapshot.colors(). Fixed blank/flicker.
 - Mouse: drag selection only while left button held; click focuses pane.
@@ -21,6 +21,14 @@ Binary name: `ghostwave`
 - Search matches get solid bg highlight.
 - Key releases only forwarded for unbound keys (no spam to apps).
 - Zoomed pane re-grids to full content rect.
+- FONT SIZE FIX: font_px was multiplied by screen_dpi_scale() (wl buffer
+  scale = 2.0) but macroquad's draw_text_ex/measure_text work in LOGICAL
+  px (miniquad internal dpi_scale = 1.0 here). Result: font_size=12
+  rendered at 24px and the grid halved (75x36). Fixed: font_size is now
+  interpreted in POINTS like ghostty/waveterm (12pt → 16px @96dpi, no
+  dpi multiplication) → font_px=16, cell=10x26, grid 112x50. Adjustable
+  in ~/.config/ghostwave/config.toml (font_size, points). Line wrapping
+  at the right edge follows the grid.
 - waveterm command blocks: LEGACY feature (new waveterm dropped them) —
   NOT implementing. AI pane context injection: deferred by user.
 - Scrollback search: libghostty-vt 0.2.1 has NO scrollback traversal API

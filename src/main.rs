@@ -378,7 +378,7 @@ async fn main() -> Result<()> {
             let _ = std::fs::create_dir_all(dir);
             let _ = std::fs::write(
                 config::Config::path(),
-                "# ghostwave configuration\nfont_size = 12.0\ntheme = \"tokyonight\"\nscrollback = 10000\npadding = 6.0\nrow_gap = 4.0\n\n[ai]\nbase_url = \"https://api.minimax.chat/v1\"\nmodel = \"MiniMax-M2\"\napi_key_env = \"MINIMAX_API_KEY\"\n",
+                "# ghostwave configuration\n# font_size is in points (12 = 12pt, like ghostty/waveterm)\nfont_size = 12.0\ntheme = \"tokyonight\"\nscrollback = 10000\npadding = 6.0\nrow_gap = 4.0\n\n[ai]\nbase_url = \"https://api.minimax.chat/v1\"\nmodel = \"MiniMax-M2\"\napi_key_env = \"MINIMAX_API_KEY\"\n",
             );
         }
     }

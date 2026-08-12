@@ -107,19 +107,19 @@ impl App {
         let theme_name = config.theme.clone();
         let theme = theme::by_name(&theme_name);
 
-        // Cell metrics: width from the font's advance, height from real line
-        // metrics (ascent + descent) so ascenders/descenders and the block
-        // cursor fit inside the cell. Baseline anchors glyphs in the cell so
-        // cursor and text line up (measure_text on "M" returns cap-height and
-        // offset_y≈0 — unusable as a baseline, that caused the offset cursor).
-        let dpi = macroquad::window::screen_dpi_scale();
+        // Cell metrics. macroquad's draw_text_ex/measure_text treat font_size
+        // in LOGICAL pixels (miniquad's internal dpi_scale is 1.0 on this
+        // Wayland setup even though screen_dpi_scale() reports the wl buffer
+        // scale, e.g. 2.0). font_size is configured in POINTS like ghostty/
+        // waveterm (12pt = 16px at 96dpi); convert to logical px here.
+        let dpi = 1.0; // logical-px drawing; do NOT scale by wl buffer scale
+        let font_px = (config.font_size * 96.0 / 72.0).round().max(6.0) as u16;
         let measured = macroquad::text::measure_text(
             "M",
             Some(&font),
-            config.font_size as u16,
-            dpi,
+            font_px,
+            1.0,
         );
-        let font_px = (config.font_size * dpi).round() as u16;
         let (ascent, descent) = font_stack.line_metrics(font_px as f32);
         let cell_w = (measured.width.max(1.0)).ceil() as u32;
         let cell_h = (ascent + descent + config.row_gap).max(8.0).ceil() as u32;
