@@ -38,6 +38,20 @@ Binary name: `ghostwave`
   never waits on the compositor) + manual 60fps cap (sleep to 16.6ms per
   iteration) in main() so CPU stays sane. User verified switching
   workspaces leaves the app responsive.
+- FLOOD THROUGHPUT: `time seq 1 2000000` was 12.6s vs ghostty 0.56s /
+  cosmic 0.63s (blocked pty writes = we drained one 64KB buffer per
+  16.6ms frame tick). Fix: event-driven pacing — main loop skips its
+  frame sleep while pty data is pending (app.pty_activity), so floods
+  process back-to-back. Result: 1.43s (9x faster; remaining gap vs
+  ghostty ≈ session-log tee + full-grid redraw per frame).
+- RENDER cleanup: blink timer + cursor block moved out of the per-row
+  loop (was re-running per row = redundant FFI calls per frame).
+- EXPLORED + REVERTED: per-row damage skipping (Dirty::Partial/Clean)
+  — the GL backbuffer is NOT guaranteed to retain content between
+  swaps on Wayland/EGL (no buffer age), so skipped rows show
+  black/garbage (the old flicker bug). Proper damage rendering needs
+  an app-owned offscreen render target (macroquad render_target) —
+  deferred; idle CPU is already ~0.
 - Ctrl+Tab = next tab, Ctrl+Shift+Tab = previous tab (global binds).
 - PIN MARKER: drawn with primitives (no 📌 in the font stack → tofu).
 - FONT STACK: JetBrains Nerd variants (6 family NAMES, same design)
