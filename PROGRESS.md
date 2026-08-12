@@ -42,7 +42,10 @@ Binary name: `ghostwave`
   d = detach (save + quit), Esc exit. Startup resumes the last-used
   session; legacy session.json auto-migrates to sessions/default.json.
   THE WHOLE SESSION IS SAVED/RESTORED (all tabs + all terminal panes,
-  full scrollback via log replay) — pin concept REMOVED (it only ever
+  full scrollback via log replay, AND the split/stack layout tree —
+  TabState.root carries layout::Node, ids remapped at save time through
+  the kept-pane mapping; old files without root fall back to one pane) —
+  pin concept REMOVED (it only ever
   filtered restore, causing "only the pinned tab came back"); right-click
   tab menu is now rename/close only. Saved CONTINUOUSLY (every 2s) so a
   kill/crash loses at most seconds. Preview/AI panes not restored.
