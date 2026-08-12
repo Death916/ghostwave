@@ -65,15 +65,26 @@ impl FontStack {
             candidates.push((score, family, PathBuf::from(path)));
         }
         // One font per family (the nerd-font package ships ~18 weights of the
-        // same family — loading them all wastes memory and starves other
-        // families). Highest score first; prefer Regular-ish files on ties.
+        // same design across 6 family NAMES — "JetBrainsMono Nerd Font",
+        // "JetBrainsMonoNL Nerd Font Mono", "…Propo", etc. — loading them all
+        // wastes slots and starves symbol/emoji fonts like Noto Sans Symbols
+        // 2, so all JetBrains variants collapse to one slot). Highest score
+        // first; prefer Regular-ish files on ties.
         let mut by_family: HashMap<String, (i32, String, PathBuf)> = HashMap::new();
         let regularish = |p: &PathBuf| {
             let l = p.to_string_lossy().to_lowercase();
             l.contains("regular") || l.contains("-medium") || l.contains("book")
         };
+        let family_key = |f: &str| {
+            let l = f.to_lowercase();
+            if l.contains("jetbrainsmono") {
+                "jetbrainsmono".to_string()
+            } else {
+                l
+            }
+        };
         for c in candidates {
-            let key = c.1.to_lowercase();
+            let key = family_key(&c.1);
             let better = match by_family.get(&key) {
                 Some(existing) => {
                     c.0 > existing.0

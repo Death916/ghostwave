@@ -28,6 +28,12 @@ Binary name: `ghostwave`
   responding" popup when the X11 loop blocked). Wayland-only handles
   workspace switches cleanly. (Panics on X11-only sessions; fine here.)
 - Removed per-frame "pane rect" debug spam from layout_all.
+- Cursor blink (500ms phase) driven by terminal blink mode.
+- DURABLE SESSIONS: pty output tee'd to ~/.local/share/ghostwave/panes/
+  (32MB cap, front-truncate); session.json saved on quit; right-click a
+  tab → Pin/Unpin/Rename/Close menu; pinned tabs restore with FULL
+  scrollback via log replay (verified end-to-end). Preview/AI panes not
+  restored. Session module unit-tested.
 - Esc exits all modal modes; rename/search Enter+Esc actually work now.
 - Theme → terminal fg/bg wired (set_default_fg/bg_color).
 - Tab label follows active pane OSC title (fish emits none → stays "Tab 1").

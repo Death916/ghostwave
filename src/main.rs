@@ -204,14 +204,14 @@ fn render(app: &mut App) {
             TAB_BAR_H / 2.0 + 4.0,
             TextParams { font: Some(&font), font_size: 14, color: color_theme(col), ..Default::default() },
         );
-        // Pin marker for durable tabs.
+        // Pin marker for durable tabs (drawn with primitives — no font in the
+        // stack has the 📌 emoji; a shape can't tofu).
         if tab.durable {
-            draw_text_ex(
-                "📌",
-                x + 10.0 + measure_text(&label, Some(&font), 14, 1.0).width + 6.0,
-                TAB_BAR_H / 2.0 + 4.0,
-                TextParams { font: Some(&font), font_size: 12, color: color_theme(theme.search_match), ..Default::default() },
-            );
+            let pin_x = x + 10.0 + measure_text(&label, Some(&font), 14, 1.0).width + 14.0;
+            let pin_y = TAB_BAR_H / 2.0;
+            let col = color_theme(theme.search_match);
+            draw_rectangle(pin_x - 1.0, pin_y - 5.0, 2.0, 9.0, col); // shaft
+            draw_circle(pin_x, pin_y - 6.0, 3.0, col);               // head
         }
         }
 
