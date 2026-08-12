@@ -238,6 +238,45 @@ fn render(app: &mut App) {
         }
         }
 
+    // ---- session manager overlay ------------------------------------------
+    if let Some((entries, selected)) = &app.session_list {
+        let w = 460.0_f32;
+        let item_h = 24.0_f32;
+        let title_h = 30.0_f32;
+        let hint_h = 22.0_f32;
+        let h = title_h + entries.len() as f32 * item_h + hint_h;
+        let x = (screen_width() - w) / 2.0;
+        let y = (screen_height() - h) / 3.0;
+        draw_rectangle(x, y, w, h, color_theme(theme.bg));
+        draw_rectangle_lines(x, y, w, h, 1.0, color_theme(theme.tab_bg));
+        draw_text_ex(
+            &format!("SESSIONS — current: {}", app.current_session),
+            x + 12.0,
+            y + 20.0,
+            TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.search_match), ..Default::default() },
+        );
+        for (i, name) in entries.iter().enumerate() {
+            let yy = y + title_h + i as f32 * item_h;
+            if i == *selected {
+                draw_rectangle(x, yy, w, item_h, color_theme(theme.tab_active));
+            }
+            let cur = *name == app.current_session;
+            let label = if cur { format!("● {name}") } else { format!("  {name}") };
+            draw_text_ex(
+                &label,
+                x + 12.0,
+                yy + item_h / 2.0 + 5.0,
+                TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.palette_fg), ..Default::default() },
+            );
+        }
+        draw_text_ex(
+            "↑/↓ select | Enter switch | n new | r rename | d delete | Esc close",
+            x + 12.0,
+            y + h - 8.0,
+            TextParams { font: Some(&font), font_size: 12, color: color_theme(theme.status_fg), ..Default::default() },
+        );
+    }
+
     // ---- search input overlay --------------------------------------------
     if app.mode == Mode::EnterSearch {
         if let Some(t) = app.active_term() {

@@ -19,6 +19,7 @@ pub enum Mode {
     Locked,
     RenameTab,
     RenamePane,
+    RenameSession,
 }
 
 impl Mode {
@@ -36,6 +37,7 @@ impl Mode {
             Mode::Locked => "LOCKED",
             Mode::RenameTab => "RENAME TAB",
             Mode::RenamePane => "RENAME PANE",
+            Mode::RenameSession => "RENAME SESSION",
         }
     }
 
@@ -50,10 +52,11 @@ impl Mode {
             Mode::Search => "n/p next/prev | c case | w wrap | o whole word | Ctrl+s done | Esc exit",
             Mode::EnterSearch => "type to search | Enter done | Esc cancel",
             Mode::Move => "h/j/k/l move pane | n next | p previous | Esc exit",
-            Mode::Session => "sessions deferred (durable sessions not implemented)",
+            Mode::Session => "w session manager | d detach (save+quit) | Esc exit",
             Mode::Locked => "Ctrl+g unlock (input passes through)",
             Mode::RenameTab => "type new tab name | Enter confirm | Esc cancel",
             Mode::RenamePane => "type new pane name | Enter confirm | Esc cancel",
+            Mode::RenameSession => "type new session name | Enter confirm | Esc cancel",
         }
     }
 }
@@ -121,6 +124,12 @@ pub enum Action {
     OpenFile(String),
     ConnectSsh(String),
     NewAi,
+    // session mode
+    SessionManager,
+    SessionNew,
+    SessionRename,
+    SessionDelete,
+    Detach,
     Theme(String),
     FocusPane(u8),
     MoveTab(Dir),
@@ -289,7 +298,7 @@ pub fn handle(mode: Mode, kp: &KeyPress) -> Dispatch {
     }
 
     // Rename modes: text capture.
-    if mode == Mode::RenameTab || mode == Mode::RenamePane {
+    if mode == Mode::RenameTab || mode == Mode::RenamePane || mode == Mode::RenameSession {
         if kp.key == Key::Escape || ctrl(k, m, Key::C) {
             return Dispatch::Action(Action::ExitMode);
         }
@@ -343,7 +352,7 @@ pub fn handle(mode: Mode, kp: &KeyPress) -> Dispatch {
         Mode::Search => search_binds(k, m),
         Mode::Move => move_binds(k, m),
         Mode::Session => session_binds(k, m),
-        Mode::EnterSearch | Mode::RenameTab | Mode::RenamePane | Mode::Locked => {
+        Mode::EnterSearch | Mode::RenameTab | Mode::RenamePane | Mode::RenameSession | Mode::Locked => {
             return Dispatch::Ignore
         }
     };
@@ -488,16 +497,9 @@ fn move_binds(k: Key, m: Mods) -> Option<Action> {
 fn session_binds(k: Key, m: Mods) -> Option<Action> {
     use Key::*;
     Some(match k {
-        _ if plain(k, m, D) => Action::Toast("detach: durable sessions deferred"),
-        _ if plain(k, m, W)
-            || plain(k, m, C)
-            || plain(k, m, P)
-            || plain(k, m, A)
-            || plain(k, m, S)
-            || plain(k, m, L) =>
-        {
-            Action::Toast("plugins not implemented")
-        }
+        // zellij-style: w = session manager, d = detach.
+        _ if plain(k, m, W) => Action::SessionManager,
+        _ if plain(k, m, D) => Action::Detach,
         _ => return None,
     })
 }

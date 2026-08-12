@@ -111,6 +111,10 @@ pub struct App {
     pub search_mode_active: bool,
     /// Right-click tab context menu: (tab index, menu origin x, y).
     pub tab_menu: Option<(usize, f32, f32)>,
+    /// Name of the session this app instance runs inside.
+    pub current_session: String,
+    /// Session manager overlay: (session names, selected index).
+    pub session_list: Option<(Vec<String>, usize)>,
     pub cell: CellDims,
     pub font_px: u16,
     pub config: Config,
@@ -158,44 +162,18 @@ impl App {
             macroquad::window::screen_height(),
         );
 
-        // Restore a durable session if one exists; otherwise create the
-        // initial shell pane (no tabs exist yet, so new_term_pane would
-        // index an empty vec).
+        // Restore the last-used named session if it has durable tabs;
+        // otherwise create the initial shell pane (no tabs exist yet, so
+        // new_term_pane would index an empty vec).
+        let current_session = crate::session::last_session();
+        crate::session::set_last_session(&current_session);
         let cols: u16 = 100;
         let rows: u16 = 30;
-        let session = crate::session::load();
-        let mut tabs: Vec<Tab> = Vec::new();
-        if let Some(sess) = session {
-            for ts in sess.tabs.iter().filter(|t| t.durable && !t.panes.is_empty()) {
-                let mut panes: Vec<Pane> = Vec::new();
-                for ps in &ts.panes {
-                    let args: Vec<&str> = ps.args.iter().map(String::as_str).collect();
-                    let Ok(pane) = TermPane::new(
-                        cols,
-                        rows,
-                        cell,
-                        ps.program.as_deref(),
-                        &args,
-                        ps.cwd.as_deref(),
-                        config.scrollback,
-                        config.max_log_mb * 1024 * 1024,
-                    ) else {
-                        continue;
-                    };
-                    let mut pane = pane;
-                    let seeded = crate::session::replay_pane_log(
-                        &ps.log,
-                        &mut pane.term,
-                        config.max_log_mb * 1024 * 1024,
-                    );
-                    pane.log_seed(&seeded);
-                    panes.push(Pane::Term(pane));
-                }
-                if !panes.is_empty() {
-                    tabs.push(Tab::from_panes(panes, ts.name.clone()));
-                }
-            }
-        }
+        let tabs = match crate::session::load(&current_session) {
+            Some(sess) => Self::tabs_from_session(&sess, cols, rows, cell, &config)?,
+            None => Vec::new(),
+        };
+        let mut tabs = tabs;
         if tabs.is_empty() {
             let initial = TermPane::new(
                 cols,
@@ -212,6 +190,7 @@ impl App {
 
         let mut app = Self {
             tabs,
+            current_session,
             active_tab: 0,
             mode: Mode::Normal,
             theme,
@@ -231,6 +210,7 @@ impl App {
             quit: false,
             mouse_pane: None,
             tab_menu: None,
+            session_list: None,
             last_session_save: std::time::Instant::now(),
         };
 
@@ -466,6 +446,31 @@ impl App {
             Action::OpenFile(path) => self.open_file(path),
             Action::ConnectSsh(host) => self.connect_ssh(&host),
             Action::NewAi => self.new_ai_pane(),
+            Action::SessionManager => self.open_session_manager(),
+            Action::SessionNew => {
+                let name = self.next_session_name();
+                self.new_session(&name);
+            }
+            Action::SessionRename => {
+                self.mode = Mode::RenameSession;
+                self.rename_buf = self.current_session.clone();
+            }
+            Action::SessionDelete => {
+                if self.current_session == "default" {
+                    self.toast("cannot delete the default session");
+                } else {
+                    let name = self.current_session.clone();
+                    crate::session::delete(&name);
+                    self.current_session = "default".into();
+                    self.load_session("default");
+                    self.toast(&format!("deleted session: {name}"));
+                }
+            }
+            Action::Detach => {
+                self.save_session();
+                self.toast(&format!("session {} saved — quitting", self.current_session));
+                self.quit = true;
+            }
             Action::Theme(name) => self.apply_theme(&name),
             Action::FocusPane(i) => {
                 let leaves = self.current_tab().root.leaves();
@@ -493,14 +498,32 @@ impl App {
             }
             Action::ConfirmRename => {
                 let name = std::mem::take(&mut self.rename_buf);
-                let was_tab = self.mode == Mode::RenameTab;
-                self.mode = Mode::Normal;
-                if !name.is_empty() {
-                    if was_tab {
-                        self.current_tab_mut().name = name;
-                    } else if let Some(t) = self.active_term_mut() {
-                        t.name = name;
+                match self.mode {
+                    Mode::RenameTab => {
+                        self.mode = Mode::Normal;
+                        if !name.is_empty() {
+                            self.current_tab_mut().name = name;
+                        }
                     }
+                    Mode::RenamePane => {
+                        self.mode = Mode::Normal;
+                        if !name.is_empty() {
+                            if let Some(t) = self.active_term_mut() {
+                                t.name = name;
+                            }
+                        }
+                    }
+                    Mode::RenameSession => {
+                        self.mode = Mode::Normal;
+                        if !name.is_empty() && name != self.current_session {
+                            let old = self.current_session.clone();
+                            crate::session::rename(&old, &name);
+                            self.current_session = name.clone();
+                            crate::session::set_last_session(&name);
+                            self.toast(&format!("session renamed: {name}"));
+                        }
+                    }
+                    _ => self.mode = Mode::Normal,
                 }
             }
         }
@@ -882,7 +905,8 @@ impl App {
                 })
                 .collect(),
         };
-        crate::session::save(&state);
+        crate::session::save(&self.current_session, &state);
+        crate::session::set_last_session(&self.current_session);
     }
 
     // ---- tab context menu -------------------------------------------------
@@ -894,6 +918,146 @@ impl App {
         let state = if tab.durable { "pinned" } else { "unpinned" };
         let name = tab.name.clone();
         self.toast(&format!("tab {state}: {name} (restored on restart)"));
+    }
+
+    // ---- sessions ---------------------------------------------------------
+
+    /// Build tabs (with replayed scrollback) from a saved session state.
+    fn tabs_from_session(
+        sess: &crate::session::SessionState,
+        cols: u16,
+        rows: u16,
+        cell: CellDims,
+        config: &Config,
+    ) -> crate::Result<Vec<Tab>> {
+        let mut tabs: Vec<Tab> = Vec::new();
+        for ts in sess.tabs.iter().filter(|t| t.durable && !t.panes.is_empty()) {
+            let mut panes: Vec<Pane> = Vec::new();
+            for ps in &ts.panes {
+                let args: Vec<&str> = ps.args.iter().map(String::as_str).collect();
+                let Ok(pane) = TermPane::new(
+                    cols,
+                    rows,
+                    cell,
+                    ps.program.as_deref(),
+                    &args,
+                    ps.cwd.as_deref(),
+                    config.scrollback,
+                    config.max_log_mb * 1024 * 1024,
+                ) else {
+                    continue;
+                };
+                let mut pane = pane;
+                let seeded = crate::session::replay_pane_log(
+                    &ps.log,
+                    &mut pane.term,
+                    config.max_log_mb * 1024 * 1024,
+                );
+                pane.log_seed(&seeded);
+                panes.push(Pane::Term(pane));
+            }
+            if !panes.is_empty() {
+                tabs.push(Tab::from_panes(panes, ts.name.clone()));
+            }
+        }
+        Ok(tabs)
+    }
+
+    /// Switch the whole window to a saved session (replacing tabs).
+    pub fn load_session(&mut self, name: &str) {
+        if name == self.current_session {
+            self.toast(&format!("already in session: {name}"));
+            return;
+        }
+        self.save_session(); // persist the outgoing session
+        let cols: u16 = 100;
+        let rows: u16 = 30;
+        let tabs = match crate::session::load(name) {
+            Some(sess) => Self::tabs_from_session(&sess, cols, rows, self.cell, &self.config)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let mut tabs = tabs;
+        if tabs.is_empty() {
+            match TermPane::new(
+                cols,
+                rows,
+                self.cell,
+                self.config.shell.as_deref(),
+                &[],
+                None,
+                self.config.scrollback,
+                self.config.max_log_mb * 1024 * 1024,
+            ) {
+                Ok(p) => tabs.push(Tab::new(Pane::Term(p), "Tab 1".into())),
+                Err(e) => {
+                    self.toast(&format!("failed to open session {name}: {e}"));
+                    return;
+                }
+            }
+        }
+        self.tabs = tabs;
+        self.active_tab = 0;
+        self.current_session = name.to_string();
+        crate::session::set_last_session(name);
+        self.apply_terminal_colors();
+        self.layout_all();
+        self.toast(&format!("session: {name}"));
+    }
+
+    /// Start a fresh (empty) session under `name`.
+    pub fn new_session(&mut self, name: &str) {
+        self.save_session();
+        let cols: u16 = 100;
+        let rows: u16 = 30;
+        match TermPane::new(
+            cols,
+            rows,
+            self.cell,
+            self.config.shell.as_deref(),
+            &[],
+            None,
+            self.config.scrollback,
+            self.config.max_log_mb * 1024 * 1024,
+        ) {
+            Ok(p) => {
+                self.tabs = vec![Tab::new(Pane::Term(p), "Tab 1".into())];
+                self.active_tab = 0;
+                self.current_session = name.to_string();
+                crate::session::set_last_session(name);
+                self.apply_terminal_colors();
+                self.layout_all();
+                self.toast(&format!("new session: {name}"));
+            }
+            Err(e) => self.toast(&format!("failed to start session: {e}")),
+        }
+    }
+
+    /// Next free auto-generated session name (session-1, session-2, …).
+    fn next_session_name(&self) -> String {
+        let existing = crate::session::list_sessions();
+        let mut i = 1;
+        loop {
+            let name = format!("session-{i}");
+            if !existing.iter().any(|e| e == &name) {
+                return name;
+            }
+            i += 1;
+        }
+    }
+
+    /// Open the session manager overlay (list of saved sessions).
+    pub fn open_session_manager(&mut self) {
+        let mut entries = crate::session::list_sessions();
+        if !entries.iter().any(|e| e == &self.current_session) {
+            entries.push(self.current_session.clone());
+            entries.sort();
+        }
+        let selected = entries
+            .iter()
+            .position(|e| e == &self.current_session)
+            .unwrap_or(0);
+        self.session_list = Some((entries, selected));
     }
 
     // ---- layout ----------------------------------------------------------
@@ -1003,6 +1167,70 @@ impl App {
             return;
         }
 
+        // Session manager overlay.
+        if self.session_list.is_some() {
+            match k {
+                Key::Escape => self.session_list = None,
+                Key::ArrowUp => {
+                    if let Some((_, sel)) = self.session_list.as_mut() {
+                        *sel = sel.saturating_sub(1);
+                    }
+                }
+                Key::ArrowDown => {
+                    if let Some((e, sel)) = self.session_list.as_mut() {
+                        *sel = (*sel + 1).min(e.len().saturating_sub(1));
+                    }
+                }
+                Key::Enter => {
+                    let name = self
+                        .session_list
+                        .take()
+                        .and_then(|(e, sel)| e.get(sel).cloned());
+                    self.mode = Mode::Normal;
+                    if let Some(name) = name {
+                        self.load_session(&name);
+                    }
+                }
+                Key::R => {
+                    let name = self
+                        .session_list
+                        .take()
+                        .and_then(|(e, sel)| e.get(sel).cloned());
+                    self.mode = Mode::RenameSession;
+                    self.rename_buf = name.unwrap_or_default();
+                }
+                Key::D => {
+                    let name = self
+                        .session_list
+                        .as_ref()
+                        .and_then(|(e, sel)| e.get(*sel).cloned());
+                    if let Some(name) = name {
+                        if name != self.current_session {
+                            crate::session::delete(&name);
+                            let entries = crate::session::list_sessions();
+                            if let Some((e, sel)) = self.session_list.as_mut() {
+                                *e = entries;
+                                if *sel >= e.len() {
+                                    *sel = e.len().saturating_sub(1);
+                                }
+                            }
+                            self.toast(&format!("deleted session: {name}"));
+                        } else {
+                            self.toast("cannot delete the current session");
+                        }
+                    }
+                }
+                Key::N => {
+                    let name = self.next_session_name();
+                    self.session_list = None;
+                    self.mode = Mode::Normal;
+                    self.new_session(&name);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Mode entry binds.
         if let Some(new_mode) = keymap::entry_bind(k, m) {
             self.mode = if self.mode == new_mode { Mode::Normal } else { new_mode };
@@ -1050,7 +1278,7 @@ impl App {
                         t.search.set_query(format!("{}{c}", t.search.query));
                     }
                 }
-                Mode::RenameTab | Mode::RenamePane => {
+                Mode::RenameTab | Mode::RenamePane | Mode::RenameSession => {
                     self.rename_buf.push(c);
                 }
                 _ => {}
@@ -1070,7 +1298,7 @@ impl App {
                     t.search.set_query(format!("{}{c}", t.search.query));
                 }
             }
-            Mode::RenameTab | Mode::RenamePane => self.rename_buf.push(c),
+            Mode::RenameTab | Mode::RenamePane | Mode::RenameSession => self.rename_buf.push(c),
             Mode::Normal | Mode::Locked => {
                 if let Some(t) = self.active_term_mut() {
                     t.handle_char(c);

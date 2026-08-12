@@ -34,14 +34,17 @@ Binary name: `ghostwave`
 - FONT STACK: JetBrains Nerd variants (6 family NAMES, same design)
   collapsed to one slot → Noto Sans Symbols 2 / Symbols / Liberation
   Mono now load; emoji in terminal output render via fallback.
-- DURABLE SESSIONS: pty output tee'd to ~/.local/share/ghostwave/panes/
-  (cap: config max_log_mb, default 32 MiB, front-truncated LIVE during
-  logging so logs cannot balloon; prune of dead logs at save);
-  session.json saved CONTINUOUSLY (every 2s, not just on quit) so a
-  kill/crash loses at most seconds; right-click a tab →
-  Pin/Unpin/Rename/Close menu; pinned tabs restore with FULL scrollback
-  via log replay (verified end-to-end with real user content).
-  Preview/AI panes not restored. Session module unit-tested.
+- DURABLE SESSIONS (zellij-style): every pane's pty output tee'd to
+  ~/.local/share/ghostwave/panes/ (cap: config max_log_mb, default 32 MiB,
+  front-truncated LIVE during logging; prune of dead logs at save).
+  NAMED sessions under sessions/<name>.json: Ctrl+o → session mode →
+  w = session manager (↑/↓ + Enter switch, n new, r rename, d delete),
+  d = detach (save + quit), Esc exit. Startup resumes the last-used
+  session; legacy session.json auto-migrates to sessions/default.json.
+  Pinned tabs restore with FULL scrollback via log replay; session.json
+  saved CONTINUOUSLY (every 2s) so a kill/crash loses at most seconds.
+  Preview/AI panes not restored. Unit-tested (save/load/delete/rename,
+  front truncation).
   NOTE: each restore spawns a fresh shell whose greeting appends to the
   log — shell greetings accumulate across restarts (cosmetic).
 - REMOVED dead Ctrl+Shift+A bind + ToggleAi action + ai_visible flag

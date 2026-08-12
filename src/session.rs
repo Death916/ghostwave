@@ -1,17 +1,21 @@
 //! Durable sessions (waveterm/zellij-style): every pane's pty output is
-//! tee'd to a log file; on quit the session state (tabs marked durable) is
-//! saved as JSON. On startup, durable tabs are recreated and their logs are
-//! replayed into fresh terminals, restoring screen AND scrollback.
+//! tee'd to a log file; sessions are NAMED and saved as JSON under
+//! ~/.local/share/ghostwave/sessions/<name>.json. The app runs inside one
+//! session (default: "default"); Ctrl+o → session mode → `w` opens the
+//! session manager (switch/new/rename/delete). Switching sessions replaces
+//! the current tabs and replays the saved pane logs, restoring screen AND
+//! scrollback.
 //!
 //! Design decisions:
 //! - ALL panes log (cheap; a pane designated durable mid-session keeps its
 //!   full history). Only durable tabs are restored.
 //! - Logs are raw pty bytes, replayed with vt_write. Exact restoration.
-//! - Log cap: MAX_LOG_BYTES per pane; when exceeded the log is truncated at
-//!   the front — the restored terminal then shows the tail, and the screen
+//! - Log cap: config max_log_mb per pane; when exceeded the log is truncated
+//!   at the front — the restored terminal then shows the tail, and the screen
 //!   may start mid-state. (Checkpointing the screen state would require
 //!   Format::Full which libghostty-vt 0.2.1 does not expose.)
-//! - Old logs (panes that no longer exist) are pruned at save time.
+//! - Old logs (panes that no longer exist in ANY session) are pruned at save.
+//! - Legacy single session.json is migrated to sessions/default.json.
 
 use std::path::PathBuf;
 
@@ -50,41 +54,124 @@ pub fn dir() -> PathBuf {
     base.join("ghostwave")
 }
 
-pub fn state_path() -> PathBuf {
-    dir().join("session.json")
+pub fn sessions_dir() -> PathBuf {
+    dir().join("sessions")
+}
+
+pub fn session_path(name: &str) -> PathBuf {
+    // Names come from user input; sanitize to a safe filename.
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    sessions_dir().join(format!("{safe}.json"))
+}
+
+/// Last-used session name marker.
+pub fn last_session_path() -> PathBuf {
+    dir().join("last_session")
+}
+
+pub fn last_session() -> String {
+    std::fs::read_to_string(last_session_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".into())
+}
+
+pub fn set_last_session(name: &str) {
+    let _ = std::fs::create_dir_all(dir());
+    let _ = std::fs::write(last_session_path(), name);
+}
+
+/// Sorted names of saved sessions (excluding empty).
+pub fn list_sessions() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(sessions_dir()) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(stem) = name.strip_suffix(".json") {
+                out.push(stem.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 pub fn pane_log_path(name: &str) -> PathBuf {
     dir().join("panes").join(name)
 }
 
-pub fn load() -> Option<SessionState> {
-    let bytes = std::fs::read(state_path()).ok()?;
+/// Migrate the legacy single session.json → sessions/default.json.
+fn migrate_legacy() {
+    let legacy = dir().join("session.json");
+    if legacy.exists() && !session_path("default").exists() {
+        let _ = std::fs::create_dir_all(sessions_dir());
+        if let Ok(bytes) = std::fs::read(&legacy) {
+            let _ = std::fs::write(session_path("default"), bytes);
+        }
+        let _ = std::fs::remove_file(&legacy);
+    }
+}
+
+pub fn load(name: &str) -> Option<SessionState> {
+    migrate_legacy();
+    let bytes = std::fs::read(session_path(name)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-pub fn save(state: &SessionState) {
-    let _ = std::fs::create_dir_all(dir().join("panes"));
+pub fn save(name: &str, state: &SessionState) {
+    let _ = std::fs::create_dir_all(sessions_dir());
     match serde_json::to_string_pretty(state) {
         Ok(json) => {
-            let _ = std::fs::write(state_path(), json);
-            prune_logs(state);
+            let _ = std::fs::write(session_path(name), json);
+            prune_logs();
         }
         Err(e) => eprintln!("ghostwave: session save failed: {e}"),
     }
 }
 
-/// Delete pane logs not referenced by the current session.
-fn prune_logs(state: &SessionState) {
+pub fn delete(name: &str) {
+    let _ = std::fs::remove_file(session_path(name));
+    if last_session() == name {
+        let _ = std::fs::remove_file(last_session_path());
+    }
+    prune_logs();
+}
+
+/// Rename a saved session (preserving its pane log references).
+pub fn rename(old: &str, new: &str) {
+    if old == new {
+        return;
+    }
+    if let Some(state) = load(old) {
+        save(new, &state);
+    }
+    let _ = std::fs::remove_file(session_path(old));
+    if last_session() == old {
+        set_last_session(new);
+    }
+}
+
+/// Delete pane logs not referenced by ANY saved session.
+fn prune_logs() {
+    migrate_legacy();
     let panes_dir = dir().join("panes");
     let Ok(entries) = std::fs::read_dir(&panes_dir) else {
         return;
     };
-    let live: std::collections::HashSet<String> = state
-        .tabs
-        .iter()
-        .flat_map(|t| t.panes.iter().map(|p| p.log.clone()))
-        .collect();
+    let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in list_sessions() {
+        if let Some(state) = load(&name) {
+            for tab in &state.tabs {
+                for p in &tab.panes {
+                    live.insert(p.log.clone());
+                }
+            }
+        }
+    }
     for entry in entries.flatten() {
         if let Some(name) = entry.file_name().to_str().map(String::from) {
             if !live.contains(&name) {
@@ -181,11 +268,14 @@ mod tests {
                 }],
             }],
         };
-        save(&state);
-        let loaded = load().expect("session should reload");
+        save("test-sess", &state);
+        let loaded = load("test-sess").expect("session should reload");
         assert_eq!(loaded.tabs.len(), 1);
         assert!(loaded.tabs[0].durable);
         assert_eq!(loaded.tabs[0].panes[0].cwd.as_deref(), Some("/home/user"));
+        assert!(list_sessions().iter().any(|s| s == "test-sess"));
+        delete("test-sess");
+        assert!(!session_path("test-sess").exists());
     }
 
     #[test]
