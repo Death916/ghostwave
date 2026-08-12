@@ -123,6 +123,9 @@ pub struct App {
     mouse_pane: Option<(usize, usize)>, // (tab, pane)
     /// Last time the durable session was persisted (continuous save).
     last_session_save: std::time::Instant,
+    /// True when the last update() drained pty data (event-driven pacing:
+    /// the main loop skips its frame sleep while there's backlog).
+    pub pty_activity: bool,
 }
 
 impl App {
@@ -208,6 +211,7 @@ impl App {
             tab_menu: None,
             session_list: None,
             last_session_save: std::time::Instant::now(),
+            pty_activity: false,
         };
 
         // Apply the configured theme's fg/bg to the initial terminal.
@@ -294,10 +298,12 @@ impl App {
             Action::ToggleFrames => {
                 self.show_frames = !self.show_frames;
                 self.layout_all();
+                self.repaint_all(); // frame lines are drawn over pane edges
             }
             Action::RenamePane => {
                 self.mode = Mode::RenamePane;
                 self.rename_buf.clear();
+                self.repaint_all(); // input box is drawn over content
             }
             Action::CycleStack => self.cycle_stack(),
             Action::NewTab => self.new_tab(),
@@ -323,6 +329,7 @@ impl App {
             Action::RenameTab => {
                 self.mode = Mode::RenameTab;
                 self.rename_buf.clear();
+                self.repaint_all(); // input box is drawn over content
             }
             Action::BreakPane => self.break_pane(),
             Action::Resize(dir, increase) => {
@@ -380,6 +387,7 @@ impl App {
             Action::OpenSearch => {
                 self.mode = Mode::EnterSearch;
                 self.search_mode_active = true;
+                self.repaint_all(); // input box + match highlights over content
                 if let Some(t) = self.active_term_mut() {
                     t.search.start();
                 }
@@ -422,6 +430,7 @@ impl App {
             Action::OpenCommandBar => {
                 let items = CommandPalette::default_items(&theme::names());
                 self.palette = Some(CommandPalette::new(items));
+                self.repaint_all(); // palette is drawn over content
             }
             Action::Copy => {
                 if let Some(t) = self.active_term_mut() {
@@ -450,6 +459,7 @@ impl App {
             Action::SessionRename => {
                 self.mode = Mode::RenameSession;
                 self.rename_buf = self.current_session.clone();
+                self.repaint_all(); // input box is drawn over content
             }
             Action::SessionDelete => {
                 if self.current_session == "default" {
@@ -484,7 +494,10 @@ impl App {
                 self.active_tab = next;
             }
             Action::Toast(msg) => self.toast(msg),
-            Action::ExitMode => self.mode = Mode::Normal,
+            Action::ExitMode => {
+                self.mode = Mode::Normal;
+                self.repaint_all(); // search/rename overlays disappear
+            }
             Action::ConfirmSearch => {
                 // Enter in the search box: switch to Search navigation mode.
                 self.mode = Mode::Search;
@@ -527,6 +540,22 @@ impl App {
 
     pub fn toast(&mut self, msg: &str) {
         self.toast = Some((msg.to_string(), Instant::now()));
+        // The toast is drawn over pane content: the covered cells need a
+        // full repaint when it appears (and on expiry, handled in update).
+        self.repaint_all();
+    }
+
+    /// Force a full repaint of every terminal pane (anything drawn over
+    /// pane content — overlays, toasts, focus moves, theme changes — must
+    /// repaint the covered cells; damage-based rendering skips clean panes).
+    pub fn repaint_all(&mut self) {
+        for tab in &mut self.tabs {
+            for pane in &mut tab.panes {
+                if let Pane::Term(t) = pane {
+                    t.force_repaint = true;
+                }
+            }
+        }
     }
 
     // ---- tab ops ---------------------------------------------------------
@@ -1166,6 +1195,7 @@ impl App {
         if self.tab_menu.is_some() {
             if k == Key::Escape {
                 self.tab_menu = None;
+                self.repaint_all();
             }
             return;
         }
@@ -1173,12 +1203,16 @@ impl App {
         // Palette input takes precedence.
         if let Some(pal) = self.palette.as_mut() {
             match k {
-                Key::Escape => self.palette = None,
+                Key::Escape => {
+                    self.palette = None;
+                    self.repaint_all();
+                }
                 Key::Enter => {
                     if let Some(item) = pal.selected() {
                         let action = item.action.clone();
                         self.palette = None;
                         self.mode = Mode::Normal;
+                        self.repaint_all(); // palette closes before executing
                         self.execute(action);
                     }
                 }
@@ -1200,7 +1234,10 @@ impl App {
         // Session manager overlay.
         if self.session_list.is_some() {
             match k {
-                Key::Escape => self.session_list = None,
+                Key::Escape => {
+                    self.session_list = None;
+                    self.repaint_all();
+                }
                 Key::ArrowUp => {
                     if let Some((_, sel)) = self.session_list.as_mut() {
                         *sel = sel.saturating_sub(1);
@@ -1434,6 +1471,7 @@ impl App {
                     }
                 }
                 self.tab_menu = None;
+                self.repaint_all(); // menu box covered pane content
                 return;
             }
         }
@@ -1445,6 +1483,7 @@ impl App {
                 let idx = (mx / tab_w) as usize;
                 if idx < self.tabs.len() {
                     self.tab_menu = Some((idx, mx, my));
+                    self.repaint_all(); // menu box covers pane content
                 }
             }
             if is_mouse_button_pressed(MouseButton::Left) {
@@ -1460,6 +1499,7 @@ impl App {
         // Palette click closes.
         if self.palette.is_some() && is_mouse_button_pressed(MouseButton::Left) {
             self.palette = None;
+            self.repaint_all(); // palette box covered pane content
             return;
         }
 
@@ -1480,6 +1520,7 @@ impl App {
         if is_mouse_button_pressed(MouseButton::Left) || is_mouse_button_pressed(MouseButton::Right) {
             if self.current_tab().active != pane_id {
                 self.current_tab_mut().active = pane_id;
+                self.repaint_all(); // cursor moved to another pane
             }
         }
         self.mouse_pane = Some((self.active_tab, pane_id));
@@ -1617,6 +1658,8 @@ impl App {
     // ---- per-frame updates ----------------------------------------------
 
     pub fn update(&mut self) {
+        self.pty_activity = false;
+
         // Persist the durable session every 2s so a crash/kill loses at most
         // a couple of seconds (quit also saves explicitly).
         if self.last_session_save.elapsed().as_secs() >= 2 {
@@ -1624,12 +1667,24 @@ impl App {
             self.last_session_save = std::time::Instant::now();
         }
 
+        // Toast expiry: repaint when it disappears (it's drawn over content).
+        if let Some((_, t)) = self.toast {
+            if t.elapsed().as_secs() >= 3 {
+                self.toast = None;
+                self.repaint_all();
+            }
+        }
+
         // Drain pty output for every pane in every tab.
         for tab in self.tabs.iter_mut() {
             let mut i = 0;
             while i < tab.panes.len() {
                 match &mut tab.panes[i] {
-                    Pane::Term(t) => t.poll_pty(),
+                    Pane::Term(t) => {
+                        if t.poll_pty() {
+                            self.pty_activity = true;
+                        }
+                    }
                     Pane::Ai(a) => a.poll(),
                     Pane::Preview(_) => {}
                     Pane::Closed => {}

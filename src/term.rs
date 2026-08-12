@@ -285,11 +285,12 @@ impl TermPane {
         Ok(())
     }
 
-    /// Drain pty output into the terminal. Call every frame.
-    pub fn poll_pty(&mut self) {
+    /// Drain pty output into the terminal. Call every frame. Returns true
+    /// when pty data was processed (used for event-driven frame pacing).
+    pub fn poll_pty(&mut self) -> bool {
         if self.exited.is_some() {
             self.child.poll_reap();
-            return;
+            return false;
         }
         match self.pty.read() {
             Ok(data) => {
@@ -308,15 +309,19 @@ impl TermPane {
                         }
                     }
                     self.term.vt_write(&data);
+                    return true;
                 }
+                return false;
             }
             Err(PtyError::EndOfStream) => {
                 self.exited = Some("process exited".into());
                 self.force_repaint = true;
+                return false;
             }
             Err(PtyError::OtherError(e)) => {
                 self.exited = Some(format!("pty error: {e}"));
                 self.force_repaint = true;
+                return false;
             }
         }
         self.child.poll_reap();
@@ -550,17 +555,28 @@ impl TermPane {
         let (ox, oy) = (rect.x, rect.y);
 
         self.last_rect = Some(rect);
-        self.force_repaint = false;
 
         let snapshot = self.render_state.update(&self.term)?;
         let colors = snapshot.colors()?;
 
         // Documented libghostty-vt pattern (ghostling-rs reference): draw the
         // pane background every frame using the TERMINAL's default bg, then
-        // redraw ALL rows/cells every frame, then reset dirty flags. No
-        // skip-on-clean optimization: skipping combined with per-frame bg
-        // painting erased the pane on clean frames (flicker / blank pane).
+        // redraw ALL rows/cells every frame, then reset dirty flags. NOTE:
+        // per-row damage skipping is NOT possible against the swapchain —
+        // the GL backbuffer is not guaranteed to retain content between
+        // swaps (no buffer-age on Wayland/EGL), so skipping rows leaves
+        // black/garbage (the old flicker bug). Damage rendering would need
+        // an offscreen render target owned by the app (TODO, perf branch).
         draw_rectangle(ox, oy, rect.w, rect.h, color(colors.background));
+
+        // Blink phase (updated here, once per frame — not per row).
+        if snapshot.cursor_blinking()? {
+            let now = std::time::Instant::now();
+            if now.duration_since(self.last_blink).as_millis() >= 500 {
+                self.blink_on = !self.blink_on;
+                self.last_blink = now;
+            }
+        }
 
         {
             // --- search pass: compute matches on current viewport ---
@@ -702,20 +718,13 @@ impl TermPane {
             }
 
             // Cursor (with blink: ghostty reports cursor_blinking from
-            // terminal modes; we toggle visibility on a 500ms phase).
+            // terminal modes; visibility phase updated above, before the
+            // damage decision, so phase flips trigger a repaint).
             if snapshot.cursor_visible()?
                 && let Some(vp) = snapshot.cursor_viewport()?
                 && focused
             {
-                let mut draw_cursor = true;
-                if snapshot.cursor_blinking()? {
-                    let now = std::time::Instant::now();
-                    if now.duration_since(self.last_blink).as_millis() >= 500 {
-                        self.blink_on = !self.blink_on;
-                        self.last_blink = now;
-                    }
-                    draw_cursor = self.blink_on;
-                }
+                let draw_cursor = self.blink_on || !snapshot.cursor_blinking()?;
                 let cursor_color = colors.cursor.unwrap_or(colors.foreground);
                 let style = snapshot.cursor_visual_style()?;
                 let (cx, cy) = (

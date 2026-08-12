@@ -476,12 +476,13 @@ async fn main() -> Result<()> {
             std::process::exit(0);
         }
 
-        // Manual frame cap (vsync is disabled — see macroquad_conf). Sleeping
-        // keeps CPU sane while guaranteeing the loop NEVER blocks on the
-        // compositor, so a hidden window stays responsive.
+        // Frame cap: sleep only when idle. While pty data is being drained
+        // (app.pty_activity) the loop runs back-to-back so output backlog is
+        // processed at full speed instead of one buffer per 16.6ms tick —
+        // this is the flood-throughput fix. Sleeping keeps idle CPU low.
         const FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(16_667);
         let elapsed = frame_start.elapsed();
-        if elapsed < FRAME_TIME {
+        if !app.pty_activity && elapsed < FRAME_TIME {
             std::thread::sleep(FRAME_TIME - elapsed);
         }
 
