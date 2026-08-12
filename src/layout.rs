@@ -4,7 +4,9 @@
 //! tab's `Vec<Pane>`. Stacked panes (zellij `s`) share one cell; the active
 //! one is rendered.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplitDir {
     /// Side-by-side (new pane to the right).
     Horizontal,
@@ -33,7 +35,7 @@ impl Dir {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Node {
     Split {
         dir: SplitDir,

@@ -29,6 +29,9 @@ pub struct SessionState {
 pub struct TabState {
     pub name: String,
     pub panes: Vec<PaneState>,
+    /// Layout tree (pane ids reference `panes`). Absent in old files →
+    /// single-pane layout on restore.
+    pub root: Option<crate::layout::Node>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -263,6 +266,7 @@ mod tests {
                     cwd: Some("/home/user".into()),
                     log: "pane-test.log".into(),
                 }],
+                root: Some(crate::layout::Node::Leaf { pane: 0 }),
             }],
         };
         save("test-sess", &state);

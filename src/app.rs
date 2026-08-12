@@ -882,21 +882,38 @@ impl App {
             tabs: self
                 .tabs
                 .iter()
-                .map(|tab| crate::session::TabState {
-                    name: tab.name.clone(),
-                    panes: tab
+                .map(|tab| {
+                    // Terminal panes only (preview/AI panes are not restored);
+                    // remap the layout tree to the kept pane ids.
+                    let mut kept: Vec<usize> = Vec::new();
+                    let panes: Vec<crate::session::PaneState> = tab
                         .panes
                         .iter()
-                        .filter_map(|p| match p {
-                            Pane::Term(t) => Some(crate::session::PaneState {
-                                program: t.program.clone(),
-                                args: t.args.clone(),
-                                cwd: t.cwd.clone(),
-                                log: t.log_name.clone(),
-                            }),
+                        .enumerate()
+                        .filter_map(|(id, p)| match p {
+                            Pane::Term(t) => {
+                                kept.push(id);
+                                Some(crate::session::PaneState {
+                                    program: t.program.clone(),
+                                    args: t.args.clone(),
+                                    cwd: t.cwd.clone(),
+                                    log: t.log_name.clone(),
+                                })
+                            }
                             _ => None, // preview/AI panes are not restored
                         })
-                        .collect(),
+                        .collect();
+                    let map: std::collections::HashMap<usize, usize> = kept
+                        .iter()
+                        .enumerate()
+                        .map(|(new_id, old_id)| (*old_id, new_id))
+                        .collect();
+                    let root = Self::remap_layout(&tab.root, &map);
+                    crate::session::TabState {
+                        name: tab.name.clone(),
+                        panes,
+                        root: Some(root),
+                    }
                 })
                 .collect(),
         };
@@ -907,6 +924,27 @@ impl App {
     // ---- tab context menu -------------------------------------------------
 
     // ---- sessions ---------------------------------------------------------
+
+    /// Remap pane ids in a layout tree through `map` (old id → new id).
+    /// Dropped ids (preview/AI panes) fall back to pane 0.
+    fn remap_layout(node: &crate::layout::Node, map: &std::collections::HashMap<usize, usize>) -> crate::layout::Node {
+        use crate::layout::Node;
+        match node {
+            Node::Split { dir, ratio, a, b } => Node::Split {
+                dir: *dir,
+                ratio: *ratio,
+                a: Box::new(Self::remap_layout(a, map)),
+                b: Box::new(Self::remap_layout(b, map)),
+            },
+            Node::Leaf { pane } => Node::Leaf {
+                pane: *map.get(pane).unwrap_or(&0),
+            },
+            Node::Stack { panes, active } => Node::Stack {
+                panes: panes.iter().map(|p| *map.get(p).unwrap_or(&0)).collect(),
+                active: *map.get(active).unwrap_or(&0),
+            },
+        }
+    }
 
     /// Build tabs (with replayed scrollback) from a saved session state.
     fn tabs_from_session(
@@ -943,7 +981,13 @@ impl App {
                 panes.push(Pane::Term(pane));
             }
             if !panes.is_empty() {
-                tabs.push(Tab::from_panes(panes, ts.name.clone()));
+                let mut tab = Tab::from_panes(panes, ts.name.clone());
+                // Restore the saved split/stack layout (pane ids already
+                // remapped at save time). Old files lack it → single pane.
+                if let Some(root) = &ts.root {
+                    tab.root = root.clone();
+                }
+                tabs.push(tab);
             }
         }
         Ok(tabs)
