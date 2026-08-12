@@ -17,6 +17,12 @@ use crate::{
     theme::{self, Theme},
 };
 
+/// Tab context menu geometry (shared by app hit-testing and main.rs render).
+pub const TAB_MENU_W: f32 = 230.0;
+pub const TAB_MENU_ITEM_H: f32 = 24.0;
+pub const TAB_MENU_PAD: f32 = 8.0;
+pub const TAB_MENU_ITEMS: usize = 3;
+
 pub const TAB_BAR_H: f32 = 30.0;
 pub const STATUS_BAR_H: f32 = 26.0;
 
@@ -34,6 +40,8 @@ pub struct Tab {
     pub panes: Vec<Pane>,
     pub active: usize,
     pub zoomed: HashSet<usize>,
+    /// Durable tab: restored with full scrollback on restart (session.json).
+    pub durable: bool,
 }
 
 impl Tab {
@@ -44,6 +52,18 @@ impl Tab {
             panes: vec![initial],
             active: 0,
             zoomed: HashSet::new(),
+            durable: false,
+        }
+    }
+
+    fn from_panes(panes: Vec<Pane>, name: String) -> Self {
+        Self {
+            name,
+            root: Node::Leaf { pane: 0 },
+            panes,
+            active: 0,
+            zoomed: HashSet::new(),
+            durable: true,
         }
     }
 
@@ -90,6 +110,8 @@ pub struct App {
     pub last_tab: Option<usize>,
     pub rename_buf: String,
     pub search_mode_active: bool,
+    /// Right-click tab context menu: (tab index, menu origin x, y).
+    pub tab_menu: Option<(usize, f32, f32)>,
     pub cell: CellDims,
     pub font_px: u16,
     pub config: Config,
@@ -135,22 +157,54 @@ impl App {
             macroquad::window::screen_height(),
         );
 
-        // Create the initial shell pane BEFORE building the App (there are
-        // no tabs yet, so new_term_pane would index an empty vec).
+        // Restore a durable session if one exists; otherwise create the
+        // initial shell pane (no tabs exist yet, so new_term_pane would
+        // index an empty vec).
         let cols: u16 = 100;
         let rows: u16 = 30;
-        let initial = TermPane::new(
-            cols,
-            rows,
-            cell,
-            config.shell.as_deref(),
-            &[],
-            None,
-            config.scrollback,
-        )?;
+        let session = crate::session::load();
+        let mut tabs: Vec<Tab> = Vec::new();
+        if let Some(sess) = session {
+            for ts in sess.tabs.iter().filter(|t| t.durable && !t.panes.is_empty()) {
+                let mut panes: Vec<Pane> = Vec::new();
+                for ps in &ts.panes {
+                    let args: Vec<&str> = ps.args.iter().map(String::as_str).collect();
+                    let Ok(pane) = TermPane::new(
+                        cols,
+                        rows,
+                        cell,
+                        ps.program.as_deref(),
+                        &args,
+                        ps.cwd.as_deref(),
+                        config.scrollback,
+                    ) else {
+                        continue;
+                    };
+                    let mut pane = pane;
+                    let seeded = crate::session::replay_pane_log(&ps.log, &mut pane.term);
+                    pane.log_seed(&seeded);
+                    panes.push(Pane::Term(pane));
+                }
+                if !panes.is_empty() {
+                    tabs.push(Tab::from_panes(panes, ts.name.clone()));
+                }
+            }
+        }
+        if tabs.is_empty() {
+            let initial = TermPane::new(
+                cols,
+                rows,
+                cell,
+                config.shell.as_deref(),
+                &[],
+                None,
+                config.scrollback,
+            )?;
+            tabs.push(Tab::new(Pane::Term(initial), "Tab 1".into()));
+        }
 
         let mut app = Self {
-            tabs: vec![Tab::new(Pane::Term(initial), "Tab 1".into())],
+            tabs,
             active_tab: 0,
             mode: Mode::Normal,
             theme,
@@ -170,6 +224,7 @@ impl App {
             repeats: std::collections::HashMap::new(),
             quit: false,
             mouse_pane: None,
+            tab_menu: None,
         };
 
         // Apply the configured theme's fg/bg to the initial terminal.
@@ -785,6 +840,45 @@ impl App {
         }
     }
 
+    /// Persist the durable session state (JSON + pane logs). Called on quit.
+    pub fn save_session(&self) {
+        let state = crate::session::SessionState {
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| crate::session::TabState {
+                    name: tab.name.clone(),
+                    durable: tab.durable,
+                    panes: tab
+                        .panes
+                        .iter()
+                        .filter_map(|p| match p {
+                            Pane::Term(t) => Some(crate::session::PaneState {
+                                program: t.program.clone(),
+                                args: t.args.clone(),
+                                cwd: t.cwd.clone(),
+                                log: t.log_name.clone(),
+                            }),
+                            _ => None, // preview/AI panes are not restored
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        crate::session::save(&state);
+    }
+
+    // ---- tab context menu -------------------------------------------------
+
+    /// Toggle a tab's durable flag (right-click tab → pin/unpin).
+    pub fn toggle_tab_durable(&mut self, tab_idx: usize) {
+        let Some(tab) = self.tabs.get_mut(tab_idx) else { return };
+        tab.durable = !tab.durable;
+        let state = if tab.durable { "pinned" } else { "unpinned" };
+        let name = tab.name.clone();
+        self.toast(&format!("tab {state}: {name} (restored on restart)"));
+    }
+
     // ---- layout ----------------------------------------------------------
 
     pub fn content_rect(&self) -> Rect {
@@ -854,6 +948,14 @@ impl App {
 
         if keymap::is_quit(k, m) {
             self.quit = true;
+            return;
+        }
+
+        // Tab context menu swallows keys; Esc closes it.
+        if self.tab_menu.is_some() {
+            if k == Key::Escape {
+                self.tab_menu = None;
+            }
             return;
         }
 
@@ -1037,8 +1139,40 @@ impl App {
         let cell = self.cell;
         let padding = self.config.padding;
 
+        // Tab context menu clicks (before the tab-bar check: the menu box
+        // opens at the cursor and extends below the tab bar).
+        if let Some((tab_idx, mx0, my0)) = self.tab_menu {
+            if is_mouse_button_pressed(MouseButton::Left) {
+                let menu_h = TAB_MENU_PAD + TAB_MENU_ITEMS as f32 * TAB_MENU_ITEM_H + TAB_MENU_PAD;
+                if mx >= mx0 && mx <= mx0 + TAB_MENU_W && my >= my0 && my <= my0 + menu_h {
+                    let item = ((my - my0 - TAB_MENU_PAD) / TAB_MENU_ITEM_H) as usize;
+                    match item {
+                        0 => self.toggle_tab_durable(tab_idx),
+                        1 => {
+                            self.goto_tab(tab_idx);
+                            self.mode = Mode::RenameTab;
+                        }
+                        2 => {
+                            self.goto_tab(tab_idx);
+                            self.close_tab();
+                        }
+                        _ => {}
+                    }
+                }
+                self.tab_menu = None;
+                return;
+            }
+        }
+
         // Tab bar clicks.
         if my < TAB_BAR_H {
+            if is_mouse_button_pressed(MouseButton::Right) {
+                let tab_w = 120.0;
+                let idx = (mx / tab_w) as usize;
+                if idx < self.tabs.len() {
+                    self.tab_menu = Some((idx, mx, my));
+                }
+            }
             if is_mouse_button_pressed(MouseButton::Left) {
                 let tab_w = 120.0;
                 let idx = (mx / tab_w) as usize;

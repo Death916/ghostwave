@@ -89,15 +89,17 @@ impl Pty {
         }
     }
 
-    /// Drain available output and feed it into the terminal.
-    /// Returns Err(EndOfStream) on EOF/EIO, Ok otherwise.
-    pub fn read(&self, term: &mut libghostty_vt::Terminal<'static, 'static>) -> Result<(), PtyError> {
+    /// Drain available output; returns the raw bytes read (feed them to the
+    /// terminal via vt_write; callers may also tee them for session logs).
+    /// Returns Err(EndOfStream) on EOF/EIO, Ok(bytes) otherwise.
+    pub fn read(&self) -> Result<Vec<u8>, PtyError> {
         let mut buf = [0u8; 8192];
+        let mut out: Vec<u8> = Vec::new();
         loop {
             match nix::unistd::read(&self.0, &mut buf) {
                 Ok(0) => return Err(PtyError::EndOfStream),
-                Ok(len) => term.vt_write(&buf[..len]),
-                Err(Errno::EAGAIN) => return Ok(()),
+                Ok(len) => out.extend_from_slice(&buf[..len]),
+                Err(Errno::EAGAIN) => return Ok(out),
                 Err(Errno::EINTR) => continue,
                 Err(Errno::EIO) => return Err(PtyError::EndOfStream),
                 Err(err) => return Err(PtyError::OtherError(err)),

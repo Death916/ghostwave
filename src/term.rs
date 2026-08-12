@@ -87,6 +87,13 @@ pub struct TermPane {
     /// Cursor blink phase (terminal reports cursor_blinking from modes).
     blink_on: bool,
     last_blink: std::time::Instant,
+    /// Spawn info (for session restore).
+    pub program: Option<String>,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    /// Pane output log (name + file) for durable sessions.
+    pub log_name: String,
+    log_file: Option<std::fs::File>,
 }
 
 impl TermPane {
@@ -121,6 +128,11 @@ impl TermPane {
             args,
             cwd,
         )?;
+
+        // Pane output log for durable sessions (best-effort; a missing log
+        // just means no session restore for this pane).
+        let (log_name, log_file) = crate::session::open_pane_log()
+            .unwrap_or((String::new(), std::fs::File::open("/dev/null").unwrap()));
 
         let effect_fd = pty.dup_raw()?;
         let shared_effects = shared.clone();
@@ -232,6 +244,11 @@ impl TermPane {
             scroll_active: false,
             blink_on: true,
             last_blink: std::time::Instant::now(),
+            program: shell.map(String::from),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            cwd: cwd.map(String::from),
+            log_name,
+            log_file: Some(log_file),
         })
     }
 
@@ -267,8 +284,17 @@ impl TermPane {
             self.child.poll_reap();
             return;
         }
-        match self.pty.read(&mut self.term) {
-            Ok(()) => {}
+        match self.pty.read() {
+            Ok(data) => {
+                // Tee output into the session log (durable sessions).
+                if !data.is_empty() {
+                    if let Some(f) = self.log_file.as_mut() {
+                        use std::io::Write;
+                        let _ = f.write_all(&data);
+                    }
+                    self.term.vt_write(&data);
+                }
+            }
             Err(PtyError::EndOfStream) => {
                 self.exited = Some("process exited".into());
                 self.force_repaint = true;
@@ -283,6 +309,15 @@ impl TermPane {
 
     pub fn write_input(&mut self, data: &[u8]) {
         self.pty.write(data);
+    }
+
+    /// Seed the session log with replayed history (durable restore) so the
+    /// restored scrollback survives further restarts.
+    pub fn log_seed(&mut self, data: &[u8]) {
+        if let Some(f) = self.log_file.as_mut() {
+            use std::io::Write;
+            let _ = f.write_all(data);
+        }
     }
 
     pub fn flush_response(&mut self) {
