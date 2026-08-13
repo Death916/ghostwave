@@ -45,6 +45,15 @@ impl CommandPalette {
                 }];
             }
         }
+        if let Some(host) = self.input.strip_prefix("ds ") {
+            let h = host.trim();
+            if !h.is_empty() {
+                return vec![PaletteItem {
+                    label: format!("Durable SSH (ghostd): {h}"),
+                    action: crate::keymap::Action::ConnectDurableSsh(h.to_string()),
+                }];
+            }
+        }
         let q = self.input.to_lowercase();
         let mut v: Vec<PaletteItem> = self
             .items

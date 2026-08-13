@@ -1,0 +1,12 @@
+[package]
+name = "ghostd"
+version = "0.1.0"
+edition = "2024"
+description = "ghostwave remote session daemon — headless, UI-less durable sessions over ssh"
+license = "MIT"
+
+[dependencies]
+nix = { version = "0.31.2", features = ["term", "fs", "signal", "process", "user", "ioctl"] }
+
+[profile.release]
+lto = true

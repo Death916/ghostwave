@@ -147,13 +147,22 @@ pub enum Child {
 }
 
 impl Child {
-    /// WNOHANG reap; transitions Exited -> Reaped. Call each frame.
-    pub fn poll_reap(&mut self) {
+    /// WNOHANG reap; transitions Exited -> Reaped. Returns the child's exit
+    /// code (128+signal for signal deaths) once it has actually exited.
+    /// Call each frame.
+    pub fn poll_reap(&mut self) -> Option<i32> {
         if let Child::Exited(pid) = *self {
             if let Ok(wp) = wait::waitpid(pid, Some(wait::WaitPidFlag::WNOHANG)) {
+                let code = match wp {
+                    wait::WaitStatus::Exited(_, c) => Some(c),
+                    wait::WaitStatus::Signaled(_, sig, _) => Some(128 + sig as i32),
+                    _ => None,
+                };
                 *self = Child::Reaped(wp);
+                return code;
             }
         }
+        None
     }
 }
 

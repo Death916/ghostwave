@@ -123,6 +123,7 @@ pub enum Action {
     ClearTerminal,
     OpenFile(String),
     ConnectSsh(String),
+    ConnectDurableSsh(String),
     NewAi,
     // session mode
     SessionManager,

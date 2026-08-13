@@ -1,6 +1,8 @@
 //! Terminal pane: libghostty-vt terminal + rendering + input + selection.
 //! Adapted from ghostling-rs (https://github.com/Uzaaft/libghostty-rs).
 
+use serde::{Deserialize, Serialize};
+
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -45,6 +47,9 @@ struct Shared {
     pwd: Mutex<String>,
     bell: AtomicBool,
     size: Mutex<(u16, u16, u32, u32)>,
+    /// Current pty master fd for terminal effect callbacks (VT queries).
+    /// Updated on respawn (reconnect) so responses go to the new pty.
+    effect_fd: Mutex<i32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -54,6 +59,26 @@ pub struct CellDims {
     /// Baseline offset within the cell: glyph baseline y = cell_top + baseline.
     /// Keeps glyphs and the block cursor aligned in the same cell.
     pub baseline: f32,
+}
+
+/// A durable remote session binding (ghostd). Saved with the session so
+/// restore can re-show the pane in a disconnected state.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RemoteSpec {
+    pub host: String,
+    /// Session name on the remote host.
+    pub session: String,
+}
+
+/// Reconnect state machine for remote (ssh/ghostd) panes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReconnectState {
+    /// Connected or nothing to do.
+    Idle,
+    /// Auto-reconnecting: attempt N, retry not before `next`.
+    Waiting { attempt: u32, next: std::time::Instant },
+    /// Auto-reconnect exhausted/failed; Enter connects manually.
+    Manual,
 }
 
 /// A single terminal pane (one shell session).
@@ -69,8 +94,9 @@ pub struct TermPane {
     mouse_event: mouse::Event<'static>,
     pub response: Vec<u8>,
     selection: SelectionState<'static>,
-    pub pty: Pty,
-    pub child: Child,
+    /// None when the pane is in a disconnected state (no child process).
+    pub pty: Option<Pty>,
+    pub child: Option<Child>,
     shared: Arc<Shared>,
     effect_fd: i32,
     pub name: String,
@@ -91,6 +117,14 @@ pub struct TermPane {
     pub program: Option<String>,
     pub args: Vec<String>,
     pub cwd: Option<String>,
+    /// Durable remote session binding, if this pane is an ssh+ghostd pane.
+    pub remote: Option<RemoteSpec>,
+    /// Exit code of the last child (None until reaped).
+    pub last_exit_code: Option<i32>,
+    /// Reconnect state (remote panes only).
+    pub reconnect: ReconnectState,
+    /// Consecutive failed connect attempts (reset on manual connect).
+    pub reconnect_failures: u32,
     /// Pane output log (name + file) for durable sessions.
     pub log_name: String,
     log_file: Option<std::fs::File>,
@@ -110,9 +144,12 @@ impl TermPane {
         cwd: Option<&str>,
         scrollback: usize,
         log_cap_bytes: u64,
+        spawn: bool,
+        remote: Option<RemoteSpec>,
     ) -> Result<Self> {
         let shared = Arc::new(Shared {
             size: Mutex::new((cols, rows, cell.w, cell.h)),
+            effect_fd: Mutex::new(-1),
             ..Default::default()
         });
 
@@ -122,24 +159,35 @@ impl TermPane {
             max_scrollback: scrollback,
         })?;
 
-        let (pty, child) = Pty::new(
-            WinSize {
-                cols,
-                rows,
-                xpixel: (cols as u32 * cell.w) as u16,
-                ypixel: (rows as u32 * cell.h) as u16,
-            },
-            shell,
-            args,
-            cwd,
-        )?;
+        // A remote pane may be created disconnected (restore) — no child
+        // process until the user connects or the reconnect loop fires.
+        let (pty, child) = if spawn {
+            let (p, c) = Pty::new(
+                WinSize {
+                    cols,
+                    rows,
+                    xpixel: (cols as u32 * cell.w) as u16,
+                    ypixel: (rows as u32 * cell.h) as u16,
+                },
+                shell,
+                args,
+                cwd,
+            )?;
+            (Some(p), Some(c))
+        } else {
+            (None, None)
+        };
 
         // Pane output log for durable sessions (best-effort; a missing log
         // just means no session restore for this pane).
         let (log_name, log_file) = crate::session::open_pane_log()
             .unwrap_or((String::new(), std::fs::File::open("/dev/null").unwrap()));
 
-        let effect_fd = pty.dup_raw()?;
+        let effect_fd = match &pty {
+            Some(p) => p.dup_raw().unwrap_or(-1),
+            None => -1,
+        };
+        *shared.effect_fd.lock().unwrap() = effect_fd;
         let shared_effects = shared.clone();
 
         term.resize(cols, rows, cell.w, cell.h)?;
@@ -150,8 +198,14 @@ impl TermPane {
             .set_kitty_image_from_shared_mem_allowed(true)?;
 
         term
-            .on_pty_write(move |_t, data| {
-                write_raw(effect_fd, data);
+            .on_pty_write({
+                let shared = shared_effects.clone();
+                move |_t, data| {
+                    let fd = *shared.effect_fd.lock().unwrap();
+                    if fd >= 0 {
+                        write_raw(fd, data);
+                    }
+                }
             })?
             .on_size({
                 let shared = shared_effects.clone();
@@ -252,6 +306,10 @@ impl TermPane {
             program: shell.map(String::from),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.map(String::from),
+            remote,
+            last_exit_code: None,
+            reconnect: ReconnectState::Idle,
+            reconnect_failures: 0,
             log_name,
             log_file: Some(log_file),
             log_cap: log_cap_bytes.max(1024),
@@ -275,12 +333,14 @@ impl TermPane {
         self.rows = rows;
         *self.shared.size.lock().unwrap() = (cols, rows, cell.w, cell.h);
         self.term.resize(cols, rows, cell.w, cell.h)?;
-        self.pty.resize(WinSize {
-            cols,
-            rows,
-            xpixel: (cols as u32 * cell.w) as u16,
-            ypixel: (rows as u32 * cell.h) as u16,
-        });
+        if let Some(pty) = self.pty.as_ref() {
+            pty.resize(WinSize {
+                cols,
+                rows,
+                xpixel: (cols as u32 * cell.w) as u16,
+                ypixel: (rows as u32 * cell.h) as u16,
+            });
+        }
         self.force_repaint = true;
         Ok(())
     }
@@ -289,10 +349,17 @@ impl TermPane {
     /// when pty data was processed (used for event-driven frame pacing).
     pub fn poll_pty(&mut self) -> bool {
         if self.exited.is_some() {
-            self.child.poll_reap();
+            if let Some(child) = self.child.as_mut() {
+                if let Some(code) = child.poll_reap() {
+                    self.last_exit_code = Some(code);
+                }
+            }
             return false;
         }
-        match self.pty.read() {
+        let Some(pty) = self.pty.as_ref() else {
+            return false;
+        };
+        match pty.read() {
             Ok(data) => {
                 // Tee output into the session log (durable sessions). The log
                 // is front-truncated when it exceeds the configured cap so it
@@ -316,19 +383,62 @@ impl TermPane {
             Err(PtyError::EndOfStream) => {
                 self.exited = Some("process exited".into());
                 self.force_repaint = true;
+                self.last_exit_code = self.child.as_mut().and_then(|c| c.poll_reap());
                 return false;
             }
             Err(PtyError::OtherError(e)) => {
                 self.exited = Some(format!("pty error: {e}"));
                 self.force_repaint = true;
+                self.last_exit_code = self.child.as_mut().and_then(|c| c.poll_reap());
                 return false;
             }
         }
-        self.child.poll_reap();
+        if let Some(child) = self.child.as_mut() {
+            if let Some(code) = child.poll_reap() {
+                self.last_exit_code = Some(code);
+            }
+        }
+        false
     }
 
     pub fn write_input(&mut self, data: &[u8]) {
-        self.pty.write(data);
+        if let Some(pty) = self.pty.as_ref() {
+            pty.write(data);
+        }
+    }
+
+    /// Re-spawn the child (reconnect). Reuses the stored program/args; the
+    /// terminal state and log are untouched so history survives.
+    pub fn respawn(&mut self) -> bool {
+        let Some(program) = self.program.clone() else {
+            return false;
+        };
+        let args: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
+        let size = WinSize {
+            cols: self.cols,
+            rows: self.rows,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        match Pty::new(size, Some(&program), &args, self.cwd.as_deref()) {
+            Ok((pty, child)) => {
+                self.pty = Some(pty);
+                self.child = Some(child);
+                if let Some(p) = self.pty.as_ref() {
+                    let old = std::mem::replace(&mut *self.shared.effect_fd.lock().unwrap(), -1);
+                    if old >= 0 {
+                        unsafe { nix::libc::close(old) };
+                    }
+                    *self.shared.effect_fd.lock().unwrap() = p.dup_raw().unwrap_or(-1);
+                }
+                self.exited = None;
+                self.last_exit_code = None;
+                self.reconnect = ReconnectState::Idle;
+                self.force_repaint = true;
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Seed the session log with replayed history (durable restore) so the
@@ -343,7 +453,9 @@ impl TermPane {
 
     pub fn flush_response(&mut self) {
         if !self.response.is_empty() {
-            self.pty.write(&self.response);
+            if let Some(pty) = self.pty.as_ref() {
+                pty.write(&self.response);
+            }
             self.response.clear();
         }
     }
@@ -795,10 +907,31 @@ impl TermPane {
             )?;
         }
 
-        // Exited overlay
+        // Exited overlay — remote panes get a reconnect prompt instead of
+        // the generic message.
         if let Some(msg) = &self.exited {
-            draw_rectangle(ox + 4.0, oy + 4.0, 260.0, 40.0, color_theme(theme.status_bg));
-            draw_text(&msg, ox + 12.0, oy + 28.0, 16.0, color_theme(theme.status_fg));
+            if let Some(remote) = &self.remote {
+                let status = match self.reconnect {
+                    ReconnectState::Waiting { attempt, .. } => {
+                        format!("reconnecting (attempt {attempt}) — Esc to stop")
+                    }
+                    ReconnectState::Manual => "disconnected — Enter connect | k kill remote | Esc dismiss".to_string(),
+                    ReconnectState::Idle => "disconnected".to_string(),
+                };
+                draw_rectangle(ox + 4.0, oy + 4.0, 520.0, 56.0, color_theme(theme.status_bg));
+                draw_rectangle_lines(ox + 4.0, oy + 4.0, 520.0, 56.0, 1.0, color_theme(theme.frame_active));
+                draw_text(
+                    &format!("ssh {} — session {}", remote.host, remote.session),
+                    ox + 14.0,
+                    oy + 28.0,
+                    16.0,
+                    color_theme(theme.status_fg),
+                );
+                draw_text(&status, ox + 14.0, oy + 50.0, 14.0, color_theme(theme.status_fg));
+            } else {
+                draw_rectangle(ox + 4.0, oy + 4.0, 260.0, 40.0, color_theme(theme.status_bg));
+                draw_text(&msg, ox + 12.0, oy + 28.0, 16.0, color_theme(theme.status_fg));
+            }
         }
 
         // Scrollbar
