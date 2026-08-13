@@ -898,6 +898,21 @@ impl App {
     }
 
     pub fn connect_ssh(&mut self, host: &str) {
+        // Each plain ssh connection lives in its OWN named session (visible
+        // in the session list, no durable marker), so it is identifiable
+        // and resumable like any other session.
+        let sess = format!("ssh-{}", Self::sanitize_host(host));
+        if sess != self.current_session {
+            if crate::session::list_sessions().contains(&sess) {
+                self.load_session(&sess);
+            } else {
+                self.save_session();
+                self.tabs = Vec::new();
+                self.active_tab = 0;
+                self.current_session = sess.clone();
+                crate::session::set_last_session(&sess);
+            }
+        }
         let cols = 100;
         let rows = 30;
         match self.make_term_pane(cols, rows, Some("ssh"), &[host], None, None) {
@@ -912,12 +927,15 @@ impl App {
     // ---- durable remote sessions (ghostd) --------------------------------
 
     /// Remote session name for a host: `ghostwave-<host>` (sanitized).
-    pub fn remote_session_name(host: &str) -> String {
-        let h: String = host
-            .chars()
+    /// Host string → filesystem-safe token (used for session names).
+    fn sanitize_host(host: &str) -> String {
+        host.chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
-            .collect();
-        format!("ghostwave-{h}")
+            .collect()
+    }
+
+    pub fn remote_session_name(host: &str) -> String {
+        format!("ghostwave-{}", Self::sanitize_host(host))
     }
 
     /// The remote shell command the pane runs: check the cached ghostd
@@ -927,7 +945,7 @@ impl App {
             "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
              if [ ! -x \"$BIN\" ] || [ \"$($BIN --version 2>/dev/null)\" != \"ghostd {ver}\" ]; then \
              echo \"ghostd missing/stale on {host} — reconnect to upload\"; exit 1; fi; \
-             exec \"$BIN\" attach {session} 2>/dev/null || {{ \"$BIN\" new {session} >/dev/null 2>&1 && exec \"$BIN\" attach {session}; }}",
+             \"$BIN\" attach {session} 2>/dev/null || {{ \"$BIN\" new {session} >/dev/null 2>&1 && exec \"$BIN\" attach {session}; }}",
             ver = env!("CARGO_PKG_VERSION")
         )
     }
@@ -1013,7 +1031,9 @@ impl App {
         self.toast(&format!("killing remote session {session} on {host}"));
         std::thread::spawn(move || {
             let cmd = format!(
-                "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \"$BIN\" kill {session} 2>&1 || echo \"no ghostd binary on {host}\""
+                "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
+                 if [ ! -x \"$BIN\" ]; then echo \"no ghostd binary on {host}\"; exit 1; fi; \
+                 \"$BIN\" kill {session} 2>&1 || echo \"no session '{session}' on {host}\""
             );
             let _ = std::process::Command::new("ssh")
                 .args(["-o", "ConnectTimeout=5", &host, &cmd])
