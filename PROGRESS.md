@@ -52,24 +52,41 @@ Binary name: `ghostwave`
   black/garbage (the old flicker bug). Proper damage rendering needs
   an app-owned offscreen render target (macroquad render_target) —
   deferred; idle CPU is already ~0.
-- REMOTE DURABLE SESSIONS (waveterm-style) — `feat/remote-durable` branch,
-  NOT merged yet (user gates merges now; master is protected on forgejo):
-  - ghostd: standalone pure-Rust daemon (ghostd/ crate). Sessions survive
-    ssh drops (daemonize + setsid + SIGHUP-immune); pty ALWAYS drained to a
-    front-truncated ring log so children never stall while detached and
-    drop-gap output replays on attach; first-attach timeout (default 300s)
-    + client reconnect loop (3s→15s backoff, 5 tries, then manual);
-    `ds <host>` palette entry opens a new TAB (fixed: ssh/durable ssh panes
-    were created but never inserted into the layout tree — invisible).
-    kills orphaned daemons; log cap (32MB) bounds disk; new/attach/list/
-    kill/kill-all; DCS-based mid-session resize.
+- REMOTE DURABLE SESSIONS (waveterm-style) — `feat/remote-durable` branch.
+  STATUS: PR #1 MERGED by user to master (d115196); follow-up fixes on the
+  branch (7872569) awaiting user re-test; master protected on forgejo, user
+  gates all merges ("dont merge till i confirm"):
+  - ghostd: standalone pure-Rust daemon (ghostd/ crate, lib+bin).
+    Sessions survive ssh drops (daemonize + setsid + SIGHUP-immune); pty
+    ALWAYS drained to a front-truncated ring log so children never stall
+    while detached and drop-gap output replays on attach; first-attach
+    timeout (default 300s) kills orphans; log cap (32MB) bounds disk;
+    new/attach/list/kill/kill-all; DCS-based mid-session resize.
+  - Build: static musl binaries COMMITTED under assets/ (x86_64 + aarch64,
+    built with official rustc + rust-std components + rust-lld — no zig, no
+    C toolchain, no nix build needed); scripts/build-ghostd.sh rebuilds
+    them with plain cargo on any distro (rustup musl targets), NixOS
+    fallback path included. Flake REMOVED (was bootstrapping a musl gcc
+    toolchain from source for a zero-C crate — overkill).
   - Client: `ds <host>` palette entry → ssh -t + ghostd attach; binary
     bootstrapped over ssh (uname -m → version check → stdin upload,
-    embedded x86_64+aarch64 static musl builds via flake.nix pkgsMusl —
-    NO zig); restore shows remote panes DISCONNECTED (Enter to connect,
-    never auto-connect on start); bounded auto-reconnect (5 attempts,
-    3s→15s backoff → manual); `k` kills the remote session; session
-    manager shows an "ssh" marker; [remote] config section.
+    embedded static musl binaries); restore shows remote panes
+    DISCONNECTED (Enter to connect, never auto-connect on start); bounded
+    auto-reconnect (5 attempts, 3s→15s backoff → manual); `k` kills the
+    remote session; session manager shows an "ssh" marker; [remote] config.
+  - FIXED (7872569): shell-quote escaping emitted literal backslashes
+    (remote checks always failed → stale loop); `exec attach || new`
+    fallback was dead code (exec replaces the shell → sessions never
+    created). Verified end-to-end on orac: session created, daemon
+    persists. Kill message now accurate ('no ghostd binary' only when
+    truly missing).
+  - NEW: plain `ssh <host>` palette connections live in their OWN named
+    session (ssh-<host>) in the session list — no durable marker, resume
+    by re-running the command.
+  - KNOWN BUG (in fix): ds pane input — remote pty is canonical+echo, so
+    Ctrl+C SIGINTs the attach (drops the connection) and arrow keys echo
+    as ^[[A instead of reaching the remote shell. Fix: attach must set
+    its stdin raw (termios). Regular ssh mode is unaffected.
   - OSC 52 clipboard over ssh: already wired (on_clipboard_write → wl-copy).
   - Wrap/reflow semantics pinned in tests/term_core.rs — both work in
     libghostty-vt 0.2.1; the "cut off" report was a TUI clipping its own
