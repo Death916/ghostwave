@@ -1,265 +1,49 @@
-//! ghostd — the ghostwave remote session daemon.
+//! ghostd CLI — ghostwave remote session daemon.
 //!
-//! A headless, UI-less session host for durable remote sessions
-//! (waveterm-style). Runs on a remote host; sessions survive the client
-//! (ssh) dying; reattaching replays the full log including everything
-//! printed while disconnected.
-//!
-//! Protocol (v1, over a unix socket):
-//!   client -> daemon on attach:  "SIZE <cols> <rows>\n"  (first line)
-//!   client -> daemon mid-session: DCS "\x1bPgw-size <cols> <rows>\x1b\\"
-//!   daemon -> client:             log replay (raw VT bytes), then live
-//!                                 pty output. EOF when the session ends.
-//!
-//! Safeguards: the daemon exits if no client attaches within
-//! --first-attach-secs (default 300) of creation; the log is a
-//! front-truncated ring capped at --log-cap-mb (default 32) so disk
-//! cannot fill; `ghostd list` shows session age; `kill`/`kill-all`
-//! clean up manually.
-//!
-//! The daemon deliberately has NO UI and NO keybindings — the pane looks
-//! like a plain ssh session and all ghostwave keybinds keep working.
+//! See the `ghostd` library for the shared machinery.
 
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::{
-        fd::{AsRawFd, IntoRawFd},
+        fd::AsRawFd,
         unix::net::{UnixListener, UnixStream},
-        unix::process::CommandExt,
     },
-    path::{Path, PathBuf},
-    process::Command,
+    path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        atomic::Ordering,
+        mpsc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 
 use nix::{
     errno::Errno,
-    pty::{ForkptyResult, Winsize},
     sys::{
-        signal::{self, SigAction, SigHandler, SaFlags, SigSet, Signal},
+        signal::{self, Signal},
         wait::{self, WaitPidFlag},
     },
-    unistd::{self, Pid},
+    unistd::Pid,
 };
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_LOG_CAP_MB: u64 = 32;
-const DEFAULT_FIRST_ATTACH_SECS: u64 = 300;
-const ATTACH_RETRY_SECS: u64 = 5;
-
-static TERM_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-// ---------------------------------------------------------------------------
-// helpers
-
-fn state_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("GHOSTWAVE_STATE_DIR") {
-        return PathBuf::from(d);
-    }
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".local/share/ghostwave")
-}
-
-fn socket_path(name: &str) -> PathBuf {
-    state_dir().join(format!("{name}.sock"))
-}
-fn log_path(name: &str) -> PathBuf {
-    state_dir().join(format!("{name}.log"))
-}
-fn pid_path(name: &str) -> PathBuf {
-    state_dir().join(format!("{name}.pid"))
-}
+use ghostd::{
+    daemonize, dcs_size_msg, die, fd_poll, fd_read, install_term_handler, log_path, pid_alive,
+    pid_path, set_nonblock, set_term_size, socket_path, spawn_child, state_dir, term_size,
+    truncate_log_front, write_all_blocking, DEFAULT_FIRST_ATTACH_SECS, DEFAULT_LOG_CAP_MB,
+    TERM_REQUESTED, VERSION,
+};
 
 fn eprintln_exit(msg: &str) -> ! {
     eprintln!("ghostd: {msg}");
     std::process::exit(1);
 }
 
-fn die(msg: &str) -> ! {
-    eprintln!("ghostd: {msg}");
-    std::process::exit(1);
-}
-
-/// Returns (cols, rows) of the terminal on `fd` (TIOCGWINSZ).
-fn term_size(fd: i32) -> Option<(u16, u16)> {
-    nix::ioctl_read_bad!(tiocgwinsz, nix::libc::TIOCGWINSZ, Winsize);
-    let mut ws = Winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
-    unsafe { tiocgwinsz(fd, &mut ws) }.ok()?;
-    Some((ws.ws_col, ws.ws_row))
-}
-
-fn set_term_size(fd: i32, cols: u16, rows: u16) {
-    nix::ioctl_write_ptr_bad!(tiocswinsz, nix::libc::TIOCSWINSZ, Winsize);
-    let ws = Winsize { ws_col: cols, ws_row: rows, ws_xpixel: 0, ws_ypixel: 0 };
-    unsafe { tiocswinsz(fd, &ws) }.ok();
-}
-
-fn set_nonblock(fd: i32) {
-    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
-    if flags >= 0 {
-        unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) };
-    }
-}
-
-fn fd_read(fd: i32, buf: &mut [u8]) -> Result<usize, Errno> {
-    let n = unsafe { nix::libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 {
-        Err(Errno::last())
-    } else {
-        Ok(n as usize)
-    }
-}
-
-fn fd_write(fd: i32, buf: &[u8]) -> Result<usize, Errno> {
-    let n = unsafe { nix::libc::write(fd, buf.as_ptr().cast(), buf.len()) };
-    if n < 0 {
-        Err(Errno::last())
-    } else {
-        Ok(n as usize)
-    }
-}
-
-/// poll() over (fd, want_read) pairs; returns the indices that are ready.
-fn fd_poll(pairs: &mut [(i32, bool)], timeout_ms: i32) -> Result<Vec<usize>, Errno> {
-    let mut pfds: Vec<nix::libc::pollfd> = pairs
-        .iter()
-        .map(|(fd, want)| nix::libc::pollfd {
-            fd: *fd,
-            events: if *want { nix::libc::POLLIN } else { 0 },
-            revents: 0,
-        })
-        .collect();
-    let rc = unsafe { nix::libc::poll(pfds.as_mut_ptr(), pfds.len() as nix::libc::nfds_t, timeout_ms) };
-    if rc < 0 {
-        return Err(Errno::last());
-    }
-    Ok(pairs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, _)| {
-            let r = pfds[i].revents;
-            if r & (nix::libc::POLLIN | nix::libc::POLLHUP | nix::libc::POLLERR) != 0 {
-                Some(i)
-            } else {
-                None
-            }
-        })
-        .collect())
-}
-
-fn pid_alive(pid: Pid) -> bool {
-    signal::kill(pid, None).is_ok()
-}
-
-// ---------------------------------------------------------------------------
-// daemon
-
-/// Spawn the pty child (the session's program). Returns the non-blocking
-/// master fd.
-fn spawn_child(cmd: &[String]) -> i32 {
-    let (shell, args): (PathBuf, Vec<String>) = if !cmd.is_empty() {
-        (PathBuf::from(&cmd[0]), cmd[1..].to_vec())
-    } else {
-        // Login shell via passwd (same policy as the ghostwave pane).
-        let s = match unistd::User::from_uid(unistd::getuid()) {
-            Ok(Some(u)) if !u.shell.as_os_str().is_empty() => u.shell,
-            _ => PathBuf::from("/bin/sh"),
-        };
-        (s, vec![])
-    };
-    let ws = Winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
-    match unsafe { nix::pty::forkpty(&ws, None) } {
-        Ok(ForkptyResult::Child) => {
-            let arg0 = shell.file_name().unwrap_or(shell.as_os_str()).to_os_string();
-            let mut c = Command::new(&shell);
-            c.env("TERM", "xterm-256color").arg0(arg0);
-            for a in &args {
-                c.arg(a);
-            }
-            _ = c.exec();
-            std::process::exit(127);
-        }
-        Ok(ForkptyResult::Parent { master, .. }) => {
-            set_nonblock(master.as_raw_fd());
-            master.into_raw_fd()
-        }
-        Err(e) => die(&format!("forkpty failed: {e}")),
-    }
-}
-
-fn daemonize() {
-    match unsafe { unistd::fork() } {
-        Ok(unistd::ForkResult::Parent { .. }) => std::process::exit(0),
-        Ok(unistd::ForkResult::Child) => {}
-        Err(e) => die(&format!("fork failed: {e}")),
-    }
-    _ = unistd::setsid();
-    match unsafe { unistd::fork() } {
-        Ok(unistd::ForkResult::Parent { .. }) => std::process::exit(0),
-        Ok(unistd::ForkResult::Child) => {}
-        Err(_) => std::process::exit(1),
-    }
-    // Detach stdio.
-    if let Ok(null) = OpenOptions::new().read(true).write(true).open("/dev/null") {
-        let fd = std::os::fd::AsRawFd::as_raw_fd(&null);
-        unsafe {
-            nix::libc::dup2(fd, 0);
-            nix::libc::dup2(fd, 1);
-            nix::libc::dup2(fd, 2);
-        }
-    }
-    // Survive the ssh session teardown.
-    unsafe {
-        signal::sigaction(
-            Signal::SIGHUP,
-            &SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty()),
-        )
-        .ok();
-    }
-}
-
-fn install_term_handler() {
-    extern "C" fn on_term(_: i32) {
-        TERM_REQUESTED.store(true, Ordering::SeqCst);
-    }
-    unsafe {
-        signal::sigaction(
-            Signal::SIGTERM,
-            &SigAction::new(SigHandler::Handler(on_term), SaFlags::empty(), SigSet::empty()),
-        )
-        .ok();
-    }
-}
-
-/// Front-truncate `path` to keep at most `cap` trailing bytes (ring log).
-fn truncate_log_front(path: &Path, cap: u64) {
-    let Ok(meta) = fs::metadata(path) else { return };
-    if meta.len() <= cap {
-        return;
-    }
-    let Ok(mut f) = File::open(path) else { return };
-    let skip = meta.len() - cap;
-    use std::io::Seek;
-    if f.seek(std::io::SeekFrom::Start(skip)).is_err() {
-        return;
-    }
-    let mut tail = Vec::with_capacity(cap as usize);
-    if f.read_to_end(&mut tail).is_err() {
-        return;
-    }
-    let _ = fs::write(path, &tail);
-}
-
 /// Accept loop. `tx` is where pty output is published for the client.
 fn accept_loop(listener: UnixListener, name: &str, log_cap: u64, first_attach_secs: u64) {
     let log_file = log_path(name);
     let pty_fd = spawn_child(&[]);
-    let _ = fs::write(pid_path(name), format!("{}", unistd::getpid()));
+    let _ = fs::write(pid_path(name), format!("{}", nix::unistd::getpid()));
     let mut log = OpenOptions::new().create(true).append(true).open(&log_file).unwrap_or_else(|e| die(&format!("log: {e}")));
     let mut log_bytes = fs::metadata(&log_file).map(|m| m.len()).unwrap_or(0);
 
@@ -291,7 +75,6 @@ fn accept_loop(listener: UnixListener, name: &str, log_cap: u64, first_attach_se
                     } else {
                         ever_attached = true;
                         let tx = client_tx.clone();
-                        let name = name.to_string();
                         let log_file = log_file.clone();
                         std::thread::spawn(move || handle_client(stream, &log_file, pty_fd, tx));
                     }
@@ -492,19 +275,6 @@ fn handle_client(
     *tx.lock().unwrap() = None;
 }
 
-fn write_all_blocking(fd: i32, mut data: &[u8]) -> std::io::Result<()> {
-    while !data.is_empty() {
-        match fd_write(fd, data) {
-            Ok(0) => break,
-            Ok(n) => data = &data[n..],
-            Err(Errno::EINTR) => continue,
-            Err(Errno::EAGAIN) => std::thread::sleep(Duration::from_millis(1)),
-            Err(_) => break,
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // commands
 
@@ -535,20 +305,8 @@ fn cmd_new(name: &str, cmd: &[String], log_cap: u64, first_attach_secs: u64) {
     accept_loop(listener, name, log_cap, first_attach_secs);
 }
 
-fn connect_with_retry(name: &str) -> Option<UnixStream> {
-    let sock = socket_path(name);
-    let deadline = Instant::now() + Duration::from_secs(ATTACH_RETRY_SECS);
-    while Instant::now() < deadline {
-        match UnixStream::connect(&sock) {
-            Ok(s) => return Some(s),
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
-        }
-    }
-    None
-}
-
 fn cmd_attach(name: &str) {
-    let Some(mut stream) = connect_with_retry(name) else {
+    let Some(mut stream) = ghostd::connect_with_retry(name) else {
         eprintln!("ghostd: no session '{name}'");
         std::process::exit(1);
     };
@@ -560,9 +318,13 @@ fn cmd_attach(name: &str) {
     let mut last_size = term_size(stdin_fd);
     extern "C" fn on_winch(_: i32) {}
     unsafe {
-        signal::sigaction(
-            Signal::SIGWINCH,
-            &SigAction::new(SigHandler::Handler(on_winch), SaFlags::empty(), SigSet::empty()),
+        nix::sys::signal::sigaction(
+            nix::sys::signal::Signal::SIGWINCH,
+            &nix::sys::signal::SigAction::new(
+                nix::sys::signal::SigHandler::Handler(on_winch),
+                nix::sys::signal::SaFlags::empty(),
+                nix::sys::signal::SigSet::empty(),
+            ),
         )
         .ok();
     }
@@ -577,7 +339,7 @@ fn cmd_attach(name: &str) {
         if now != last_size {
             last_size = now;
             if let Some((c, r)) = now {
-                let _ = stream.write_all(format!("\x1bPgw-size {c} {r}\x1b\\").as_bytes());
+                let _ = stream.write_all(dcs_size_msg(c, r).as_bytes());
             }
         }
         let ready = match fd_poll(&mut [(stdin_fd, true), (stream.as_raw_fd(), true)], 100) {
@@ -585,33 +347,34 @@ fn cmd_attach(name: &str) {
             Err(Errno::EINTR) => continue,
             Err(_) => break,
         };
-        // stdin -> daemon.
         if ready.contains(&0) {
             match fd_read(stdin_fd, &mut in_buf) {
-                Ok(0) => break, // client (ghostwave pane) closed
+                Ok(0) | Err(Errno::EAGAIN) => {}
                 Ok(n) => {
                     if stream.write_all(&in_buf[..n]).is_err() {
                         break;
                     }
                 }
-                Err(Errno::EAGAIN) => {}
                 Err(_) => break,
             }
         }
-        // daemon -> stdout.
         if ready.contains(&1) {
             match fd_read(stream.as_raw_fd(), &mut in_buf) {
-                Ok(0) => break, // session ended / daemon gone
-                Ok(n) => {
-                    out_buf.extend_from_slice(&in_buf[..n]);
-                    if let Ok(w) = std::io::stdout().write(&out_buf) {
-                        out_buf.drain(..w);
-                    }
-                    let _ = std::io::stdout().flush();
-                }
-                Err(Errno::EAGAIN) => {}
+                Ok(0) | Err(Errno::EAGAIN) => {}
+                Ok(n) => out_buf.extend_from_slice(&in_buf[..n]),
                 Err(_) => break,
             }
+            // stdout is blocking: write as much as possible now.
+            let mut i = 0;
+            while i < out_buf.len() {
+                let n = unsafe { nix::libc::write(1, out_buf[i..].as_ptr().cast(), out_buf.len() - i) };
+                if n > 0 {
+                    i += n as usize;
+                } else {
+                    break;
+                }
+            }
+            out_buf.drain(..i);
         }
     }
 }

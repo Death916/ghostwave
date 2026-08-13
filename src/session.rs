@@ -276,6 +276,7 @@ mod tests {
                     program: None,
                     args: vec![],
                     cwd: Some("/home/user".into()),
+                    remote: None,
                     log: "pane-test.log".into(),
                 }],
                 root: Some(crate::layout::Node::Leaf { pane: 0 }),
