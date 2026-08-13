@@ -315,6 +315,18 @@ fn cmd_attach(name: &str) {
     if let Some((c, r)) = term_size(stdin_fd) {
         let _ = stream.write_all(format!("SIZE {c} {r}\n").as_bytes());
     }
+    // Raw-mode stdin: the ssh pty's line discipline must not eat control
+    // bytes. In canonical mode Ctrl+C SIGINTs THIS process (dropping the
+    // connection) and arrow keys get echo-buffered as ^[[A instead of
+    // reaching the session's shell. cfmakeraw disables ICANON/ECHO/ISIG
+    // so every byte (0x03, arrows, …) flows through to the daemon, which
+    // writes it to the child pty (the shell there re-enables its own
+    // signal handling).
+    let mut t: nix::libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { nix::libc::tcgetattr(stdin_fd, &mut t) } == 0 {
+        unsafe { nix::libc::cfmakeraw(&mut t) };
+        unsafe { nix::libc::tcsetattr(stdin_fd, nix::libc::TCSANOW, &t) };
+    }
     let mut last_size = term_size(stdin_fd);
     extern "C" fn on_winch(_: i32) {}
     unsafe {
