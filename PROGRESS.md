@@ -83,10 +83,11 @@ Binary name: `ghostwave`
   - NEW: plain `ssh <host>` palette connections live in their OWN named
     session (ssh-<host>) in the session list — no durable marker, resume
     by re-running the command.
-  - KNOWN BUG (in fix): ds pane input — remote pty is canonical+echo, so
-    Ctrl+C SIGINTs the attach (drops the connection) and arrow keys echo
-    as ^[[A instead of reaching the remote shell. Fix: attach must set
-    its stdin raw (termios). Regular ssh mode is unaffected.
+  - FIXED (3363fff): ds pane input — the ssh -t remote pty was canonical+
+    echo, so Ctrl+C SIGINT'd the attach process (dropped the connection)
+    and arrows echoed as ^[[A. cmd_attach now cfmakeraw()s its stdin:
+    every byte (0x03, arrows) flows to the daemon's child pty, where the
+    shell's own signal handling applies. Static musl binaries rebuilt.
   - OSC 52 clipboard over ssh: already wired (on_clipboard_write → wl-copy).
   - Wrap/reflow semantics pinned in tests/term_core.rs — both work in
     libghostty-vt 0.2.1; the "cut off" report was a TUI clipping its own
