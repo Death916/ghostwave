@@ -52,6 +52,25 @@ Binary name: `ghostwave`
   black/garbage (the old flicker bug). Proper damage rendering needs
   an app-owned offscreen render target (macroquad render_target) —
   deferred; idle CPU is already ~0.
+- REMOTE DURABLE SESSIONS (waveterm-style) — `feat/remote-durable` branch,
+  NOT merged yet (user gates merges now; master is protected on forgejo):
+  - ghostd: standalone pure-Rust daemon (ghostd/ crate). Sessions survive
+    ssh drops (daemonize + setsid + SIGHUP-immune); pty ALWAYS drained to a
+    front-truncated ring log so children never stall while detached and
+    drop-gap output replays on attach; first-attach timeout (default 300s)
+    kills orphaned daemons; log cap (32MB) bounds disk; new/attach/list/
+    kill/kill-all; DCS-based mid-session resize.
+  - Client: `ds <host>` palette entry → ssh -t + ghostd attach; binary
+    bootstrapped over ssh (uname -m → version check → stdin upload,
+    embedded x86_64+aarch64 static musl builds via flake.nix pkgsMusl —
+    NO zig); restore shows remote panes DISCONNECTED (Enter to connect,
+    never auto-connect on start); bounded auto-reconnect (5 attempts,
+    3s→15s backoff → manual); `k` kills the remote session; session
+    manager shows an "ssh" marker; [remote] config section.
+  - OSC 52 clipboard over ssh: already wired (on_clipboard_write → wl-copy).
+  - Wrap/reflow semantics pinned in tests/term_core.rs — both work in
+    libghostty-vt 0.2.1; the "cut off" report was a TUI clipping its own
+    panels, not a terminal bug.
 - Ctrl+Tab = next tab, Ctrl+Shift+Tab = previous tab (global binds).
 - PIN MARKER: drawn with primitives (no 📌 in the font stack → tofu).
 - FONT STACK: JetBrains Nerd variants (6 family NAMES, same design)

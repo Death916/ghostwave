@@ -41,6 +41,10 @@ tab and it comes back — screen *and* scrollback — after a restart.
 | `Ctrl+Shift+P` | command palette |
 | `Ctrl+Shift+F` | find |
 | `Ctrl+Shift+C` / `V` | copy / paste |
+| `ds <host>` in palette | durable ssh pane (ghostd) |
+| disconnected remote pane: `Enter` | connect / reconnect |
+| disconnected remote pane: `k` | kill the remote session |
+| disconnected remote pane: `Esc` | stop auto-reconnect |
 | right-click tab | tab menu: rename, close |
 
 ## Build & run
@@ -66,10 +70,37 @@ scrollback = 10000          # terminal scrollback lines per pane
 max_log_mb = 32             # per-pane session log cap (MiB), front-truncated
 padding = 6.0
 row_gap = 4.0
+
+[remote]                    # durable remote sessions (ghostd)
+auto_reconnect = true       # auto-retry a dropped remote pane
+reconnect_attempts = 5      # before dropping to manual (Enter)
+reconnect_delay_secs = 3    # initial retry delay (backoff caps at 15s)
 ```
 
 Session data (pane logs + session state) lives in
 `~/.local/share/ghostwave/`.
+
+## Durable remote sessions (ghostd)
+
+`ds <host>` in the command palette (`Ctrl+Shift+P`) opens a durable ssh
+pane. Under the hood it runs `ssh -t <host> ghostd attach ghostwave-<host>`;
+the ghostd daemon is uploaded to `~/.cache/ghostwave/` on the host on first
+use (no install needed; both x86_64 and aarch64 binaries are embedded and
+selected by the remote's `uname -m`).
+
+- The remote session keeps running when the pane/ssh dies — long builds
+  and shells survive disconnects, and output keeps being logged.
+- Reconnecting (re-opening `ds <host>`, or pressing `Enter` on a
+  disconnected pane) replays the full log — including everything printed
+  while you were away — then resumes live.
+- A dropped connection auto-reconnects (bounded: 5 attempts, 3s→15s
+  backoff), then waits for `Enter`. `Esc` stops auto-reconnect, `k` kills
+  the remote session (daemon cleans up socket/pid/log).
+- Restoring a saved session restores remote panes DISCONNECTED — history
+  is shown but nothing connects until you press `Enter`.
+- OSC 52 copy (vim/tmux clipboard over ssh) is supported out of the box.
+- `ghostd` builds: `nix build .#ghostd-x86_64 .#ghostd-aarch64`
+  (static musl via nixpkgs; pure Rust, no zig).
 
 ## Project layout
 
@@ -79,6 +110,8 @@ Session data (pane logs + session state) lives in
 - `src/app.rs` — app state, tabs/panes/layout, mouse handling
 - `src/fonts.rs` — font stack with fallback discovery (fc-list)
 - `src/main.rs` — macroquad event loop + chrome rendering
+- `ghostd/` — the remote session daemon (standalone crate)
+- `tests/term_core.rs` — terminal-core semantics (wrap/reflow)
 - `PROGRESS.md` — development journal
 
 ## License

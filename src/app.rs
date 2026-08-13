@@ -126,6 +126,11 @@ pub struct App {
     /// True when the last update() drained pty data (event-driven pacing:
     /// the main loop skips its frame sleep while there's backlog).
     pub pty_activity: bool,
+    /// ghostd upload results: (host, session, ok). Polled each frame.
+    remote_uploads: std::sync::mpsc::Receiver<(String, String, bool)>,
+    remote_upload_tx: std::sync::mpsc::Sender<(String, String, bool)>,
+    /// Hosts whose ghostd binary is known-good this session (skip re-upload).
+    binary_ready: std::collections::HashSet<String>,
 }
 
 impl App {
@@ -183,9 +188,13 @@ impl App {
                 None,
                 config.scrollback,
                 config.max_log_mb * 1024 * 1024,
+                true,
+                None,
             )?;
             tabs.push(Tab::new(Pane::Term(initial), "Tab 1".into()));
         }
+
+        let (remote_upload_tx, remote_uploads) = std::sync::mpsc::channel();
 
         let mut app = Self {
             tabs,
@@ -212,6 +221,9 @@ impl App {
             session_list: None,
             last_session_save: std::time::Instant::now(),
             pty_activity: false,
+            remote_uploads,
+            remote_upload_tx,
+            binary_ready: Default::default(),
         };
 
         // Apply the configured theme's fg/bg to the initial terminal.
@@ -229,6 +241,7 @@ impl App {
         program: Option<&str>,
         args: &[&str],
         cwd: Option<&str>,
+        remote: Option<crate::term::RemoteSpec>,
     ) -> crate::Result<usize> {
         let shell = program.or(self.config.shell.as_deref());
         let pane = TermPane::new(
@@ -240,6 +253,8 @@ impl App {
             cwd,
             self.config.scrollback,
             self.config.max_log_mb * 1024 * 1024,
+            true,
+            remote,
         )?;
         let id = {
             let tab = self.current_tab_mut();
@@ -450,6 +465,7 @@ impl App {
             }
             Action::OpenFile(path) => self.open_file(path),
             Action::ConnectSsh(host) => self.connect_ssh(&host),
+            Action::ConnectDurableSsh(host) => self.connect_durable_ssh(&host),
             Action::NewAi => self.new_ai_pane(),
             Action::SessionManager => self.open_session_manager(),
             Action::SessionNew => {
@@ -572,6 +588,8 @@ impl App {
             None,
             self.config.scrollback,
             self.config.max_log_mb * 1024 * 1024,
+            true,
+            None,
         ) {
             Ok(p) => Pane::Term(p),
             Err(e) => {
@@ -601,6 +619,8 @@ impl App {
                 None,
                 self.config.scrollback,
                 self.config.max_log_mb * 1024 * 1024,
+                true,
+                None,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -657,7 +677,7 @@ impl App {
     pub fn split(&mut self, dir: SplitDir, stacked: bool) {
         let cols = 80;
         let rows = 24;
-        let id = match self.new_term_pane(cols, rows, None, &[], None) {
+        let id = match self.new_term_pane(cols, rows, None, &[], None, None) {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("ghostwave: failed to spawn shell: {e}");
@@ -708,6 +728,8 @@ impl App {
                 None,
                 self.config.scrollback,
                 self.config.max_log_mb * 1024 * 1024,
+                true,
+                None,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -855,12 +877,149 @@ impl App {
     pub fn connect_ssh(&mut self, host: &str) {
         let cols = 100;
         let rows = 30;
-        match self.new_term_pane(cols, rows, Some("ssh"), &[host], None) {
+        match self.new_term_pane(cols, rows, Some("ssh"), &[host], None, None) {
             Ok(id) => {
                 self.current_tab_mut().active = id;
                 self.toast(&format!("connecting to {host}"));
             }
             Err(e) => self.toast(&format!("ssh failed: {e}")),
+        }
+    }
+
+    // ---- durable remote sessions (ghostd) --------------------------------
+
+    /// Remote session name for a host: `ghostwave-<host>` (sanitized).
+    pub fn remote_session_name(host: &str) -> String {
+        let h: String = host
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+            .collect();
+        format!("ghostwave-{h}")
+    }
+
+    /// The remote shell command the pane runs: check the cached ghostd
+    /// binary, then attach (creating the session if missing).
+    fn remote_attach_cmd(host: &str, session: &str) -> String {
+        format!(
+            "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
+             if [ ! -x \"$BIN\" ] || [ \"$($BIN --version 2>/dev/null)\" != \"ghostd {ver}\" ]; then \
+             echo \"ghostd missing/stale on {host} — reconnect to upload\"; exit 1; fi; \
+             exec \"$BIN\" attach {session} 2>/dev/null || {{ \"$BIN\" new {session} >/dev/null 2>&1 && exec \"$BIN\" attach {session}; }}",
+            ver = env!("CARGO_PKG_VERSION")
+        )
+    }
+
+    /// Open a durable remote pane: `ssh -t host` running the ghostd attach
+    /// command. The ghostd binary is uploaded in the background on first
+    /// use; a stale/missing binary shows an error and the reconnect loop
+    /// retries once the upload lands.
+    pub fn connect_durable_ssh(&mut self, host: &str) {
+        let session = Self::remote_session_name(host);
+        let cmd = Self::remote_attach_cmd(host, &session);
+        self.ensure_remote_binary(host, &session);
+        let cols = 100;
+        let rows = 30;
+        let args = ["-t", "-o", "ConnectTimeout=10", host, &cmd];
+        match self.new_term_pane(
+            cols,
+            rows,
+            Some("ssh"),
+            &args,
+            None,
+            Some(crate::term::RemoteSpec {
+                host: host.to_string(),
+                session,
+            }),
+        ) {
+            Ok(id) => {
+                self.current_tab_mut().active = id;
+                self.toast(&format!("durable ssh: {host}"));
+            }
+            Err(e) => self.toast(&format!("ssh failed: {e}")),
+        }
+    }
+
+    /// Background thread: check/upload the ghostd binary for `host`; the
+    /// result arrives on `remote_uploads` and respawns waiting panes.
+    fn ensure_remote_binary(&mut self, host: &str, session: &str) {
+        if self.binary_ready.contains(host) {
+            return;
+        }
+        let tx = self.remote_upload_tx.clone();
+        let host = host.to_string();
+        let session = session.to_string();
+        std::thread::spawn(move || {
+            let ok = upload_ghostd(&host);
+            let _ = tx.send((host, session, ok));
+        });
+    }
+
+    /// Enter on a disconnected remote pane: connect now (upload first if
+    /// needed, then respawn — or wait for the upload signal).
+    fn connect_remote_pane(&mut self, tab_idx: usize, pane_idx: usize) {
+        let Some((host, session)) = self.remote_spec_of(tab_idx, pane_idx) else {
+            return;
+        };
+        let ready = self.binary_ready.contains(&host);
+        if !ready {
+            self.ensure_remote_binary(&host, &session);
+        }
+        if let Pane::Term(t) = &mut self.tabs[tab_idx].panes[pane_idx] {
+            t.reconnect_failures = 0;
+            if ready {
+                if !t.respawn() {
+                    t.reconnect = crate::term::ReconnectState::Manual;
+                    self.toast("reconnect failed");
+                }
+            } else {
+                t.reconnect = crate::term::ReconnectState::Waiting {
+                    attempt: 1,
+                    next: std::time::Instant::now(),
+                };
+            }
+            self.repaint_all();
+        }
+    }
+
+    /// k on a disconnected remote pane: kill the remote session (ghostd
+    /// kill on the host). The daemon cleans up its socket/pid/log.
+    fn kill_remote_pane(&mut self, tab_idx: usize, pane_idx: usize) {
+        let Some((host, session)) = self.remote_spec_of(tab_idx, pane_idx) else {
+            return;
+        };
+        self.toast(&format!("killing remote session {session} on {host}"));
+        std::thread::spawn(move || {
+            let cmd = format!(
+                "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \"$BIN\" kill {session} 2>&1 || echo \"no ghostd binary on {host}\""
+            );
+            let _ = std::process::Command::new("ssh")
+                .args(["-o", "ConnectTimeout=5", &host, &cmd])
+                .status();
+        });
+    }
+
+    fn remote_spec_of(&self, tab_idx: usize, pane_idx: usize) -> Option<(String, String)> {
+        match self.tabs.get(tab_idx)?.panes.get(pane_idx)? {
+            Pane::Term(t) => t
+                .remote
+                .as_ref()
+                .map(|r| (r.host.clone(), r.session.clone())),
+            _ => None,
+        }
+    }
+
+    /// Respawn every pane waiting to reconnect to `host` (binary just
+    /// became ready).
+    fn respawn_waiting(&mut self, host: &str) {
+        for tab in self.tabs.iter_mut() {
+            for pane in tab.panes.iter_mut() {
+                if let Pane::Term(t) = pane {
+                    let is_host = t.remote.as_ref().is_some_and(|r| r.host == host);
+                    if is_host && matches!(t.reconnect, crate::term::ReconnectState::Waiting { .. }) {
+                        let _ = t.respawn();
+                    }
+                }
+            }
         }
     }
 
@@ -926,6 +1085,7 @@ impl App {
                                     program: t.program.clone(),
                                     args: t.args.clone(),
                                     cwd: t.cwd.clone(),
+                                    remote: t.remote.clone(),
                                     log: t.log_name.clone(),
                                 })
                             }
@@ -948,6 +1108,19 @@ impl App {
         };
         crate::session::save(&self.current_session, &state);
         crate::session::set_last_session(&self.current_session);
+    }
+
+    /// Set every remote pane on `host` to Manual (upload failed).
+    fn set_remote_manual(&mut self, host: &str) {
+        for tab in self.tabs.iter_mut() {
+            for pane in tab.panes.iter_mut() {
+                if let Pane::Term(t) = pane {
+                    if t.remote.as_ref().is_some_and(|r| r.host == host) {
+                        t.reconnect = crate::term::ReconnectState::Manual;
+                    }
+                }
+            }
+        }
     }
 
     // ---- tab context menu -------------------------------------------------
@@ -988,6 +1161,10 @@ impl App {
             let mut panes: Vec<Pane> = Vec::new();
             for ps in &ts.panes {
                 let args: Vec<&str> = ps.args.iter().map(String::as_str).collect();
+                // Remote panes restore DISCONNECTED: history shows, but the
+                // ssh only connects when the user presses Enter (or an
+                // in-session reconnect loop fires — never on restore).
+                let spawn = ps.remote.is_none();
                 let Ok(pane) = TermPane::new(
                     cols,
                     rows,
@@ -997,6 +1174,8 @@ impl App {
                     ps.cwd.as_deref(),
                     config.scrollback,
                     config.max_log_mb * 1024 * 1024,
+                    spawn,
+                    ps.remote.clone(),
                 ) else {
                     continue;
                 };
@@ -1007,6 +1186,12 @@ impl App {
                     config.max_log_mb * 1024 * 1024,
                 );
                 pane.log_seed(&seeded);
+                if !spawn {
+                    pane.exited = Some("disconnected (remote session)".into());
+                    pane.last_exit_code = Some(1);
+                    pane.reconnect = crate::term::ReconnectState::Manual;
+                    pane.force_repaint = true;
+                }
                 panes.push(Pane::Term(pane));
             }
             if !panes.is_empty() {
@@ -1047,6 +1232,8 @@ impl App {
                 None,
                 self.config.scrollback,
                 self.config.max_log_mb * 1024 * 1024,
+                true,
+                None,
             ) {
                 Ok(p) => tabs.push(Tab::new(Pane::Term(p), "Tab 1".into())),
                 Err(e) => {
@@ -1078,6 +1265,8 @@ impl App {
             None,
             self.config.scrollback,
             self.config.max_log_mb * 1024 * 1024,
+            true,
+            None,
         ) {
             Ok(p) => {
                 self.tabs = vec![Tab::new(Pane::Term(p), "Tab 1".into())];
@@ -1189,6 +1378,39 @@ impl App {
         if keymap::is_quit(k, m) {
             self.quit = true;
             return;
+        }
+
+        // Disconnected durable-remote pane: Enter connects, k kills the
+        // remote session, Esc stops auto-reconnect. All other keys are
+        // swallowed (there is no process to send them to).
+        if self.mode == Mode::Normal {
+            let active = self.current_tab().active;
+            let is_remote_dead = matches!(
+                self.current_tab().panes.get(active),
+                Some(Pane::Term(t)) if t.remote.is_some() && t.exited.is_some()
+            );
+            if is_remote_dead {
+                let tab_idx = self.active_tab;
+                let pane_idx = active;
+                match k {
+                    Key::Enter => {
+                        self.connect_remote_pane(tab_idx, pane_idx);
+                        return;
+                    }
+                    Key::K => {
+                        self.kill_remote_pane(tab_idx, pane_idx);
+                        return;
+                    }
+                    Key::Escape => {
+                        if let Pane::Term(t) = &mut self.tabs[tab_idx].panes[pane_idx] {
+                            t.reconnect = crate::term::ReconnectState::Manual;
+                        }
+                        self.toast("reconnect stopped — Enter to connect");
+                        return;
+                    }
+                    _ => return,
+                }
+            }
         }
 
         // Tab context menu swallows keys; Esc closes it.
@@ -1699,6 +1921,77 @@ impl App {
             }
         }
 
+        // ---- durable remote sessions ----
+
+        // ghostd upload results: mark the host ready and respawn panes that
+        // were waiting for the binary.
+        while let Ok((host, _session, ok)) = self.remote_uploads.try_recv() {
+            if ok {
+                self.binary_ready.insert(host.clone());
+                self.respawn_waiting(&host);
+            } else {
+                self.set_remote_manual(&host);
+                self.toast(&format!("ghostd setup failed on {host}"));
+            }
+            self.repaint_all();
+        }
+
+        // Reconnect loop: a dead remote pane enters auto-reconnect (bounded),
+        // then drops to manual. Panes whose binary isn't uploaded yet wait
+        // for the upload signal instead of burning attempts.
+        let now = std::time::Instant::now();
+        let mut to_respawn: Vec<(usize, usize)> = Vec::new();
+        let mut to_manual: Vec<(usize, usize)> = Vec::new();
+        for (ti, tab) in self.tabs.iter_mut().enumerate() {
+            for (pi, pane) in tab.panes.iter_mut().enumerate() {
+                let Pane::Term(t) = pane else { continue };
+                if t.remote.is_none() {
+                    continue;
+                }
+                if t.exited.is_some() && t.reconnect == crate::term::ReconnectState::Idle {
+                    let code = t.last_exit_code.unwrap_or(255);
+                    let auto = self.config.remote.auto_reconnect && code != 0;
+                    if auto && t.reconnect_failures < self.config.remote.reconnect_attempts {
+                        t.reconnect_failures += 1;
+                        let delay = self.config.remote.reconnect_delay_secs.max(1);
+                        t.reconnect = crate::term::ReconnectState::Waiting {
+                            attempt: t.reconnect_failures,
+                            next: now + std::time::Duration::from_secs(delay),
+                        };
+                    } else {
+                        t.reconnect = crate::term::ReconnectState::Manual;
+                    }
+                }
+                if let crate::term::ReconnectState::Waiting { attempt, next } = t.reconnect {
+                    if now >= next {
+                        let host = t.remote.as_ref().map(|r| r.host.clone());
+                        if let Some(h) = host {
+                            if self.binary_ready.contains(&h) {
+                                to_respawn.push((ti, pi));
+                            } else {
+                                t.reconnect = crate::term::ReconnectState::Waiting {
+                                    attempt,
+                                    next: now + std::time::Duration::from_millis(500),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (ti, pi) in to_respawn {
+            if let Pane::Term(t) = &mut self.tabs[ti].panes[pi] {
+                if !t.respawn() {
+                    t.reconnect = crate::term::ReconnectState::Manual;
+                }
+            }
+        }
+        for (ti, pi) in to_manual {
+            if let Pane::Term(t) = &mut self.tabs[ti].panes[pi] {
+                t.reconnect = crate::term::ReconnectState::Manual;
+            }
+        }
+
         // Tab label follows the active pane's OSC title (unless renamed).
         let tab = self.current_tab_mut();
         let active = tab.active;
@@ -1762,4 +2055,82 @@ impl Node {
     pub fn pane_id_of_path(&self, path: &[u8]) -> usize {
         self.at(path).pane_id()
     }
+}
+
+// ---- durable remote (ghostd) bootstrap -----------------------------------
+
+/// Embedded ghostd binaries (built as static musl; see assets/). Selected
+/// by the REMOTE arch (uname -m) during the upload.
+const GHOSTD_X86_64: &[u8] = include_bytes!("../assets/ghostd-x86_64");
+const GHOSTD_AARCH64: &[u8] = include_bytes!("../assets/ghostd-aarch64");
+
+/// Run a short ssh command; true on exit 0.
+fn ssh_ok(host: &str, cmd: &str) -> bool {
+    std::process::Command::new("ssh")
+        .args(["-o", "ConnectTimeout=5", host, cmd])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Run a short ssh command; its stdout (None on failure).
+fn ssh_out(host: &str, cmd: &str) -> Option<String> {
+    let out = std::process::Command::new("ssh")
+        .args(["-o", "ConnectTimeout=5", host, cmd])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Ensure the ghostd binary for `host` is present and current in
+/// ~/.cache/ghostwave on the remote. True when it is (or became) ready.
+fn upload_ghostd(host: &str) -> bool {
+    // 1. Remote arch decides which embedded binary to ship.
+    let arch = match ssh_out(host, "uname -m") {
+        Some(a) => a.trim().to_string(),
+        None => return false,
+    };
+    let bytes: &[u8] = match arch.as_str() {
+        "x86_64" => GHOSTD_X86_64,
+        "aarch64" => GHOSTD_AARCH64,
+        _ => return false,
+    };
+    // 2. Already current? (version check on the remote).
+    let check = format!(
+        "BIN=\"$HOME/.cache/ghostwave/ghostd-{arch}\"; [ -x \"$BIN\" ] && [ \"$($BIN --version 2>/dev/null)\" = \"ghostd {ver}\" ]",
+        ver = env!("CARGO_PKG_VERSION")
+    );
+    if ssh_ok(host, &check) {
+        return true;
+    }
+    // 3. Upload the binary over stdin.
+    let mut child = match std::process::Command::new("ssh")
+        .args([
+            "-o",
+            "ConnectTimeout=5",
+            host,
+            &format!(
+                "mkdir -p \"$HOME/.cache/ghostwave\" && cat > \"$HOME/.cache/ghostwave/ghostd-{arch}\" && chmod +x \"$HOME/.cache/ghostwave/ghostd-{arch}\""
+            ),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    {
+        use std::io::Write;
+        if let Some(mut si) = child.stdin.take() {
+            let _ = si.write_all(bytes);
+        }
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
 }

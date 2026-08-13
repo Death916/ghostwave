@@ -24,6 +24,19 @@ pub struct Config {
     pub max_log_mb: u64,
     /// AI assistant pane configuration (OpenAI-compatible chat completions).
     pub ai: AiConfig,
+    /// Durable remote sessions (ghostd).
+    pub remote: RemoteConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RemoteConfig {
+    /// Auto-reconnect a dropped remote pane (bounded by the attempts below).
+    pub auto_reconnect: bool,
+    /// Max consecutive auto-reconnect attempts before dropping to manual.
+    pub reconnect_attempts: u32,
+    /// Initial reconnect delay in seconds (backoff caps at 15s).
+    pub reconnect_delay_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +63,16 @@ impl Default for AiConfig {
     }
 }
 
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            auto_reconnect: true,
+            reconnect_attempts: 5,
+            reconnect_delay_secs: 3,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -61,6 +84,7 @@ impl Default for Config {
             row_gap: 4.0,
             max_log_mb: 32,
             ai: AiConfig::default(),
+            remote: RemoteConfig::default(),
         }
     }
 }

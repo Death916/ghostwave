@@ -39,6 +39,10 @@ pub struct PaneState {
     pub program: Option<String>,
     pub args: Vec<String>,
     pub cwd: Option<String>,
+    /// Durable remote binding (ssh+ghostd). Present = restore the pane
+    /// DISCONNECTED (no auto-connect; the user connects or reconnects).
+    #[serde(default)]
+    pub remote: Option<crate::term::RemoteSpec>,
     /// Log filename (relative to the session dir).
     pub log: String,
 }
@@ -121,6 +125,14 @@ pub fn load(name: &str) -> Option<SessionState> {
     migrate_legacy();
     let bytes = std::fs::read(session_path(name)).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Whether any pane in the session is a durable remote (ssh) connection —
+/// used by the session manager to show an "ssh" marker.
+pub fn has_remote(name: &str) -> bool {
+    load(name).is_some_and(|s| {
+        s.tabs.iter().any(|t| t.panes.iter().any(|p| p.remote.is_some()))
+    })
 }
 
 pub fn save(name: &str, state: &SessionState) {
@@ -264,6 +276,7 @@ mod tests {
                     program: None,
                     args: vec![],
                     cwd: Some("/home/user".into()),
+                    remote: None,
                     log: "pane-test.log".into(),
                 }],
                 root: Some(crate::layout::Node::Leaf { pane: 0 }),

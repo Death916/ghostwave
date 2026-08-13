@@ -257,6 +257,16 @@ fn render(app: &mut App) {
                 yy + item_h / 2.0 + 5.0,
                 TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.palette_fg), ..Default::default() },
             );
+            // ssh marker: sessions containing durable remote panes.
+            if crate::session::has_remote(name) {
+                let lw = measure_text(&label, Some(&font), 13, 1.0).width;
+                draw_text_ex(
+                    "ssh",
+                    x + 16.0 + lw,
+                    yy + item_h / 2.0 + 5.0,
+                    TextParams { font: Some(&font), font_size: 11, color: color_theme(theme.search_match), ..Default::default() },
+                );
+            }
         }
         draw_text_ex(
             "↑/↓ select | Enter switch | n new | r rename | d delete | Esc close",
