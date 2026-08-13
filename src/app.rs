@@ -234,15 +234,16 @@ impl App {
 
     // ---- pane creation ---------------------------------------------------
 
-    fn new_term_pane(
-        &mut self,
+    /// Create a pane WITHOUT inserting it into a tab (for new-tab flows).
+    fn make_term_pane(
+        &self,
         cols: u16,
         rows: u16,
         program: Option<&str>,
         args: &[&str],
         cwd: Option<&str>,
         remote: Option<crate::term::RemoteSpec>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<TermPane> {
         let shell = program.or(self.config.shell.as_deref());
         let pane = TermPane::new(
             cols,
@@ -256,6 +257,28 @@ impl App {
             true,
             remote,
         )?;
+        Ok(pane)
+    }
+
+    /// Push a new tab containing `pane` and switch to it.
+    fn push_new_tab(&mut self, pane: Pane, name: &str) {
+        self.tabs.push(Tab::new(pane, name.to_string()));
+        self.active_tab = self.tabs.len() - 1;
+        self.last_tab = None;
+        self.apply_terminal_colors();
+        self.layout_all();
+    }
+
+    fn new_term_pane(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        program: Option<&str>,
+        args: &[&str],
+        cwd: Option<&str>,
+        remote: Option<crate::term::RemoteSpec>,
+    ) -> crate::Result<usize> {
+        let pane = self.make_term_pane(cols, rows, program, args, cwd, remote)?;
         let id = {
             let tab = self.current_tab_mut();
             let id = tab.panes.len();
@@ -877,9 +900,9 @@ impl App {
     pub fn connect_ssh(&mut self, host: &str) {
         let cols = 100;
         let rows = 30;
-        match self.new_term_pane(cols, rows, Some("ssh"), &[host], None, None) {
-            Ok(id) => {
-                self.current_tab_mut().active = id;
+        match self.make_term_pane(cols, rows, Some("ssh"), &[host], None, None) {
+            Ok(pane) => {
+                self.push_new_tab(Pane::Term(pane), &format!("ssh {host}"));
                 self.toast(&format!("connecting to {host}"));
             }
             Err(e) => self.toast(&format!("ssh failed: {e}")),
@@ -920,7 +943,7 @@ impl App {
         let cols = 100;
         let rows = 30;
         let args = ["-t", "-o", "ConnectTimeout=10", host, &cmd];
-        match self.new_term_pane(
+        match self.make_term_pane(
             cols,
             rows,
             Some("ssh"),
@@ -931,8 +954,8 @@ impl App {
                 session,
             }),
         ) {
-            Ok(id) => {
-                self.current_tab_mut().active = id;
+            Ok(pane) => {
+                self.push_new_tab(Pane::Term(pane), &format!("ssh {host}"));
                 self.toast(&format!("durable ssh: {host}"));
             }
             Err(e) => self.toast(&format!("ssh failed: {e}")),

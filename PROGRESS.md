@@ -58,6 +58,9 @@ Binary name: `ghostwave`
     ssh drops (daemonize + setsid + SIGHUP-immune); pty ALWAYS drained to a
     front-truncated ring log so children never stall while detached and
     drop-gap output replays on attach; first-attach timeout (default 300s)
+    + client reconnect loop (3s→15s backoff, 5 tries, then manual);
+    `ds <host>` palette entry opens a new TAB (fixed: ssh/durable ssh panes
+    were created but never inserted into the layout tree — invisible).
     kills orphaned daemons; log cap (32MB) bounds disk; new/attach/list/
     kill/kill-all; DCS-based mid-session resize.
   - Client: `ds <host>` palette entry → ssh -t + ghostd attach; binary
