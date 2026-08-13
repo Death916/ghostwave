@@ -88,6 +88,44 @@ Binary name: `ghostwave`
     and arrows echoed as ^[[A. cmd_attach now cfmakeraw()s its stdin:
     every byte (0x03, arrows) flows to the daemon's child pty, where the
     shell's own signal handling applies. Static musl binaries rebuilt.
+  - FIXED (uncommitted, ghostd 0.1.1 + app 0.1.1): fish-shell hosts (homelab)
+    rejected every remote command — ssh runs the command via the login
+    shell, and fish refuses `BIN="..."` assignment ("Unsupported use of
+    '='"). All four remote command sites wrapped in `sh -c '...'` so POSIX
+    sh parses them regardless of login shell: remote_attach_cmd
+    (attach/fallback chain), kill_remote_pane, upload_ghostd version
+    check + upload. Dropped the inner single quotes in the kill message
+    (would have terminated the sh -c wrapper). VERIFIED on homelab (fish):
+    full ds chain runs, session created, fish welcome replayed.
+  - FIXED (same commit): `ds` hung with ZERO output on both hosts even
+    after the fish fix — root cause chain, all addressed:
+    a. ghostd handle_client read the SIZE handshake NONBLOCKING and bailed
+       on EAGAIN → thread died silently → attach connected but nobody ever
+       serviced it → hang with no output. Now polls (5s bound) for the
+       line.
+    b. New OK-ack protocol: daemon acks after SIZE; attach waits ≤8s for
+       the ack then exits 1 ("session 'x' not responding — recovering")
+       so the `|| new` fallback fires. `new` probes first (SIZE handshake,
+       2s bound): live daemon → "already exists"; unresponsive daemon →
+       SIGTERM → SIGKILL → remove state → rebind fresh.
+    c. attach ignored stdin/stream EOF (spin at 100% CPU forever holding
+       the daemon's client slot — the zombie attaches found on orac).
+       Now exits on both.
+    d. attach sends SIZE 80x24 fallback when stdin isn't a tty (was:
+       no SIZE → daemon's 5s wait → dead thread).
+    e. upload writes ghostd-<arch>.new + mv (was: "Text file busy" when a
+       running daemon holds the binary path).
+    VERIFIED end-to-end: orac SIGSTOP'd daemon → chain attach-timeout →
+    probe → SIGTERM/SIGKILL → fresh daemon → re-attach → live bash
+    prompt; homelab fish full chain; no zombie attaches after pane close.
+  - DEBUG: GHOSTWAVE_DEBUG=1 (app, stdout traces: ssh argv, upload steps,
+    reconnect, kill) and GHOSTD_DEBUG=1 (remote: eprintln + append to
+    ~/.local/share/ghostwave/debug.log — daemon/attach/new/probe/recover
+    traces). Off by default.
+  - Versions bumped 0.1.0 → 0.1.1 (BOTH crates — the ssh bootstrap
+    compares `ghostd --version` against the app's CARGO_PKG_VERSION, so a
+    ghostd-only bump would never re-upload). Musl assets rebuilt both
+    arches.
   - OSC 52 clipboard over ssh: already wired (on_clipboard_write → wl-copy).
   - Wrap/reflow semantics pinned in tests/term_core.rs — both work in
     libghostty-vt 0.2.1; the "cut off" report was a TUI clipping its own

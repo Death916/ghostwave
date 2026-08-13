@@ -26,6 +26,15 @@ pub const TAB_MENU_ITEMS: usize = 2;
 pub const TAB_BAR_H: f32 = 30.0;
 pub const STATUS_BAR_H: f32 = 26.0;
 
+/// Debug trace to stdout, gated by GHOSTWAVE_DEBUG=1 (off by default).
+/// Intended for remote-session (ds/ghostd) diagnostics while running the
+/// debug binary from a terminal: each line is one client-side step.
+pub fn gdbg(msg: impl AsRef<str>) {
+    if std::env::var_os("GHOSTWAVE_DEBUG").is_some() {
+        println!("[ghostwave] {}", msg.as_ref());
+    }
+}
+
 pub enum Pane {
     Term(TermPane),
     Preview(PreviewPane),
@@ -942,10 +951,10 @@ impl App {
     /// binary, then attach (creating the session if missing).
     fn remote_attach_cmd(host: &str, session: &str) -> String {
         format!(
-            "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
+            "sh -c 'BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
              if [ ! -x \"$BIN\" ] || [ \"$($BIN --version 2>/dev/null)\" != \"ghostd {ver}\" ]; then \
              echo \"ghostd missing/stale on {host} — reconnect to upload\"; exit 1; fi; \
-             \"$BIN\" attach {session} 2>/dev/null || {{ \"$BIN\" new {session} >/dev/null 2>&1 && exec \"$BIN\" attach {session}; }}",
+             \"$BIN\" attach {session} 2>/dev/null || {{ \"$BIN\" new {session} >/dev/null 2>&1 && exec \"$BIN\" attach {session}; }}'",
             ver = env!("CARGO_PKG_VERSION")
         )
     }
@@ -957,10 +966,12 @@ impl App {
     pub fn connect_durable_ssh(&mut self, host: &str) {
         let session = Self::remote_session_name(host);
         let cmd = Self::remote_attach_cmd(host, &session);
+        gdbg(format!("ds {host}: session={session} uploading-binary-check"));
         self.ensure_remote_binary(host, &session);
         let cols = 100;
         let rows = 30;
         let args = ["-t", "-o", "ConnectTimeout=10", host, &cmd];
+        gdbg(format!("ds {host}: ssh argv: -t -o ConnectTimeout=10 {host} {cmd:?}"));
         match self.make_term_pane(
             cols,
             rows,
@@ -989,8 +1000,10 @@ impl App {
         let tx = self.remote_upload_tx.clone();
         let host = host.to_string();
         let session = session.to_string();
+        gdbg(format!("upload thread for {host}: starting"));
         std::thread::spawn(move || {
             let ok = upload_ghostd(&host);
+            gdbg(format!("upload thread for {host}: result ok={ok}"));
             let _ = tx.send((host, session, ok));
         });
     }
@@ -1029,11 +1042,12 @@ impl App {
             return;
         };
         self.toast(&format!("killing remote session {session} on {host}"));
+        gdbg(format!("kill {session} on {host}: spawning ssh"));
         std::thread::spawn(move || {
             let cmd = format!(
-                "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
+                "sh -c 'BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
                  if [ ! -x \"$BIN\" ]; then echo \"no ghostd binary on {host}\"; exit 1; fi; \
-                 \"$BIN\" kill {session} 2>&1 || echo \"no session '{session}' on {host}\""
+                 \"$BIN\" kill {session} 2>&1 || echo \"no session {session} on {host}\"'"
             );
             let _ = std::process::Command::new("ssh")
                 .args(["-o", "ConnectTimeout=5", &host, &cmd])
@@ -1969,6 +1983,7 @@ impl App {
         // ghostd upload results: mark the host ready and respawn panes that
         // were waiting for the binary.
         while let Ok((host, _session, ok)) = self.remote_uploads.try_recv() {
+            gdbg(format!("upload result {host}: ok={ok}"));
             if ok {
                 self.binary_ready.insert(host.clone());
                 self.respawn_waiting(&host);
@@ -2136,21 +2151,30 @@ fn upload_ghostd(host: &str) -> bool {
     // 1. Remote arch decides which embedded binary to ship.
     let arch = match ssh_out(host, "uname -m") {
         Some(a) => a.trim().to_string(),
-        None => return false,
+        None => {
+            gdbg(format!("upload {host}: uname -m failed"));
+            return false;
+        }
     };
+    gdbg(format!("upload {host}: arch={arch}"));
     let bytes: &[u8] = match arch.as_str() {
         "x86_64" => GHOSTD_X86_64,
         "aarch64" => GHOSTD_AARCH64,
-        _ => return false,
+        _ => {
+            gdbg(format!("upload {host}: unsupported arch {arch}"));
+            return false;
+        }
     };
     // 2. Already current? (version check on the remote).
     let check = format!(
-        "BIN=\"$HOME/.cache/ghostwave/ghostd-{arch}\"; [ -x \"$BIN\" ] && [ \"$($BIN --version 2>/dev/null)\" = \"ghostd {ver}\" ]",
+        "sh -c 'BIN=\"$HOME/.cache/ghostwave/ghostd-{arch}\"; [ -x \"$BIN\" ] && [ \"$($BIN --version 2>/dev/null)\" = \"ghostd {ver}\" ]'",
         ver = env!("CARGO_PKG_VERSION")
     );
     if ssh_ok(host, &check) {
+        gdbg(format!("upload {host}: binary current, no upload"));
         return true;
     }
+    gdbg(format!("upload {host}: uploading {} bytes", bytes.len()));
     // 3. Upload the binary over stdin.
     let mut child = match std::process::Command::new("ssh")
         .args([
@@ -2158,7 +2182,7 @@ fn upload_ghostd(host: &str) -> bool {
             "ConnectTimeout=5",
             host,
             &format!(
-                "mkdir -p \"$HOME/.cache/ghostwave\" && cat > \"$HOME/.cache/ghostwave/ghostd-{arch}\" && chmod +x \"$HOME/.cache/ghostwave/ghostd-{arch}\""
+                "sh -c 'mkdir -p \"$HOME/.cache/ghostwave\" && cat > \"$HOME/.cache/ghostwave/ghostd-{arch}.new\" && chmod +x \"$HOME/.cache/ghostwave/ghostd-{arch}.new\" && mv -f \"$HOME/.cache/ghostwave/ghostd-{arch}.new\" \"$HOME/.cache/ghostwave/ghostd-{arch}\"'"
             ),
         ])
         .stdin(std::process::Stdio::piped())
