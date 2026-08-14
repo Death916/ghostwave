@@ -26,13 +26,14 @@ pub const TAB_MENU_ITEMS: usize = 2;
 pub const TAB_BAR_H: f32 = 30.0;
 pub const STATUS_BAR_H: f32 = 26.0;
 
-/// Debug trace to stdout, gated by GHOSTWAVE_DEBUG=1 (off by default).
-/// Intended for remote-session (ds/ghostd) diagnostics while running the
-/// debug binary from a terminal: each line is one client-side step.
+/// Debug trace to stdout, ON BY DEFAULT (remote-session bring-up phase —
+/// the user runs the debug binary from a terminal and expects to see the
+/// steps); set GHOSTWAVE_DEBUG=0 to silence.
 pub fn gdbg(msg: impl AsRef<str>) {
-    if std::env::var_os("GHOSTWAVE_DEBUG").is_some() {
-        println!("[ghostwave] {}", msg.as_ref());
+    if std::env::var("GHOSTWAVE_DEBUG").map(|v| v == "0").unwrap_or(false) {
+        return;
     }
+    println!("[ghostwave] {}", msg.as_ref());
 }
 
 pub enum Pane {
@@ -498,6 +499,7 @@ impl App {
             Action::OpenFile(path) => self.open_file(path),
             Action::ConnectSsh(host) => self.connect_ssh(&host),
             Action::ConnectDurableSsh(host) => self.connect_durable_ssh(&host),
+            Action::KillRemoteSession => self.kill_active_remote_pane(),
             Action::NewAi => self.new_ai_pane(),
             Action::SessionManager => self.open_session_manager(),
             Action::SessionNew => {
@@ -1053,6 +1055,23 @@ impl App {
                 .args(["-o", "ConnectTimeout=5", &host, &cmd])
                 .status();
         });
+    }
+
+    /// Palette "Kill Remote Session": kill the remote ghostd session of the
+    /// ACTIVE pane (connected or disconnected) and close the local pane —
+    /// the only way to fully get rid of a durable remote session.
+    fn kill_active_remote_pane(&mut self) {
+        let t = self.active_tab;
+        let p = self.active_pane_id();
+        let Some((host, session)) = self.remote_spec_of(t, p) else {
+            self.toast("no remote session in active pane");
+            return;
+        };
+        self.kill_remote_pane(t, p);
+        // Close the local pane too (the remote session is gone — the pane
+        // is useless; its ssh/attach dies with the daemon anyway).
+        self.close_pane();
+        self.toast(&format!("killed remote session {session} on {host}"));
     }
 
     fn remote_spec_of(&self, tab_idx: usize, pane_idx: usize) -> Option<(String, String)> {

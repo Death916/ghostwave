@@ -226,31 +226,48 @@ fn handle_client(
         };
         let stream_ready = ready.contains(&0);
 
-        // Client -> pty (strip DCS size messages).
+        // Client -> pty (strip DCS size messages). Only `ESC P` (DCS
+        // introducer) starts a size message — ANY other ESC byte is a
+        // normal escape sequence (arrows = `ESC [ A`, etc.) and must pass
+        // through, or interactive TUI apps freeze on mangled input.
         if stream_ready {
             match fd_read(stream.as_raw_fd(), &mut read_buf) {
                 Ok(0) | Err(Errno::EAGAIN) => {}
                 Ok(n) => {
                     for &b in &read_buf[..n] {
                         if in_dcs {
-                            dcs_buf.push(b);
-                            if dcs_buf.len() > 64 {
+                            if dcs_buf.len() == 1 && b != b'P' {
+                                // ESC followed by anything but 'P': not a
+                                // DCS — emit the ESC and re-handle `b`.
+                                pty_out.push(0x1b);
                                 in_dcs = false;
                                 dcs_buf.clear();
-                            } else if b == b'\\' && dcs_buf.len() >= 2 && dcs_buf[dcs_buf.len() - 2] == 0x1b {
-                                // complete DCS: \x1bPgw-size <c> <r>\x1b\
-                                if let Some(rest) = dcs_buf.strip_prefix(b"Pgw-size ") {
-                                    let s = String::from_utf8_lossy(rest);
-                                    let s = s.trim_end_matches('\x1b').trim();
-                                    let mut it = s.split(' ');
-                                    if let (Some(c), Some(r)) = (it.next(), it.next()) {
-                                        if let (Ok(c), Ok(r)) = (c.parse::<u16>(), r.parse::<u16>()) {
-                                            set_term_size(pty_write, c, r);
+                                if b == 0x1b {
+                                    in_dcs = true;
+                                    dcs_buf.push(b);
+                                } else {
+                                    pty_out.push(b);
+                                }
+                            } else {
+                                dcs_buf.push(b);
+                                if dcs_buf.len() > 64 {
+                                    in_dcs = false;
+                                    dcs_buf.clear();
+                                } else if b == b'\\' && dcs_buf.len() >= 2 && dcs_buf[dcs_buf.len() - 2] == 0x1b {
+                                    // complete DCS: \x1bPgw-size <c> <r>\x1b\
+                                    if let Some(rest) = dcs_buf.strip_prefix(b"Pgw-size ") {
+                                        let s = String::from_utf8_lossy(rest);
+                                        let s = s.trim_end_matches('\x1b').trim();
+                                        let mut it = s.split(' ');
+                                        if let (Some(c), Some(r)) = (it.next(), it.next()) {
+                                            if let (Ok(c), Ok(r)) = (c.parse::<u16>(), r.parse::<u16>()) {
+                                                set_term_size(pty_write, c, r);
+                                            }
                                         }
                                     }
+                                    in_dcs = false;
+                                    dcs_buf.clear();
                                 }
-                                in_dcs = false;
-                                dcs_buf.clear();
                             }
                         } else if b == 0x1b {
                             in_dcs = true;
