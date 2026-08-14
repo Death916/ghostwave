@@ -45,7 +45,7 @@ impl Mode {
     pub fn hints(&self) -> &'static str {
         match self {
             Mode::Normal => "Ctrl+p pane | Ctrl+t tab | Ctrl+n resize | Ctrl+s scroll | Ctrl+h move | Ctrl+o session | Ctrl+g lock | Ctrl+q quit",
-            Mode::Pane => "n new | d down | r right | s stacked | x close | h/j/k/l focus | p cycle | f zoom | z frames | c rename | Esc exit",
+            Mode::Pane => "n new | d down | r right | s stacked | x close | h/j/k/l focus | p cycle | f float | e hide | E cycle float | z frames | c rename | Esc exit",
             Mode::Tab => "n new | x close | h/l prev/next | r rename | b break | 1-9 goto | Tab last | Esc exit",
             Mode::Resize => "h/j/k/l resize | H/J/K/L shrink | =/+ grow | - shrink | Esc exit",
             Mode::Scroll => "j/k scroll | d/u half page | s search | Ctrl+c bottom | e edit | Esc exit",
@@ -72,6 +72,9 @@ pub enum Action {
     MoveFocus(Dir),
     SwitchFocus,
     ToggleZoom,
+    ToggleFloating,
+    ToggleHideFloat,
+    CycleFloat,
     ToggleFrames,
     RenamePane,
     CycleStack,
@@ -391,11 +394,12 @@ fn pane_binds(k: Key, m: Mods) -> Option<Action> {
         _ if plain(k, m, S) => Action::NewPaneStacked,
         _ if plain(k, m, X) => Action::ClosePane,
         _ if plain(k, m, P) => Action::SwitchFocus,
-        _ if plain(k, m, F) => Action::ToggleZoom,
+        _ if plain(k, m, F) => Action::ToggleFloating,
+        _ if plain(k, m, E) => Action::ToggleHideFloat,
+        _ if shift(k, m, E) => Action::CycleFloat,
         _ if plain(k, m, Z) => Action::ToggleFrames,
         _ if plain(k, m, W) => Action::CycleStack,
         _ if plain(k, m, C) => Action::RenamePane,
-        _ if plain(k, m, E) => Action::Toast("embed/floating not implemented"),
         _ if let Some(d) = dir => Action::MoveFocus(d),
         _ => return None,
     })

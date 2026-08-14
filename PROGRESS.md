@@ -155,6 +155,36 @@ Binary name: `ghostwave`
     never-populated session can't come back).
   - Tradeoff: parked sessions keep terminal grids resident in memory (fine
     on 32GB; could cap "keep last N alive" later).
+- FLOATING PANES (zellij) — same branch:
+  - Ctrl+p f = toggle float: the focused tree pane leaves the layout and
+    floats above it (same size/position); f again embeds it back at its
+    EXACT original tree spot (layout.rs FloatOrigin records the split
+    parent/side/dir/ratio before the tree collapses — round-trips cleanly,
+    stacks included; stale origins fall back to a split next to the active
+    pane).
+  - Ctrl+h (Move) moves the float by cell steps; Ctrl+n (Resize) resizes
+    it; both clamp to the content area. Move mode is now STICKY (zellij
+    behavior) — removed Move from the one-shot modal auto-exit; Esc or
+    Ctrl+h exits. Unbound keys in modal modes are ignored, so nothing leaks
+    into the terminal while moving.
+  - Mouse: floats hit-test BEFORE tree panes (topmost, z-order = list
+    order); clicking focuses. Floats render last (on top), with "float N"
+    frames; the ACTIVE pane's frame is now 2px (inactive 1px) so focus is
+    obvious.
+  - Hidden BG PANES: pane-mode `e` hides the active float (pane-mode `E`
+    cycles floats and shows them). Hidden floats are not rendered or
+    clickable but keep RUNNING and draining — the "shunt to bg" case:
+    float a build, hide it, keep working; E brings it back.
+  - Guardrails: zoom on a float toasts; focus/cycle from a float re-enters
+    the tree; close (x) closes a float; splitting with an empty tree (only
+    pane floating) works; the usize::MAX empty-tree sentinel is invisible
+    to leaves()/layout()/path_to_pane (no render panic).
+  - Persistence: TabState.floating (serde default → old files fine) stores
+    pane id (remapped), rect in CELLS (window-size independent), origin,
+    hidden flag; restored on session load/switch.
+  - Unit-tested: 6 layout tests (float/embed round-trips: split, root
+    stack, root leaf, stack-under-split, stale-origin rejection, sentinel
+    invisibility).
 - Ctrl+Tab = next tab, Ctrl+Shift+Tab = previous tab (global binds).
 - PIN MARKER: drawn with primitives (no 📌 in the font stack → tofu).
 - FONT STACK: JetBrains Nerd variants (6 family NAMES, same design)
@@ -282,11 +312,11 @@ Key API gotchas discovered (all fixed):
    per-row dirty optimization deferred).
 7. ✅ DONE: durable sessions (pin via right-click tab, restore with
    scrollback, continuous 2s saves).
-8. NEXT — polish queue: middle-click paste; kitty graphics clipping;
-   preview pane zoom/pan; config extras (cursor style); shell-greeting
-   accumulation on restore (cosmetic).
-9. NEXT — zellij floating panes (Ctrl+p f toggle float + Move/Resize modes;
-   f currently = zoom → zoom stays on Ctrl+M only).
+9. ✅ DONE: zellij floating panes + hidden bg panes (Ctrl+p f/e/E; Move
+   mode sticky; active-pane frame 2px).
+10. NEXT — polish queue: middle-click paste; kitty graphics clipping;
+    preview pane zoom/pan; config extras (cursor style); shell-greeting
+    accumulation on restore (cosmetic).
 
 ---
 
@@ -398,8 +428,8 @@ assets/JetBrainsMono-Medium.ttf  (from libghostty-rs example/fonts)
 ## Zellij binds implemented (from default.kdl, verbatim where possible)
 
 - Ctrl+p PANE: n new(down), d down, r right, s stacked, x close,
-  h/j/k/l+arrows focus, p cycle, f zoom, z frames, w cycle-stack,
-  c rename, e/i toast
+  h/j/k/l+arrows focus, p cycle, f float, e hide float, E cycle float,
+  z frames, w cycle-stack, c rename
 - Ctrl+t TAB: n new, x close, r rename, h/l prev/next, b break-pane,
   1-9 goto, Tab last, s/[ /] toast
 - Ctrl+n RESIZE: h/j/k/l grow, H/J/K/L shrink, =/+ grow-all, - shrink-all
@@ -413,7 +443,7 @@ assets/JetBrainsMono-Medium.ttf  (from libghostty-rs example/fonts)
 
 ## Waveterm features ported
 
-tabs, split panes (right/down/stacked), zoom (Ctrl+M / f), command palette
+tabs, split panes (right/down/stacked), zoom (Ctrl+M), command palette
 (Ctrl+Shift+P; open <path>, ssh <host>, theme <name>), find in terminal
 (Ctrl+Shift+F, viewport-only), copy (Ctrl+Shift+C, sel-or-screen),
 paste (Ctrl+Shift+V), clear (Ctrl+K), file preview pane, AI chat pane
