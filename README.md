@@ -5,12 +5,18 @@ A waveterm/zellij-style terminal multiplexer built on
 for the Ghostty terminal) and [macroquad](https://macroquad.rs), with
 zellij-style keybindings.
 
-Wayland-first, mouse-friendly, and designed around durable sessions: pin a
-tab and it comes back — screen *and* scrollback — after a restart.
+Wayland-first, mouse-friendly, and designed around durable sessions: every
+session saves continuously (screen *and* scrollback), and switching
+sessions parks the outgoing one's processes — they keep running in the
+background until you switch back or delete the session.
 
 ## Features
 
 - Tabs, split panes (right/down/stacked), zoom, resize via mode keys
+- **Floating panes** (zellij): float any pane above the layout (pane-mode
+  `f`), move/resize it (Ctrl+h / Ctrl+n), or hide it as a background pane
+  (`e`) that keeps running and draining while invisible; `E` cycles floats
+  and shows hidden ones again.
 - **Durable sessions**: every pane's output is logged; the session manager
   (Ctrl+o → w) switches between named sessions, each restoring ALL of its
   tabs and panes with full scrollback on launch. Session state persists
@@ -28,16 +34,16 @@ tab and it comes back — screen *and* scrollback — after a restart.
 
 | Bind | Action |
 |------|--------|
-| `Ctrl+p` | pane mode (n new, d down, r right, s stacked, x close, h/j/k/l move) |
+| `Ctrl+p` | pane mode (n new, d down, r right, s stacked, x close, h/j/k/l focus, p cycle, f float, e hide float, E cycle float, z frames, c rename) |
 | `Ctrl+t` | tab mode (n new, d close, o next, p prev, r rename) |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | next / previous tab |
 | `Ctrl+n` | resize mode (h/j/k/l) |
 | `Ctrl+s` | scroll mode (arrow keys; Ctrl+s exit) |
-| `Ctrl+h` | move focus mode (h/j/k/l) |
+| `Ctrl+h` | move mode (h/j/k/l — sticky; Esc or Ctrl+h exits) |
 | `Ctrl+o` | session mode (w session manager, d detach) |
 | `Ctrl+g` | lock (passthrough) |
 | `Ctrl+q` | quit (saves session) |
-| `Ctrl+m` / `f` | zoom pane |
+| `Ctrl+M` | zoom pane (floats can't zoom — embed first) |
 | `Ctrl+Shift+P` | command palette |
 | `Ctrl+Shift+F` | find |
 | `Ctrl+Shift+C` / `V` | copy / paste |

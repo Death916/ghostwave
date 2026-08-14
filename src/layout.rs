@@ -120,6 +120,9 @@ impl Node {
                 b.collect_leaves(path, out);
                 path.pop();
             }
+            // The usize::MAX sentinel marks an EMPTY tree (last pane floated
+            // or closed) — it is not a real pane and never participates.
+            Node::Leaf { pane: usize::MAX } => {}
             Node::Leaf { pane } => out.push((path.clone(), *pane)),
             Node::Stack { panes, active } => out.push((path.clone(), panes[*active])),
         }
@@ -255,6 +258,177 @@ pub fn resize_at(root: &mut Node, path: &[u8], dir: Dir, delta: f32) {
     }
 }
 
+/// Where a floated pane came from, so it can be embedded back into the
+/// exact same spot of the tree.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum FloatOrigin {
+    /// The pane was the leaf on `side` (0 = a, 1 = b) of the split at
+    /// `parent` (dir/ratio recorded before the tree collapsed).
+    Split {
+        parent: Path,
+        side: u8,
+        dir: SplitDir,
+        ratio: f32,
+    },
+    /// The pane was an element of the stack at `path` (stack still exists).
+    Stack { path: Path },
+    /// The pane was the whole root (tree is now empty).
+    Root,
+}
+
+/// Walk to the node at `path`, returning None when the path is stale (goes
+/// through a leaf or a missing split) — embed fallback depends on this.
+fn walk_mut<'a>(root: &'a mut Node, path: &[u8]) -> Option<&'a mut Node> {
+    let mut node = root;
+    for &c in path {
+        match node {
+            Node::Split { a, b, .. } => node = if c == 0 { a } else { b },
+            _ => return None,
+        }
+    }
+    Some(node)
+}
+
+/// Remove the pane at `path` from the tree, returning (removed pane id,
+/// origin) so it can float and later be embedded back. Mirrors close_at's
+/// collapse, but records the pre-collapse split info.
+pub fn float_out(root: &mut Node, path: &[u8]) -> Option<(usize, FloatOrigin)> {
+    // Pop the active pane from a stack; returns (removed id, now empty).
+    fn pop_stack(stack: &mut Node) -> Option<(usize, bool)> {
+        if let Node::Stack { panes, active } = stack {
+            let removed = panes.remove(*active);
+            if *active >= panes.len() {
+                *active = panes.len().saturating_sub(1);
+            }
+            Some((removed, panes.is_empty()))
+        } else {
+            None
+        }
+    }
+
+    if path.is_empty() {
+        return match root {
+            Node::Leaf { pane } => {
+                let removed = *pane;
+                *root = Node::Leaf { pane: usize::MAX };
+                Some((removed, FloatOrigin::Root))
+            }
+            Node::Stack { .. } => match pop_stack(root) {
+                Some((removed, emptied)) => {
+                    if emptied {
+                        *root = Node::Leaf { pane: usize::MAX };
+                        Some((removed, FloatOrigin::Root))
+                    } else {
+                        Some((removed, FloatOrigin::Stack { path: Vec::new() }))
+                    }
+                }
+                None => None,
+            },
+            _ => None,
+        };
+    }
+
+    let parent_path = &path[..path.len() - 1];
+    let side = *path.last().unwrap();
+    let Node::Split { dir, ratio, a, b } = root.at_mut(parent_path) else {
+        return None;
+    };
+    let (dir, ratio) = (*dir, *ratio);
+    let target = if side == 0 { a } else { b };
+    let (removed, origin, collapse) = match &mut **target {
+        Node::Leaf { pane } => (
+            *pane,
+            FloatOrigin::Split {
+                parent: parent_path.to_vec(),
+                side,
+                dir,
+                ratio,
+            },
+            true,
+        ),
+        Node::Stack { .. } => match pop_stack(target) {
+            Some((removed, emptied)) => {
+                let origin = if emptied {
+                    FloatOrigin::Split {
+                        parent: parent_path.to_vec(),
+                        side,
+                        dir,
+                        ratio,
+                    }
+                } else {
+                    FloatOrigin::Stack { path: path.to_vec() }
+                };
+                (removed, origin, emptied)
+            }
+            None => return None,
+        },
+        _ => return None,
+    };
+
+    // The parent split now has a dead side (removed leaf or emptied stack):
+    // replace it with the survivor. A surviving stack keeps its side.
+    if collapse {
+        let parent = root.at_mut(parent_path);
+        if let Node::Split { a, b, .. } = parent {
+            let survivor = if side == 0 { b } else { a };
+            let replacement =
+                std::mem::replace(survivor, Box::new(Node::Leaf { pane: usize::MAX }));
+            *parent = *replacement;
+        }
+    }
+    Some((removed, origin))
+}
+
+/// Re-insert `pane` into the tree at its origin. Returns false when the
+/// origin is stale (the tree changed while the pane floated) — the caller
+/// should fall back to splitting next to the active pane.
+pub fn embed_at(root: &mut Node, pane: usize, origin: &FloatOrigin) -> bool {
+    match origin {
+        FloatOrigin::Root => {
+            if matches!(root, Node::Leaf { pane: usize::MAX }) {
+                *root = Node::Leaf { pane };
+                true
+            } else {
+                false
+            }
+        }
+        FloatOrigin::Split { parent, side, dir, ratio } => {
+            let Some(node) = walk_mut(root, parent) else {
+                return false;
+            };
+            if matches!(node, Node::Split { .. }) {
+                return false;
+            }
+            let survivor = std::mem::replace(node, Node::Leaf { pane: usize::MAX });
+            let (a_node, b_node) = if *side == 0 {
+                (Box::new(Node::Leaf { pane }), Box::new(survivor))
+            } else {
+                (Box::new(survivor), Box::new(Node::Leaf { pane }))
+            };
+            *node = Node::Split {
+                dir: *dir,
+                ratio: *ratio,
+                a: a_node,
+                b: b_node,
+            };
+            true
+        }
+        FloatOrigin::Stack { path } => {
+            let Some(node) = walk_mut(root, path) else {
+                return false;
+            };
+            match node {
+                Node::Stack { panes, active } => {
+                    panes.push(pane);
+                    *active = panes.len() - 1;
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
 /// Find the leaf path for a pane id.
 pub fn path_to_pane(root: &Node, pane: usize) -> Option<Path> {
     root.leaves()
@@ -357,6 +531,7 @@ pub fn layout(root: &Node, rect: Rect) -> Vec<(usize, Rect)> {
 
 fn layout_node(node: &Node, rect: Rect, out: &mut Vec<(usize, Rect)>) {
     match node {
+        Node::Leaf { pane: usize::MAX } => {} // empty-tree sentinel
         Node::Leaf { pane } => out.push((*pane, rect)),
         Node::Stack { panes, active } => out.push((panes[*active], rect)),
         Node::Split { dir, ratio, a, b } => {
@@ -406,4 +581,122 @@ pub fn cycle_stack(root: &mut Node, path: &[u8]) -> bool {
 /// Is the node at `path` a stack?
 pub fn is_stack(root: &Node, path: &[u8]) -> bool {
     matches!(root.at(path), Node::Stack { .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leaf(pane: usize) -> Node {
+        Node::Leaf { pane }
+    }
+
+    #[test]
+    fn float_embed_split_roundtrip() {
+        // Split{ a: Leaf(1), b: Leaf(2) } — float pane 2 (side b).
+        let mut root = Node::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            a: Box::new(leaf(1)),
+            b: Box::new(leaf(2)),
+        };
+        let (removed, origin) = float_out(&mut root, &[1]).expect("float out");
+        assert_eq!(removed, 2);
+        // Tree collapsed to the survivor leaf.
+        assert!(matches!(&root, Node::Leaf { pane: 1 }));
+        assert!(embed_at(&mut root, 2, &origin));
+        // Original tree restored (a=1, b=2).
+        match root {
+            Node::Split { dir, ratio, a, b } => {
+                assert_eq!(dir, SplitDir::Horizontal);
+                assert_eq!(ratio, 0.5);
+                assert_eq!(a.pane_id(), 1);
+                assert_eq!(b.pane_id(), 2);
+            }
+            _ => panic!("expected split"),
+        }
+    }
+
+    #[test]
+    fn float_embed_stack_roundtrip() {
+        // Root stack [1, 2], active = 2 — float the active pane.
+        let mut root = Node::Stack { panes: vec![1, 2], active: 1 };
+        let (removed, origin) = float_out(&mut root, &[]).expect("float out");
+        assert_eq!(removed, 2);
+        assert!(matches!(&root, Node::Stack { panes, .. } if panes == &vec![1]));
+        assert!(embed_at(&mut root, 2, &origin));
+        match root {
+            Node::Stack { panes, active } => {
+                assert_eq!(panes, vec![1, 2]);
+                assert_eq!(active, 1); // re-added as the active pane
+            }
+            _ => panic!("expected stack"),
+        }
+    }
+
+    #[test]
+    fn float_embed_root_leaf() {
+        let mut root = leaf(7);
+        let (removed, origin) = float_out(&mut root, &[]).unwrap();
+        assert_eq!(removed, 7);
+        assert!(matches!(&root, Node::Leaf { pane: usize::MAX }));
+        assert!(embed_at(&mut root, 7, &origin));
+        assert!(matches!(&root, Node::Leaf { pane: 7 }));
+    }
+
+    #[test]
+    fn float_from_stack_under_split() {
+        // Split{ a: Leaf(1), b: Stack[2, 3] } — float 3 (active).
+        let mut root = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.4,
+            a: Box::new(leaf(1)),
+            b: Box::new(Node::Stack { panes: vec![2, 3], active: 1 }),
+        };
+        let (removed, origin) = float_out(&mut root, &[1]).expect("float out");
+        assert_eq!(removed, 3);
+        // Stack survives with [2].
+        assert!(matches!(&root, Node::Split { b, .. } if matches!(&**b, Node::Stack { panes, .. } if panes == &vec![2])));
+        assert!(embed_at(&mut root, 3, &origin));
+        match root {
+            Node::Split { b, .. } => match *b {
+                Node::Stack { panes, .. } => assert_eq!(panes, vec![2, 3]),
+                _ => panic!("expected stack"),
+            },
+            _ => panic!("expected split"),
+        }
+    }
+
+    #[test]
+    fn embed_stale_origin_is_rejected() {
+        // Tree changed while floating: the origin's parent path is gone.
+        let mut root = leaf(9);
+        let origin = FloatOrigin::Split {
+            parent: vec![0],
+            side: 1,
+            dir: SplitDir::Vertical,
+            ratio: 0.3,
+        };
+        assert!(!embed_at(&mut root, 2, &origin));
+        // Sentinel root embeds via Root origin only.
+        let mut root2 = Node::Leaf { pane: usize::MAX };
+        assert!(embed_at(&mut root2, 5, &FloatOrigin::Root));
+        assert!(matches!(root2, Node::Leaf { pane: 5 }));
+        // Root origin rejected when the tree grew back.
+        let mut root3 = Node::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            a: Box::new(leaf(1)),
+            b: Box::new(leaf(2)),
+        };
+        assert!(!embed_at(&mut root3, 5, &FloatOrigin::Root));
+    }
+
+    #[test]
+    fn sentinel_leaves_are_invisible() {
+        let root = Node::Leaf { pane: usize::MAX };
+        assert!(root.leaves().is_empty());
+        assert!(layout(&root, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }).is_empty());
+        assert!(path_to_pane(&root, usize::MAX).is_none());
+    }
 }

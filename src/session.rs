@@ -32,6 +32,25 @@ pub struct TabState {
     /// Layout tree (pane ids reference `panes`). Absent in old files →
     /// single-pane layout on restore.
     pub root: Option<crate::layout::Node>,
+    /// Floating panes (zellij style). Absent in old files → none.
+    #[serde(default)]
+    pub floating: Vec<FloatingPaneState>,
+}
+
+/// A floating pane's persisted state: pane id (remapped at save), overlay
+/// position/size in CELLS (grid-independent), its tree origin, and whether
+/// it is hidden (bg pane).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct FloatingPaneState {
+    pub pane: usize,
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+    #[serde(default)]
+    pub origin: Option<crate::layout::FloatOrigin>,
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -280,6 +299,7 @@ mod tests {
                     log: "pane-test.log".into(),
                 }],
                 root: Some(crate::layout::Node::Leaf { pane: 0 }),
+                floating: vec![],
             }],
         };
         save("test-sess", &state);

@@ -130,6 +130,85 @@ Binary name: `ghostwave`
   - Wrap/reflow semantics pinned in tests/term_core.rs — both work in
     libghostty-vt 0.2.1; the "cut off" report was a TUI clipping its own
     panels, not a terminal bug.
+- LIVE SESSIONS (zellij-style background sessions) — `feat/live-sessions`:
+  - Switching sessions no longer kills the outgoing session's processes.
+    App.parked (Vec<LiveSession>{name, tabs, active_tab}) parks the outgoing
+    session's LIVE panes instead of dropping them (drop → Pty::Child::Drop →
+    SIGHUP was the old kill); switching back swaps the live tabs in —
+    instant, no shell respawn, no log replay, process state intact.
+  - Drain loop extracted (drain_tab_panes) and run over active AND parked
+    sessions every frame: background children never stall on full pty
+    buffers, and their durable logs keep growing while hidden (poll_pty tees
+    to the log regardless of render state).
+  - Remote reconnect pass extracted (remote_reconnect_pass) and run over
+    parked sessions too — a ghostd session keeps auto-reconnecting while you
+    work elsewhere; respawn_waiting/set_remote_manual cover parked panes.
+  - Quit persists ALL live sessions (save_all_sessions) — parked metadata
+    can't be lost (logs were already fresh from background draining).
+  - Manager `d` delete also drops a parked session (kills its processes —
+    the point of deleting). Delete-CURRENT-session drops instead of parking
+    so a deleted session can't resurrect via the continuous save.
+  - Rename now targets the SELECTED session (pre-existing bug: it renamed
+    the current session no matter what you picked) and renames the parked
+    in-memory entry too.
+  - Empty sessions are not parked (skips the disk write — a deleted or
+    never-populated session can't come back).
+  - Tradeoff: parked sessions keep terminal grids resident in memory (fine
+    on 32GB; could cap "keep last N alive" later).
+- FLOATING PANES (zellij) — same branch:
+  - Ctrl+p f = toggle float: the focused tree pane leaves the layout and
+    floats above it (same size/position); f again embeds it back at its
+    EXACT original tree spot (layout.rs FloatOrigin records the split
+    parent/side/dir/ratio before the tree collapses — round-trips cleanly,
+    stacks included; stale origins fall back to a split next to the active
+    pane).
+  - Ctrl+h (Move) moves the float by cell steps; Ctrl+n (Resize) resizes
+    it; both clamp to the content area. Move mode is now STICKY (zellij
+    behavior) — removed Move from the one-shot modal auto-exit; Esc or
+    Ctrl+h exits. Unbound keys in modal modes are ignored, so nothing leaks
+    into the terminal while moving.
+  - Mouse: floats hit-test BEFORE tree panes (topmost, z-order = list
+    order); clicking focuses. Floats render last (on top), with "float N"
+    frames; the ACTIVE pane's frame is now 2px (inactive 1px) so focus is
+    obvious.
+  - Hidden BG PANES: pane-mode `e` hides the active float (pane-mode `E`
+    cycles floats and shows them). Hidden floats are not rendered or
+    clickable but keep RUNNING and draining — the "shunt to bg" case:
+    float a build, hide it, keep working; E brings it back.
+  - Guardrails: zoom on a float toasts; focus/cycle from a float re-enters
+    the tree; close (x) closes a float; splitting with an empty tree (only
+    pane floating) works; the usize::MAX empty-tree sentinel is invisible
+    to leaves()/layout()/path_to_pane (no render panic).
+  - Persistence: TabState.floating (serde default → old files fine) stores
+    pane id (remapped), rect in CELLS (window-size independent), origin,
+    hidden flag; restored on session load/switch.
+  - Unit-tested: 6 layout tests (float/embed round-trips: split, root
+    stack, root leaf, stack-under-split, stale-origin rejection, sentinel
+    invisibility).
+- FISH 4 STARTUP ESCAPE GARBAGE FIX (`^[[?0u^[P>|ghostwave^[\…`):
+  - Symptom: at app start / new panes, caret-escaped terminal responses
+    (kitty `CSI ? 0 u`, `DCS >|ghostwave ST`, OSC 11 `rgb:…`, DA
+    `CSI ? 62;1;6;22c`) printed after the prompt. Decoded: they are the
+    terminal's ANSWERS to fish 4.x startup probes — kitty keyboard query
+    `CSI ? u`, XTVERSION `CSI > q`, DA `CSI c`, OSC 11 bg query (fish's
+    binary has query_kitty_progressive_enhancements).
+  - Root cause: the restore path spawned the shell BEFORE replaying the
+    session log — the probes sat in the pty buffer during the replay and
+    were answered AFTER fish's read timeout; fish's line editor then
+    echoed the stale responses as caret-escaped garbage. Running `fish`
+    later was clean because the frame loop drains promptly.
+  - Fix: (1) tabs_from_session now creates the terminal WITHOUT spawning,
+    replays history, THEN starts the shell; (2) new prime_pty() drains the
+    child's initial burst synchronously right after spawn (250ms cap, 60ms
+    idle break) so probes are answered inside fish's read window; spawn
+    refactored into start_child (unprimed — reconnect must not block the
+    main loop) + spawn_child (primed, used by restore); respawn() reuses
+    start_child and now also works for program=None ($SHELL) panes.
+  - Verified: isolation test proves the terminal core answers all four
+    probes with the correct query forms (OSC 11 only after a color was
+    set — ghostty behavior, confirmed in stream_terminal.zig); prime test
+    proves early child output is processed during construction.
+    User-verified: garbage gone at app start.
 - Ctrl+Tab = next tab, Ctrl+Shift+Tab = previous tab (global binds).
 - PIN MARKER: drawn with primitives (no 📌 in the font stack → tofu).
 - FONT STACK: JetBrains Nerd variants (6 family NAMES, same design)
@@ -257,9 +336,11 @@ Key API gotchas discovered (all fixed):
    per-row dirty optimization deferred).
 7. ✅ DONE: durable sessions (pin via right-click tab, restore with
    scrollback, continuous 2s saves).
-8. NEXT — polish queue: middle-click paste; kitty graphics clipping;
-   preview pane zoom/pan; config extras (cursor style); shell-greeting
-   accumulation on restore (cosmetic).
+9. ✅ DONE: zellij floating panes + hidden bg panes (Ctrl+p f/e/E; Move
+   mode sticky; active-pane frame 2px).
+10. NEXT — polish queue: middle-click paste; kitty graphics clipping;
+    preview pane zoom/pan; config extras (cursor style); shell-greeting
+    accumulation on restore (cosmetic).
 
 ---
 
@@ -371,8 +452,8 @@ assets/JetBrainsMono-Medium.ttf  (from libghostty-rs example/fonts)
 ## Zellij binds implemented (from default.kdl, verbatim where possible)
 
 - Ctrl+p PANE: n new(down), d down, r right, s stacked, x close,
-  h/j/k/l+arrows focus, p cycle, f zoom, z frames, w cycle-stack,
-  c rename, e/i toast
+  h/j/k/l+arrows focus, p cycle, f float, e hide float, E cycle float,
+  z frames, w cycle-stack, c rename
 - Ctrl+t TAB: n new, x close, r rename, h/l prev/next, b break-pane,
   1-9 goto, Tab last, s/[ /] toast
 - Ctrl+n RESIZE: h/j/k/l grow, H/J/K/L shrink, =/+ grow-all, - shrink-all
@@ -386,7 +467,7 @@ assets/JetBrainsMono-Medium.ttf  (from libghostty-rs example/fonts)
 
 ## Waveterm features ported
 
-tabs, split panes (right/down/stacked), zoom (Ctrl+M / f), command palette
+tabs, split panes (right/down/stacked), zoom (Ctrl+M), command palette
 (Ctrl+Shift+P; open <path>, ssh <host>, theme <name>), find in terminal
 (Ctrl+Shift+F, viewport-only), copy (Ctrl+Shift+C, sel-or-screen),
 paste (Ctrl+Shift+V), clear (Ctrl+K), file preview pane, AI chat pane
