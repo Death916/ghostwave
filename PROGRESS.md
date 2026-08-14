@@ -130,6 +130,31 @@ Binary name: `ghostwave`
   - Wrap/reflow semantics pinned in tests/term_core.rs — both work in
     libghostty-vt 0.2.1; the "cut off" report was a TUI clipping its own
     panels, not a terminal bug.
+- LIVE SESSIONS (zellij-style background sessions) — `feat/live-sessions`:
+  - Switching sessions no longer kills the outgoing session's processes.
+    App.parked (Vec<LiveSession>{name, tabs, active_tab}) parks the outgoing
+    session's LIVE panes instead of dropping them (drop → Pty::Child::Drop →
+    SIGHUP was the old kill); switching back swaps the live tabs in —
+    instant, no shell respawn, no log replay, process state intact.
+  - Drain loop extracted (drain_tab_panes) and run over active AND parked
+    sessions every frame: background children never stall on full pty
+    buffers, and their durable logs keep growing while hidden (poll_pty tees
+    to the log regardless of render state).
+  - Remote reconnect pass extracted (remote_reconnect_pass) and run over
+    parked sessions too — a ghostd session keeps auto-reconnecting while you
+    work elsewhere; respawn_waiting/set_remote_manual cover parked panes.
+  - Quit persists ALL live sessions (save_all_sessions) — parked metadata
+    can't be lost (logs were already fresh from background draining).
+  - Manager `d` delete also drops a parked session (kills its processes —
+    the point of deleting). Delete-CURRENT-session drops instead of parking
+    so a deleted session can't resurrect via the continuous save.
+  - Rename now targets the SELECTED session (pre-existing bug: it renamed
+    the current session no matter what you picked) and renames the parked
+    in-memory entry too.
+  - Empty sessions are not parked (skips the disk write — a deleted or
+    never-populated session can't come back).
+  - Tradeoff: parked sessions keep terminal grids resident in memory (fine
+    on 32GB; could cap "keep last N alive" later).
 - Ctrl+Tab = next tab, Ctrl+Shift+Tab = previous tab (global binds).
 - PIN MARKER: drawn with primitives (no 📌 in the font stack → tofu).
 - FONT STACK: JetBrains Nerd variants (6 family NAMES, same design)
@@ -260,6 +285,8 @@ Key API gotchas discovered (all fixed):
 8. NEXT — polish queue: middle-click paste; kitty graphics clipping;
    preview pane zoom/pan; config extras (cursor style); shell-greeting
    accumulation on restore (cosmetic).
+9. NEXT — zellij floating panes (Ctrl+p f toggle float + Move/Resize modes;
+   f currently = zoom → zoom stays on Ctrl+M only).
 
 ---
 

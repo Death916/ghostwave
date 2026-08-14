@@ -482,7 +482,9 @@ async fn main() -> Result<()> {
         render(&mut app);
 
         if app.quit {
-            app.save_session();
+            // Persist the active session AND every parked (background) one —
+            // a parked session's metadata must not be lost on quit.
+            app.save_all_sessions();
             std::process::exit(0);
         }
 

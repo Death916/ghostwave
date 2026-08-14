@@ -103,6 +103,15 @@ impl Tab {
     }
 }
 
+/// A session whose panes are still alive in this process but not visible:
+/// parked when the user switches sessions, so pty children keep running and
+/// their logs keep growing. Drained every frame in App::update().
+pub struct LiveSession {
+    pub name: String,
+    pub tabs: Vec<Tab>,
+    pub active_tab: usize,
+}
+
 pub struct App {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
@@ -114,11 +123,20 @@ pub struct App {
     pub toast: Option<(String, Instant)>,
     pub last_tab: Option<usize>,
     pub rename_buf: String,
+    /// Session being renamed (current or a parked one) — the manager's `r`
+    /// can target a non-current session, so ConfirmRename must not assume
+    /// the current session.
+    pub rename_target: String,
     pub search_mode_active: bool,
     /// Right-click tab context menu: (tab index, menu origin x, y).
     pub tab_menu: Option<(usize, f32, f32)>,
     /// Name of the session this app instance runs inside.
     pub current_session: String,
+    /// Sessions whose panes are STILL ALIVE in this process but not visible
+    /// (switched away from). Their pty children keep running and are drained
+    /// every frame in update(), so logs stay fresh and switching back swaps
+    /// the live tabs in — no shell respawn, no log replay.
+    pub parked: Vec<LiveSession>,
     /// Session manager overlay: (session names, selected index).
     pub session_list: Option<(Vec<String>, usize)>,
     pub cell: CellDims,
@@ -218,6 +236,7 @@ impl App {
             toast: None,
             last_tab: None,
             rename_buf: String::new(),
+            rename_target: String::new(),
             search_mode_active: false,
             cell,
             font_px,
@@ -231,6 +250,7 @@ impl App {
             session_list: None,
             last_session_save: std::time::Instant::now(),
             pty_activity: false,
+            parked: Vec::new(),
             remote_uploads,
             remote_upload_tx,
             binary_ready: Default::default(),
@@ -509,6 +529,7 @@ impl App {
             Action::SessionRename => {
                 self.mode = Mode::RenameSession;
                 self.rename_buf = self.current_session.clone();
+                self.rename_target = self.current_session.clone();
                 self.repaint_all(); // input box is drawn over content
             }
             Action::SessionDelete => {
@@ -517,7 +538,11 @@ impl App {
                 } else {
                     let name = self.current_session.clone();
                     crate::session::delete(&name);
-                    self.current_session = "default".into();
+                    // Drop the session's panes (kills their processes) rather
+                    // than parking them: its file is gone, and the continuous
+                    // save would otherwise resurrect it on quit.
+                    self.tabs = Vec::new();
+                    self.active_tab = 0;
                     self.load_session("default");
                     self.toast(&format!("deleted session: {name}"));
                 }
@@ -574,12 +599,22 @@ impl App {
                     }
                     Mode::RenameSession => {
                         self.mode = Mode::Normal;
-                        if !name.is_empty() && name != self.current_session {
-                            let old = self.current_session.clone();
-                            crate::session::rename(&old, &name);
-                            self.current_session = name.clone();
-                            crate::session::set_last_session(&name);
-                            self.toast(&format!("session renamed: {name}"));
+                        if !name.is_empty() {
+                            let old = std::mem::take(&mut self.rename_target);
+                            if old == self.current_session {
+                                crate::session::rename(&old, &name);
+                                self.current_session = name.clone();
+                                crate::session::set_last_session(&name);
+                                self.toast(&format!("session renamed: {name}"));
+                            } else if !old.is_empty() {
+                                crate::session::rename(&old, &name);
+                                // The renamed session may be parked (alive):
+                                // update its in-memory entry too.
+                                if let Some(live) = self.parked.iter_mut().find(|s| s.name == old) {
+                                    live.name = name.clone();
+                                }
+                                self.toast(&format!("session renamed: {name}"));
+                            }
                         }
                     }
                     _ => self.mode = Mode::Normal,
@@ -917,9 +952,9 @@ impl App {
             if crate::session::list_sessions().contains(&sess) {
                 self.load_session(&sess);
             } else {
-                self.save_session();
-                self.tabs = Vec::new();
-                self.active_tab = 0;
+                // Park the outgoing session (its panes keep running) and
+                // start the ssh session fresh.
+                self.park_current();
                 self.current_session = sess.clone();
                 crate::session::set_last_session(&sess);
             }
@@ -1085,9 +1120,16 @@ impl App {
     }
 
     /// Respawn every pane waiting to reconnect to `host` (binary just
-    /// became ready).
+    /// became ready) — including parked sessions' panes.
     fn respawn_waiting(&mut self, host: &str) {
-        for tab in self.tabs.iter_mut() {
+        Self::respawn_waiting_tabs(&mut self.tabs, host);
+        for live in self.parked.iter_mut() {
+            Self::respawn_waiting_tabs(&mut live.tabs, host);
+        }
+    }
+
+    fn respawn_waiting_tabs(tabs: &mut [Tab], host: &str) {
+        for tab in tabs.iter_mut() {
             for pane in tab.panes.iter_mut() {
                 if let Pane::Term(t) = pane {
                     let is_host = t.remote.as_ref().is_some_and(|r| r.host == host);
@@ -1142,9 +1184,25 @@ impl App {
 
     /// Persist the durable session state (JSON + pane logs). Called on quit.
     pub fn save_session(&self) {
-        let state = crate::session::SessionState {
-            tabs: self
-                .tabs
+        crate::session::save(&self.current_session, &Self::session_state_for(&self.tabs));
+        crate::session::set_last_session(&self.current_session);
+    }
+
+    /// Persist every live session (active + parked) — used on quit so a
+    /// background session's metadata isn't lost (its pane logs are already
+    /// fresh; they grow at drain time even while parked).
+    pub fn save_all_sessions(&self) {
+        self.save_session();
+        for live in &self.parked {
+            crate::session::save(&live.name, &Self::session_state_for(&live.tabs));
+        }
+    }
+
+    /// Build the on-disk session state for a set of tabs (terminal panes
+    /// only; preview/AI panes are not restored).
+    fn session_state_for(tabs: &[Tab]) -> crate::session::SessionState {
+        crate::session::SessionState {
+            tabs: tabs
                 .iter()
                 .map(|tab| {
                     // Terminal panes only (preview/AI panes are not restored);
@@ -1181,18 +1239,57 @@ impl App {
                     }
                 })
                 .collect(),
-        };
-        crate::session::save(&self.current_session, &state);
-        crate::session::set_last_session(&self.current_session);
+        }
     }
 
-    /// Set every remote pane on `host` to Manual (upload failed).
+    /// Save + park the current session: its panes keep RUNNING in the
+    /// background (drained every frame in update()) while another session
+    /// is shown. The active tab set is cleared; callers must populate it.
+    /// An empty session is not parked (nothing to keep alive) and is not
+    /// written to disk — a deleted or never-populated session must not be
+    /// resurrected by a switch.
+    fn park_current(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        self.save_session();
+        self.parked.push(LiveSession {
+            name: self.current_session.clone(),
+            tabs: std::mem::take(&mut self.tabs),
+            active_tab: self.active_tab,
+        });
+        self.active_tab = 0;
+    }
+
+    /// Common tail of load_session/new_session: adopt `name` as the current
+    /// session, persist the marker, and refresh colors/layout.
+    fn finish_session_switch(&mut self, name: &str) {
+        self.current_session = name.to_string();
+        crate::session::set_last_session(name);
+        self.apply_terminal_colors();
+        self.layout_all();
+        self.toast(&format!("session: {name}"));
+    }
+
+    /// Set every remote pane on `host` to Manual (upload failed) — active
+    /// and parked sessions alike.
     fn set_remote_manual(&mut self, host: &str) {
         for tab in self.tabs.iter_mut() {
             for pane in tab.panes.iter_mut() {
                 if let Pane::Term(t) = pane {
                     if t.remote.as_ref().is_some_and(|r| r.host == host) {
                         t.reconnect = crate::term::ReconnectState::Manual;
+                    }
+                }
+            }
+        }
+        for live in self.parked.iter_mut() {
+            for tab in live.tabs.iter_mut() {
+                for pane in tab.panes.iter_mut() {
+                    if let Pane::Term(t) = pane {
+                        if t.remote.as_ref().is_some_and(|r| r.host == host) {
+                            t.reconnect = crate::term::ReconnectState::Manual;
+                        }
                     }
                 }
             }
@@ -1289,7 +1386,20 @@ impl App {
             self.toast(&format!("already in session: {name}"));
             return;
         }
-        self.save_session(); // persist the outgoing session
+        // If the target session is STILL ALIVE in this process (parked when
+        // we switched away), swap the live tab sets — no shell respawn, no
+        // log replay; its processes kept running the whole time.
+        if let Some(idx) = self.parked.iter().position(|s| s.name == name) {
+            let mut live = self.parked.remove(idx);
+            self.park_current();
+            self.tabs = std::mem::take(&mut live.tabs);
+            self.active_tab = live.active_tab;
+            self.finish_session_switch(name);
+            return;
+        }
+        // Not alive this run → restore from disk (fresh shells + log replay).
+        // Build the incoming session FIRST so a failure leaves the current
+        // session untouched (it is only parked once the new one is ready).
         let cols: u16 = 100;
         let rows: u16 = 30;
         let tabs = match crate::session::load(name) {
@@ -1318,21 +1428,17 @@ impl App {
                 }
             }
         }
+        self.park_current();
         self.tabs = tabs;
         self.active_tab = 0;
-        self.current_session = name.to_string();
-        crate::session::set_last_session(name);
-        self.apply_terminal_colors();
-        self.layout_all();
-        self.toast(&format!("session: {name}"));
+        self.finish_session_switch(name);
     }
 
     /// Start a fresh (empty) session under `name`.
     pub fn new_session(&mut self, name: &str) {
-        self.save_session();
         let cols: u16 = 100;
         let rows: u16 = 30;
-        match TermPane::new(
+        let pane = match TermPane::new(
             cols,
             rows,
             self.cell,
@@ -1344,17 +1450,16 @@ impl App {
             true,
             None,
         ) {
-            Ok(p) => {
-                self.tabs = vec![Tab::new(Pane::Term(p), "Tab 1".into())];
-                self.active_tab = 0;
-                self.current_session = name.to_string();
-                crate::session::set_last_session(name);
-                self.apply_terminal_colors();
-                self.layout_all();
-                self.toast(&format!("new session: {name}"));
+            Ok(p) => p,
+            Err(e) => {
+                self.toast(&format!("failed to start session: {e}"));
+                return;
             }
-            Err(e) => self.toast(&format!("failed to start session: {e}")),
-        }
+        };
+        self.park_current();
+        self.tabs = vec![Tab::new(Pane::Term(pane), "Tab 1".into())];
+        self.active_tab = 0;
+        self.finish_session_switch(name);
     }
 
     /// Next free auto-generated session name (session-1, session-2, …).
@@ -1562,7 +1667,8 @@ impl App {
                         .take()
                         .and_then(|(e, sel)| e.get(sel).cloned());
                     self.mode = Mode::RenameSession;
-                    self.rename_buf = name.unwrap_or_default();
+                    self.rename_buf = name.clone().unwrap_or_default();
+                    self.rename_target = name.unwrap_or_default();
                 }
                 Key::D => {
                     let name = self
@@ -1572,6 +1678,12 @@ impl App {
                     if let Some(name) = name {
                         if name != self.current_session {
                             crate::session::delete(&name);
+                            // If the session is parked (still alive), drop it
+                            // too — its processes die, which is the point of
+                            // deleting a session.
+                            if let Some(idx) = self.parked.iter().position(|s| s.name == name) {
+                                self.parked.remove(idx);
+                            }
                             let entries = crate::session::list_sessions();
                             if let Some((e, sel)) = self.session_list.as_mut() {
                                 *e = entries;
@@ -1973,28 +2085,13 @@ impl App {
             }
         }
 
-        // Drain pty output for every pane in every tab.
-        for tab in self.tabs.iter_mut() {
-            let mut i = 0;
-            while i < tab.panes.len() {
-                match &mut tab.panes[i] {
-                    Pane::Term(t) => {
-                        if t.poll_pty() {
-                            self.pty_activity = true;
-                        }
-                    }
-                    Pane::Ai(a) => a.poll(),
-                    Pane::Preview(_) => {}
-                    Pane::Closed => {}
-                }
-                i += 1;
-            }
-            // Flush response buffers.
-            for pane in tab.panes.iter_mut() {
-                if let Pane::Term(t) = pane {
-                    t.flush_response();
-                }
-            }
+        // Drain pty output for every pane in every tab — active session AND
+        // parked sessions. Parked panes must keep draining or their pty
+        // buffers fill and the child processes stall; their logs also grow
+        // here, so the on-disk session stays current while hidden.
+        self.pty_activity |= drain_tab_panes(&mut self.tabs);
+        for live in self.parked.iter_mut() {
+            self.pty_activity |= drain_tab_panes(&mut live.tabs);
         }
 
         // ---- durable remote sessions ----
@@ -2014,58 +2111,16 @@ impl App {
         }
 
         // Reconnect loop: a dead remote pane enters auto-reconnect (bounded),
-        // then drops to manual. Panes whose binary isn't uploaded yet wait
-        // for the upload signal instead of burning attempts.
+        // then drops to manual. Runs over the active session AND parked
+        // sessions — a durable remote session keeps reconnecting while you
+        // work elsewhere. Panes whose binary isn't uploaded yet wait for the
+        // upload signal instead of burning attempts.
         let now = std::time::Instant::now();
-        let mut to_respawn: Vec<(usize, usize)> = Vec::new();
-        let mut to_manual: Vec<(usize, usize)> = Vec::new();
-        for (ti, tab) in self.tabs.iter_mut().enumerate() {
-            for (pi, pane) in tab.panes.iter_mut().enumerate() {
-                let Pane::Term(t) = pane else { continue };
-                if t.remote.is_none() {
-                    continue;
-                }
-                if t.exited.is_some() && t.reconnect == crate::term::ReconnectState::Idle {
-                    let code = t.last_exit_code.unwrap_or(255);
-                    let auto = self.config.remote.auto_reconnect && code != 0;
-                    if auto && t.reconnect_failures < self.config.remote.reconnect_attempts {
-                        t.reconnect_failures += 1;
-                        let delay = self.config.remote.reconnect_delay_secs.max(1);
-                        t.reconnect = crate::term::ReconnectState::Waiting {
-                            attempt: t.reconnect_failures,
-                            next: now + std::time::Duration::from_secs(delay),
-                        };
-                    } else {
-                        t.reconnect = crate::term::ReconnectState::Manual;
-                    }
-                }
-                if let crate::term::ReconnectState::Waiting { attempt, next } = t.reconnect {
-                    if now >= next {
-                        let host = t.remote.as_ref().map(|r| r.host.clone());
-                        if let Some(h) = host {
-                            if self.binary_ready.contains(&h) {
-                                to_respawn.push((ti, pi));
-                            } else {
-                                t.reconnect = crate::term::ReconnectState::Waiting {
-                                    attempt,
-                                    next: now + std::time::Duration::from_millis(500),
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for (ti, pi) in to_respawn {
-            if let Pane::Term(t) = &mut self.tabs[ti].panes[pi] {
-                if !t.respawn() {
-                    t.reconnect = crate::term::ReconnectState::Manual;
-                }
-            }
-        }
-        for (ti, pi) in to_manual {
-            if let Pane::Term(t) = &mut self.tabs[ti].panes[pi] {
-                t.reconnect = crate::term::ReconnectState::Manual;
+        {
+            let App { tabs, parked, config, binary_ready, .. } = self;
+            remote_reconnect_pass(config, binary_ready, tabs, now);
+            for live in parked.iter_mut() {
+                remote_reconnect_pass(config, binary_ready, &mut live.tabs, now);
             }
         }
 
@@ -2077,6 +2132,99 @@ impl App {
             if !title.is_empty() && (tab.name.is_empty() || tab.name.starts_with("Tab ")) {
                 tab.name = title;
             }
+        }
+    }
+}
+
+/// Drain pty output for every pane in every tab; returns true if any pty
+/// produced data (drives the event-paced frame loop). Also flushes each
+/// pane's response buffer. Runs for the active session AND parked sessions
+/// every frame, so background children never stall on full pty buffers and
+/// their durable logs keep growing.
+fn drain_tab_panes(tabs: &mut [Tab]) -> bool {
+    let mut activity = false;
+    for tab in tabs.iter_mut() {
+        let mut i = 0;
+        while i < tab.panes.len() {
+            match &mut tab.panes[i] {
+                Pane::Term(t) => {
+                    if t.poll_pty() {
+                        activity = true;
+                    }
+                }
+                Pane::Ai(a) => a.poll(),
+                Pane::Preview(_) => {}
+                Pane::Closed => {}
+            }
+            i += 1;
+        }
+        // Flush response buffers.
+        for pane in tab.panes.iter_mut() {
+            if let Pane::Term(t) = pane {
+                t.flush_response();
+            }
+        }
+    }
+    activity
+}
+
+/// One reconnect pass over a session's tabs: advance dead remote panes
+/// through the bounded auto-reconnect state machine and respawn due ones.
+fn remote_reconnect_pass(
+    config: &Config,
+    binary_ready: &std::collections::HashSet<String>,
+    tabs: &mut [Tab],
+    now: std::time::Instant,
+) {
+    let mut to_respawn: Vec<(usize, usize)> = Vec::new();
+    let to_manual: Vec<(usize, usize)> = Vec::new();
+    for (ti, tab) in tabs.iter_mut().enumerate() {
+        for (pi, pane) in tab.panes.iter_mut().enumerate() {
+            let Pane::Term(t) = pane else { continue };
+            if t.remote.is_none() {
+                continue;
+            }
+            if t.exited.is_some() && t.reconnect == crate::term::ReconnectState::Idle {
+                let code = t.last_exit_code.unwrap_or(255);
+                let auto = config.remote.auto_reconnect && code != 0;
+                if auto && t.reconnect_failures < config.remote.reconnect_attempts {
+                    t.reconnect_failures += 1;
+                    let delay = config.remote.reconnect_delay_secs.max(1);
+                    t.reconnect = crate::term::ReconnectState::Waiting {
+                        attempt: t.reconnect_failures,
+                        next: now + std::time::Duration::from_secs(delay),
+                    };
+                } else {
+                    t.reconnect = crate::term::ReconnectState::Manual;
+                }
+            }
+            if let crate::term::ReconnectState::Waiting { attempt, next } = t.reconnect {
+                if now >= next {
+                    let host = t.remote.as_ref().map(|r| r.host.clone());
+                    if let Some(h) = host {
+                        if binary_ready.contains(&h) {
+                            to_respawn.push((ti, pi));
+                        } else {
+                            t.reconnect = crate::term::ReconnectState::Waiting {
+                                attempt,
+                                next: now + std::time::Duration::from_millis(500),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (ti, pi) in to_respawn {
+        if let Pane::Term(t) = &mut tabs[ti].panes[pi] {
+            if !t.respawn() {
+                t.reconnect = crate::term::ReconnectState::Manual;
+            }
+        }
+    }
+    for (ti, pi) in to_manual {
+        if let Pane::Term(t) = &mut tabs[ti].panes[pi] {
+            t.reconnect = crate::term::ReconnectState::Manual;
         }
     }
 }
