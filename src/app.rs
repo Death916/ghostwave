@@ -1625,11 +1625,13 @@ impl App {
             let mut panes: Vec<Pane> = Vec::new();
             for ps in &ts.panes {
                 let args: Vec<&str> = ps.args.iter().map(String::as_str).collect();
-                // Remote panes restore DISCONNECTED: history shows, but the
-                // ssh only connects when the user presses Enter (or an
-                // in-session reconnect loop fires — never on restore).
-                let spawn = ps.remote.is_none();
-                let Ok(pane) = TermPane::new(
+                // Create the terminal WITHOUT spawning, replay history first,
+                // THEN start the shell. If the shell started before the
+                // replay, its startup terminal probes (fish 4: kitty/DA/
+                // XTVERSION/OSC 11) would sit in the pty buffer during the
+                // replay and get answered after the shell's read timeout —
+                // the responses then get echoed as caret-escaped garbage.
+                let Ok(mut pane) = TermPane::new(
                     cols,
                     rows,
                     cell,
@@ -1638,24 +1640,29 @@ impl App {
                     ps.cwd.as_deref(),
                     config.scrollback,
                     config.max_log_mb * 1024 * 1024,
-                    spawn,
+                    false,
                     ps.remote.clone(),
                 ) else {
                     continue;
                 };
-                let mut pane = pane;
                 let seeded = crate::session::replay_pane_log(
                     &ps.log,
                     &mut pane.term,
                     config.max_log_mb * 1024 * 1024,
                 );
                 pane.log_seed(&seeded);
-                if !spawn {
+                if let Some(remote) = &ps.remote {
+                    // Remote panes restore DISCONNECTED: history shows, but
+                    // the ssh only connects when the user presses Enter (or
+                    // an in-session reconnect loop fires — never on restore).
                     pane.exited = Some("disconnected (remote session)".into());
                     pane.last_exit_code = Some(1);
                     pane.reconnect = crate::term::ReconnectState::Manual;
-                    pane.force_repaint = true;
+                } else if let Err(e) = pane.spawn_child() {
+                    pane.exited = Some(format!("failed to start: {e}"));
+                    pane.last_exit_code = Some(1);
                 }
+                pane.force_repaint = true;
                 panes.push(Pane::Term(pane));
             }
             if !panes.is_empty() {

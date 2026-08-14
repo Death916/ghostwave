@@ -185,6 +185,30 @@ Binary name: `ghostwave`
   - Unit-tested: 6 layout tests (float/embed round-trips: split, root
     stack, root leaf, stack-under-split, stale-origin rejection, sentinel
     invisibility).
+- FISH 4 STARTUP ESCAPE GARBAGE FIX (`^[[?0u^[P>|ghostwave^[\…`):
+  - Symptom: at app start / new panes, caret-escaped terminal responses
+    (kitty `CSI ? 0 u`, `DCS >|ghostwave ST`, OSC 11 `rgb:…`, DA
+    `CSI ? 62;1;6;22c`) printed after the prompt. Decoded: they are the
+    terminal's ANSWERS to fish 4.x startup probes — kitty keyboard query
+    `CSI ? u`, XTVERSION `CSI > q`, DA `CSI c`, OSC 11 bg query (fish's
+    binary has query_kitty_progressive_enhancements).
+  - Root cause: the restore path spawned the shell BEFORE replaying the
+    session log — the probes sat in the pty buffer during the replay and
+    were answered AFTER fish's read timeout; fish's line editor then
+    echoed the stale responses as caret-escaped garbage. Running `fish`
+    later was clean because the frame loop drains promptly.
+  - Fix: (1) tabs_from_session now creates the terminal WITHOUT spawning,
+    replays history, THEN starts the shell; (2) new prime_pty() drains the
+    child's initial burst synchronously right after spawn (250ms cap, 60ms
+    idle break) so probes are answered inside fish's read window; spawn
+    refactored into start_child (unprimed — reconnect must not block the
+    main loop) + spawn_child (primed, used by restore); respawn() reuses
+    start_child and now also works for program=None ($SHELL) panes.
+  - Verified: isolation test proves the terminal core answers all four
+    probes with the correct query forms (OSC 11 only after a color was
+    set — ghostty behavior, confirmed in stream_terminal.zig); prime test
+    proves early child output is processed during construction.
+    User-verified: garbage gone at app start.
 - Ctrl+Tab = next tab, Ctrl+Shift+Tab = previous tab (global binds).
 - PIN MARKER: drawn with primitives (no 📌 in the font stack → tofu).
 - FONT STACK: JetBrains Nerd variants (6 family NAMES, same design)
