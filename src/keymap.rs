@@ -124,6 +124,7 @@ pub enum Action {
     OpenFile(String),
     ConnectSsh(String),
     ConnectDurableSsh(String),
+    KillRemoteSession,
     NewAi,
     // session mode
     SessionManager,

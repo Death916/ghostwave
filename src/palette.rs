@@ -103,6 +103,7 @@ impl CommandPalette {
     pub fn default_items(themes: &[&'static str]) -> Vec<PaletteItem> {
         use crate::keymap::Action::*;
         let mut items = vec![
+            PaletteItem { label: "Kill Remote Session".into(), action: KillRemoteSession },
             PaletteItem { label: "New Tab".into(), action: NewTab },
             PaletteItem { label: "New Pane (down)".into(), action: NewPaneDown },
             PaletteItem { label: "New Pane (right)".into(), action: NewPaneRight },

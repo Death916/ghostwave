@@ -26,6 +26,16 @@ pub const TAB_MENU_ITEMS: usize = 2;
 pub const TAB_BAR_H: f32 = 30.0;
 pub const STATUS_BAR_H: f32 = 26.0;
 
+/// Debug trace to stdout, ON BY DEFAULT (remote-session bring-up phase —
+/// the user runs the debug binary from a terminal and expects to see the
+/// steps); set GHOSTWAVE_DEBUG=0 to silence.
+pub fn gdbg(msg: impl AsRef<str>) {
+    if std::env::var("GHOSTWAVE_DEBUG").map(|v| v == "0").unwrap_or(false) {
+        return;
+    }
+    println!("[ghostwave] {}", msg.as_ref());
+}
+
 pub enum Pane {
     Term(TermPane),
     Preview(PreviewPane),
@@ -234,15 +244,16 @@ impl App {
 
     // ---- pane creation ---------------------------------------------------
 
-    fn new_term_pane(
-        &mut self,
+    /// Create a pane WITHOUT inserting it into a tab (for new-tab flows).
+    fn make_term_pane(
+        &self,
         cols: u16,
         rows: u16,
         program: Option<&str>,
         args: &[&str],
         cwd: Option<&str>,
         remote: Option<crate::term::RemoteSpec>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<TermPane> {
         let shell = program.or(self.config.shell.as_deref());
         let pane = TermPane::new(
             cols,
@@ -256,6 +267,28 @@ impl App {
             true,
             remote,
         )?;
+        Ok(pane)
+    }
+
+    /// Push a new tab containing `pane` and switch to it.
+    fn push_new_tab(&mut self, pane: Pane, name: &str) {
+        self.tabs.push(Tab::new(pane, name.to_string()));
+        self.active_tab = self.tabs.len() - 1;
+        self.last_tab = None;
+        self.apply_terminal_colors();
+        self.layout_all();
+    }
+
+    fn new_term_pane(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        program: Option<&str>,
+        args: &[&str],
+        cwd: Option<&str>,
+        remote: Option<crate::term::RemoteSpec>,
+    ) -> crate::Result<usize> {
+        let pane = self.make_term_pane(cols, rows, program, args, cwd, remote)?;
         let id = {
             let tab = self.current_tab_mut();
             let id = tab.panes.len();
@@ -466,6 +499,7 @@ impl App {
             Action::OpenFile(path) => self.open_file(path),
             Action::ConnectSsh(host) => self.connect_ssh(&host),
             Action::ConnectDurableSsh(host) => self.connect_durable_ssh(&host),
+            Action::KillRemoteSession => self.kill_active_remote_pane(),
             Action::NewAi => self.new_ai_pane(),
             Action::SessionManager => self.open_session_manager(),
             Action::SessionNew => {
@@ -875,11 +909,26 @@ impl App {
     }
 
     pub fn connect_ssh(&mut self, host: &str) {
+        // Each plain ssh connection lives in its OWN named session (visible
+        // in the session list, no durable marker), so it is identifiable
+        // and resumable like any other session.
+        let sess = format!("ssh-{}", Self::sanitize_host(host));
+        if sess != self.current_session {
+            if crate::session::list_sessions().contains(&sess) {
+                self.load_session(&sess);
+            } else {
+                self.save_session();
+                self.tabs = Vec::new();
+                self.active_tab = 0;
+                self.current_session = sess.clone();
+                crate::session::set_last_session(&sess);
+            }
+        }
         let cols = 100;
         let rows = 30;
-        match self.new_term_pane(cols, rows, Some("ssh"), &[host], None, None) {
-            Ok(id) => {
-                self.current_tab_mut().active = id;
+        match self.make_term_pane(cols, rows, Some("ssh"), &[host], None, None) {
+            Ok(pane) => {
+                self.push_new_tab(Pane::Term(pane), &format!("ssh {host}"));
                 self.toast(&format!("connecting to {host}"));
             }
             Err(e) => self.toast(&format!("ssh failed: {e}")),
@@ -889,22 +938,25 @@ impl App {
     // ---- durable remote sessions (ghostd) --------------------------------
 
     /// Remote session name for a host: `ghostwave-<host>` (sanitized).
-    pub fn remote_session_name(host: &str) -> String {
-        let h: String = host
-            .chars()
+    /// Host string → filesystem-safe token (used for session names).
+    fn sanitize_host(host: &str) -> String {
+        host.chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
-            .collect();
-        format!("ghostwave-{h}")
+            .collect()
+    }
+
+    pub fn remote_session_name(host: &str) -> String {
+        format!("ghostwave-{}", Self::sanitize_host(host))
     }
 
     /// The remote shell command the pane runs: check the cached ghostd
     /// binary, then attach (creating the session if missing).
     fn remote_attach_cmd(host: &str, session: &str) -> String {
         format!(
-            "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
+            "sh -c 'BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
              if [ ! -x \"$BIN\" ] || [ \"$($BIN --version 2>/dev/null)\" != \"ghostd {ver}\" ]; then \
              echo \"ghostd missing/stale on {host} — reconnect to upload\"; exit 1; fi; \
-             exec \"$BIN\" attach {session} 2>/dev/null || {{ \"$BIN\" new {session} >/dev/null 2>&1 && exec \"$BIN\" attach {session}; }}",
+             \"$BIN\" attach {session} 2>/dev/null || {{ \"$BIN\" new {session} >/dev/null 2>&1 && exec \"$BIN\" attach {session}; }}'",
             ver = env!("CARGO_PKG_VERSION")
         )
     }
@@ -916,11 +968,13 @@ impl App {
     pub fn connect_durable_ssh(&mut self, host: &str) {
         let session = Self::remote_session_name(host);
         let cmd = Self::remote_attach_cmd(host, &session);
+        gdbg(format!("ds {host}: session={session} uploading-binary-check"));
         self.ensure_remote_binary(host, &session);
         let cols = 100;
         let rows = 30;
         let args = ["-t", "-o", "ConnectTimeout=10", host, &cmd];
-        match self.new_term_pane(
+        gdbg(format!("ds {host}: ssh argv: -t -o ConnectTimeout=10 {host} {cmd:?}"));
+        match self.make_term_pane(
             cols,
             rows,
             Some("ssh"),
@@ -931,8 +985,8 @@ impl App {
                 session,
             }),
         ) {
-            Ok(id) => {
-                self.current_tab_mut().active = id;
+            Ok(pane) => {
+                self.push_new_tab(Pane::Term(pane), &format!("ssh {host}"));
                 self.toast(&format!("durable ssh: {host}"));
             }
             Err(e) => self.toast(&format!("ssh failed: {e}")),
@@ -948,8 +1002,10 @@ impl App {
         let tx = self.remote_upload_tx.clone();
         let host = host.to_string();
         let session = session.to_string();
+        gdbg(format!("upload thread for {host}: starting"));
         std::thread::spawn(move || {
             let ok = upload_ghostd(&host);
+            gdbg(format!("upload thread for {host}: result ok={ok}"));
             let _ = tx.send((host, session, ok));
         });
     }
@@ -988,14 +1044,34 @@ impl App {
             return;
         };
         self.toast(&format!("killing remote session {session} on {host}"));
+        gdbg(format!("kill {session} on {host}: spawning ssh"));
         std::thread::spawn(move || {
             let cmd = format!(
-                "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \"$BIN\" kill {session} 2>&1 || echo \"no ghostd binary on {host}\""
+                "sh -c 'BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
+                 if [ ! -x \"$BIN\" ]; then echo \"no ghostd binary on {host}\"; exit 1; fi; \
+                 \"$BIN\" kill {session} 2>&1 || echo \"no session {session} on {host}\"'"
             );
             let _ = std::process::Command::new("ssh")
                 .args(["-o", "ConnectTimeout=5", &host, &cmd])
                 .status();
         });
+    }
+
+    /// Palette "Kill Remote Session": kill the remote ghostd session of the
+    /// ACTIVE pane (connected or disconnected) and close the local pane —
+    /// the only way to fully get rid of a durable remote session.
+    fn kill_active_remote_pane(&mut self) {
+        let t = self.active_tab;
+        let p = self.active_pane_id();
+        let Some((host, session)) = self.remote_spec_of(t, p) else {
+            self.toast("no remote session in active pane");
+            return;
+        };
+        self.kill_remote_pane(t, p);
+        // Close the local pane too (the remote session is gone — the pane
+        // is useless; its ssh/attach dies with the daemon anyway).
+        self.close_pane();
+        self.toast(&format!("killed remote session {session} on {host}"));
     }
 
     fn remote_spec_of(&self, tab_idx: usize, pane_idx: usize) -> Option<(String, String)> {
@@ -1926,6 +2002,7 @@ impl App {
         // ghostd upload results: mark the host ready and respawn panes that
         // were waiting for the binary.
         while let Ok((host, _session, ok)) = self.remote_uploads.try_recv() {
+            gdbg(format!("upload result {host}: ok={ok}"));
             if ok {
                 self.binary_ready.insert(host.clone());
                 self.respawn_waiting(&host);
@@ -2093,21 +2170,30 @@ fn upload_ghostd(host: &str) -> bool {
     // 1. Remote arch decides which embedded binary to ship.
     let arch = match ssh_out(host, "uname -m") {
         Some(a) => a.trim().to_string(),
-        None => return false,
+        None => {
+            gdbg(format!("upload {host}: uname -m failed"));
+            return false;
+        }
     };
+    gdbg(format!("upload {host}: arch={arch}"));
     let bytes: &[u8] = match arch.as_str() {
         "x86_64" => GHOSTD_X86_64,
         "aarch64" => GHOSTD_AARCH64,
-        _ => return false,
+        _ => {
+            gdbg(format!("upload {host}: unsupported arch {arch}"));
+            return false;
+        }
     };
     // 2. Already current? (version check on the remote).
     let check = format!(
-        "BIN=\"$HOME/.cache/ghostwave/ghostd-{arch}\"; [ -x \"$BIN\" ] && [ \"$($BIN --version 2>/dev/null)\" = \"ghostd {ver}\" ]",
+        "sh -c 'BIN=\"$HOME/.cache/ghostwave/ghostd-{arch}\"; [ -x \"$BIN\" ] && [ \"$($BIN --version 2>/dev/null)\" = \"ghostd {ver}\" ]'",
         ver = env!("CARGO_PKG_VERSION")
     );
     if ssh_ok(host, &check) {
+        gdbg(format!("upload {host}: binary current, no upload"));
         return true;
     }
+    gdbg(format!("upload {host}: uploading {} bytes", bytes.len()));
     // 3. Upload the binary over stdin.
     let mut child = match std::process::Command::new("ssh")
         .args([
@@ -2115,7 +2201,7 @@ fn upload_ghostd(host: &str) -> bool {
             "ConnectTimeout=5",
             host,
             &format!(
-                "mkdir -p \"$HOME/.cache/ghostwave\" && cat > \"$HOME/.cache/ghostwave/ghostd-{arch}\" && chmod +x \"$HOME/.cache/ghostwave/ghostd-{arch}\""
+                "sh -c 'mkdir -p \"$HOME/.cache/ghostwave\" && cat > \"$HOME/.cache/ghostwave/ghostd-{arch}.new\" && chmod +x \"$HOME/.cache/ghostwave/ghostd-{arch}.new\" && mv -f \"$HOME/.cache/ghostwave/ghostd-{arch}.new\" \"$HOME/.cache/ghostwave/ghostd-{arch}\"'"
             ),
         ])
         .stdin(std::process::Stdio::piped())

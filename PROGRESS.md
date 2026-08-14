@@ -52,21 +52,80 @@ Binary name: `ghostwave`
   black/garbage (the old flicker bug). Proper damage rendering needs
   an app-owned offscreen render target (macroquad render_target) —
   deferred; idle CPU is already ~0.
-- REMOTE DURABLE SESSIONS (waveterm-style) — `feat/remote-durable` branch,
-  NOT merged yet (user gates merges now; master is protected on forgejo):
-  - ghostd: standalone pure-Rust daemon (ghostd/ crate). Sessions survive
-    ssh drops (daemonize + setsid + SIGHUP-immune); pty ALWAYS drained to a
-    front-truncated ring log so children never stall while detached and
-    drop-gap output replays on attach; first-attach timeout (default 300s)
-    kills orphaned daemons; log cap (32MB) bounds disk; new/attach/list/
-    kill/kill-all; DCS-based mid-session resize.
+- REMOTE DURABLE SESSIONS (waveterm-style) — `feat/remote-durable` branch.
+  STATUS: PR #1 MERGED by user to master (d115196); follow-up fixes on the
+  branch (7872569) awaiting user re-test; master protected on forgejo, user
+  gates all merges ("dont merge till i confirm"):
+  - ghostd: standalone pure-Rust daemon (ghostd/ crate, lib+bin).
+    Sessions survive ssh drops (daemonize + setsid + SIGHUP-immune); pty
+    ALWAYS drained to a front-truncated ring log so children never stall
+    while detached and drop-gap output replays on attach; first-attach
+    timeout (default 300s) kills orphans; log cap (32MB) bounds disk;
+    new/attach/list/kill/kill-all; DCS-based mid-session resize.
+  - Build: static musl binaries COMMITTED under assets/ (x86_64 + aarch64,
+    built with official rustc + rust-std components + rust-lld — no zig, no
+    C toolchain, no nix build needed); scripts/build-ghostd.sh rebuilds
+    them with plain cargo on any distro (rustup musl targets), NixOS
+    fallback path included. Flake REMOVED (was bootstrapping a musl gcc
+    toolchain from source for a zero-C crate — overkill).
   - Client: `ds <host>` palette entry → ssh -t + ghostd attach; binary
     bootstrapped over ssh (uname -m → version check → stdin upload,
-    embedded x86_64+aarch64 static musl builds via flake.nix pkgsMusl —
-    NO zig); restore shows remote panes DISCONNECTED (Enter to connect,
-    never auto-connect on start); bounded auto-reconnect (5 attempts,
-    3s→15s backoff → manual); `k` kills the remote session; session
-    manager shows an "ssh" marker; [remote] config section.
+    embedded static musl binaries); restore shows remote panes
+    DISCONNECTED (Enter to connect, never auto-connect on start); bounded
+    auto-reconnect (5 attempts, 3s→15s backoff → manual); `k` kills the
+    remote session; session manager shows an "ssh" marker; [remote] config.
+  - FIXED (7872569): shell-quote escaping emitted literal backslashes
+    (remote checks always failed → stale loop); `exec attach || new`
+    fallback was dead code (exec replaces the shell → sessions never
+    created). Verified end-to-end on orac: session created, daemon
+    persists. Kill message now accurate ('no ghostd binary' only when
+    truly missing).
+  - NEW: plain `ssh <host>` palette connections live in their OWN named
+    session (ssh-<host>) in the session list — no durable marker, resume
+    by re-running the command.
+  - FIXED (3363fff): ds pane input — the ssh -t remote pty was canonical+
+    echo, so Ctrl+C SIGINT'd the attach process (dropped the connection)
+    and arrows echoed as ^[[A. cmd_attach now cfmakeraw()s its stdin:
+    every byte (0x03, arrows) flows to the daemon's child pty, where the
+    shell's own signal handling applies. Static musl binaries rebuilt.
+  - FIXED (uncommitted, ghostd 0.1.1 + app 0.1.1): fish-shell hosts (homelab)
+    rejected every remote command — ssh runs the command via the login
+    shell, and fish refuses `BIN="..."` assignment ("Unsupported use of
+    '='"). All four remote command sites wrapped in `sh -c '...'` so POSIX
+    sh parses them regardless of login shell: remote_attach_cmd
+    (attach/fallback chain), kill_remote_pane, upload_ghostd version
+    check + upload. Dropped the inner single quotes in the kill message
+    (would have terminated the sh -c wrapper). VERIFIED on homelab (fish):
+    full ds chain runs, session created, fish welcome replayed.
+  - FIXED (same commit): `ds` hung with ZERO output on both hosts even
+    after the fish fix — root cause chain, all addressed:
+    a. ghostd handle_client read the SIZE handshake NONBLOCKING and bailed
+       on EAGAIN → thread died silently → attach connected but nobody ever
+       serviced it → hang with no output. Now polls (5s bound) for the
+       line.
+    b. New OK-ack protocol: daemon acks after SIZE; attach waits ≤8s for
+       the ack then exits 1 ("session 'x' not responding — recovering")
+       so the `|| new` fallback fires. `new` probes first (SIZE handshake,
+       2s bound): live daemon → "already exists"; unresponsive daemon →
+       SIGTERM → SIGKILL → remove state → rebind fresh.
+    c. attach ignored stdin/stream EOF (spin at 100% CPU forever holding
+       the daemon's client slot — the zombie attaches found on orac).
+       Now exits on both.
+    d. attach sends SIZE 80x24 fallback when stdin isn't a tty (was:
+       no SIZE → daemon's 5s wait → dead thread).
+    e. upload writes ghostd-<arch>.new + mv (was: "Text file busy" when a
+       running daemon holds the binary path).
+    VERIFIED end-to-end: orac SIGSTOP'd daemon → chain attach-timeout →
+    probe → SIGTERM/SIGKILL → fresh daemon → re-attach → live bash
+    prompt; homelab fish full chain; no zombie attaches after pane close.
+  - DEBUG: GHOSTWAVE_DEBUG=1 (app, stdout traces: ssh argv, upload steps,
+    reconnect, kill) and GHOSTD_DEBUG=1 (remote: eprintln + append to
+    ~/.local/share/ghostwave/debug.log — daemon/attach/new/probe/recover
+    traces). Off by default.
+  - Versions bumped 0.1.0 → 0.1.1 (BOTH crates — the ssh bootstrap
+    compares `ghostd --version` against the app's CARGO_PKG_VERSION, so a
+    ghostd-only bump would never re-upload). Musl assets rebuilt both
+    arches.
   - OSC 52 clipboard over ssh: already wired (on_clipboard_write → wl-copy).
   - Wrap/reflow semantics pinned in tests/term_core.rs — both work in
     libghostty-vt 0.2.1; the "cut off" report was a TUI clipping its own

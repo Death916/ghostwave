@@ -1,6 +1,6 @@
 [package]
 name = "ghostwave"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 description = "A waveterm-style terminal built on libghostty-vt (Rust), with zellij-style keybindings"
 license = "MIT"
