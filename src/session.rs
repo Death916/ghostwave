@@ -154,6 +154,33 @@ pub fn has_remote(name: &str) -> bool {
     })
 }
 
+/// All durable remote (host, daemon-session) pairs in a saved session —
+/// used by the session manager's kill action.
+pub fn remote_specs(name: &str) -> Vec<(String, String)> {
+    let Some(s) = load(name) else { return vec![] };
+    let mut v = Vec::new();
+    for t in &s.tabs {
+        for p in &t.panes {
+            if let Some(r) = &p.remote {
+                v.push((r.host.clone(), r.session.clone()));
+            }
+        }
+    }
+    v
+}
+
+/// True when EVERY pane in the saved session is a durable remote pane —
+/// a pure `ds` session, safe to delete wholesale after killing its
+/// daemons (mixed sessions keep their local tabs).
+pub fn is_pure_remote(name: &str) -> bool {
+    load(name).is_some_and(|s| {
+        !s.tabs.is_empty()
+            && s.tabs.iter().all(|t| {
+                !t.panes.is_empty() && t.panes.iter().all(|p| p.remote.is_some())
+            })
+    })
+}
+
 pub fn save(name: &str, state: &SessionState) {
     let _ = std::fs::create_dir_all(sessions_dir());
     match serde_json::to_string_pretty(state) {

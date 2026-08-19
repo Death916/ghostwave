@@ -115,7 +115,7 @@ impl CommandPalette {
             PaletteItem { label: "Focus Up".into(), action: MoveFocus(crate::layout::Dir::Up) },
             PaletteItem { label: "Focus Down".into(), action: MoveFocus(crate::layout::Dir::Down) },
             PaletteItem { label: "Next Pane".into(), action: SwitchFocus },
-            PaletteItem { label: "Zoom Pane".into(), action: ToggleZoom },
+            PaletteItem { label: "Fullscreen Pane (Window)".into(), action: ToggleZoom },
             PaletteItem { label: "Toggle Pane Frames".into(), action: ToggleFrames },
             PaletteItem { label: "Rename Tab".into(), action: RenameTab },
             PaletteItem { label: "Rename Pane".into(), action: RenamePane },

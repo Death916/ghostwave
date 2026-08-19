@@ -28,9 +28,9 @@ use nix::{
 };
 
 use ghostd::{
-    daemonize, dcs_size_msg, die, fd_poll, fd_read, gdbg, install_term_handler, log_path,
-    pid_alive, pid_path, probe_session, recover_session, set_nonblock, set_term_size, socket_path,
-    spawn_child, state_dir, term_size, truncate_log_front, write_all_blocking,
+    daemonize, dcs_size_msg, die, fd_poll, fd_read, gdbg, install_term_handler, kill_child_group,
+    log_path, pid_alive, pid_path, probe_session, recover_session, set_nonblock, set_term_size,
+    socket_path, spawn_child, state_dir, term_size, truncate_log_front, write_all_blocking,
     DEFAULT_FIRST_ATTACH_SECS, DEFAULT_LOG_CAP_MB, Probe, TERM_REQUESTED, VERSION,
 };
 
@@ -42,8 +42,13 @@ fn eprintln_exit(msg: &str) -> ! {
 /// Accept loop. `tx` is where pty output is published for the client.
 fn accept_loop(listener: UnixListener, name: &str, log_cap: u64, first_attach_secs: u64) {
     let log_file = log_path(name);
-    let pty_fd = spawn_child(&[]);
-    let _ = fs::write(pid_path(name), format!("{}", nix::unistd::getpid()));
+    let (pty_fd, child_pid) = spawn_child(&[]);
+    // Two-line pidfile: daemon pid, then the pty child's pid. `ghostd kill`
+    // needs both so a wedged daemon can't orphan the session's program.
+    let _ = fs::write(
+        pid_path(name),
+        format!("{}\n{}", nix::unistd::getpid(), child_pid.as_raw()),
+    );
     let mut log = OpenOptions::new().create(true).append(true).open(&log_file).unwrap_or_else(|e| die(&format!("log: {e}")));
     let mut log_bytes = fs::metadata(&log_file).map(|m| m.len()).unwrap_or(0);
 
@@ -120,8 +125,10 @@ fn accept_loop(listener: UnixListener, name: &str, log_cap: u64, first_attach_se
         _ = wait::waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
     }
 
-    // Cleanup: kill the child (if still alive), remove state.
-    _ = signal::kill(Pid::from_raw(-1), Signal::SIGTERM);
+    // Cleanup: kill the pty child's process group (TERM, then KILL if it
+    // ignores), remove state. Never kill(-1) — that broadcasts SIGTERM to
+    // every process this user owns on the host.
+    kill_child_group(child_pid, Duration::from_secs(2));
     let _ = wait::waitpid(Pid::from_raw(-1), None);
     let _ = fs::remove_file(socket_path(name));
     let _ = fs::remove_file(pid_path(name));
@@ -519,17 +526,33 @@ fn cmd_kill(name: &str) {
         eprintln!("ghostd: no session '{name}'");
         std::process::exit(1);
     };
-    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+    // Two-line pidfile: daemon pid, then the pty child's pid (old files
+    // have a single line — child unknown, daemon kill still works).
+    let mut lines = pid_str.lines();
+    let Some(daemon) = lines.next().and_then(|l| l.trim().parse::<i32>().ok()) else {
         eprintln!("ghostd: bad pid for '{name}'");
         std::process::exit(1);
     };
-    let _ = signal::kill(Pid::from_raw(pid), Signal::SIGTERM);
-    // Wait for cleanup (the daemon removes its own files).
-    for _ in 0..50 {
-        if !pid_alive(Pid::from_raw(pid)) {
+    let child = lines.next().and_then(|l| l.trim().parse::<i32>().ok());
+    let daemon = Pid::from_raw(daemon);
+    // SIGTERM the daemon; its handler cleans up its own files. If it's
+    // wedged, escalate: SIGKILL it and kill the session's process group
+    // directly so a stuck daemon can't orphan the running program.
+    let _ = signal::kill(daemon, Signal::SIGTERM);
+    let mut alive = true;
+    for _ in 0..30 {
+        if !pid_alive(daemon) {
+            alive = false;
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+    if alive {
+        gdbg("kill", &format!("{name}: daemon {daemon} stuck, SIGKILL"));
+        let _ = signal::kill(daemon, Signal::SIGKILL);
+    }
+    if let Some(c) = child {
+        kill_child_group(Pid::from_raw(c), Duration::from_secs(2));
     }
     let _ = fs::remove_file(socket_path(name));
     let _ = fs::remove_file(pid_file);

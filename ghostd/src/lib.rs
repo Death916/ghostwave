@@ -231,12 +231,34 @@ pub fn pid_alive(pid: Pid) -> bool {
     signal::kill(pid, None).is_ok()
 }
 
+/// Kill the pty child and its whole process group (the child is a session
+/// leader, so pgid == pid): SIGTERM, escalate to SIGKILL after `grace`.
+/// Safe to call on a dead pid — errors are ignored. Used by the daemon's
+/// own cleanup AND by `ghostd kill` so a wedged daemon can't orphan the
+/// session's program.
+pub fn kill_child_group(child: Pid, grace: Duration) {
+    let group = Pid::from_raw(-child.as_raw());
+    let _ = signal::kill(group, Signal::SIGTERM);
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if !pid_alive(child) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if pid_alive(child) {
+        gdbg("kill", &format!("child {} stuck, SIGKILL group", child.as_raw()));
+        let _ = signal::kill(group, Signal::SIGKILL);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // daemon plumbing
 
 /// Spawn the pty child (the session's program). Returns the non-blocking
-/// master fd.
-pub fn spawn_child(cmd: &[String]) -> i32 {
+/// master fd and the child's pid (== its process group: forkpty makes the
+/// child a session leader, so a negative-pid kill reaches its whole group).
+pub fn spawn_child(cmd: &[String]) -> (i32, Pid) {
     let (shell, args): (PathBuf, Vec<String>) = if !cmd.is_empty() {
         (PathBuf::from(&cmd[0]), cmd[1..].to_vec())
     } else {
@@ -259,9 +281,9 @@ pub fn spawn_child(cmd: &[String]) -> i32 {
             _ = c.exec();
             std::process::exit(127);
         }
-        Ok(ForkptyResult::Parent { master, .. }) => {
+        Ok(ForkptyResult::Parent { master, child }) => {
             set_nonblock(master.as_raw_fd());
-            master.into_raw_fd()
+            (master.into_raw_fd(), child)
         }
         Err(e) => {
             eprintln!("ghostd: forkpty failed: {e}");

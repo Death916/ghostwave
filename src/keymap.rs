@@ -259,6 +259,7 @@ pub fn global_binds(k: Key, m: Mods) -> Option<Action> {
         }
         // zellij shared_except: Alt binds
         _ if alt(k, m, N) => Action::NewPane,
+        _ if alt(k, m, F) => Action::ToggleZoom, // Zellij: Alt+f toggles pane fullscreen within window
         _ if alt(k, m, H) => Action::MoveFocus(Dir::Left),
         _ if alt(k, m, L) => Action::MoveFocus(Dir::Right),
         _ if alt(k, m, J) => Action::MoveFocus(Dir::Down),
@@ -397,7 +398,8 @@ fn pane_binds(k: Key, m: Mods) -> Option<Action> {
         _ if plain(k, m, F) => Action::ToggleFloating,
         _ if plain(k, m, E) => Action::ToggleHideFloat,
         _ if shift(k, m, E) => Action::CycleFloat,
-        _ if plain(k, m, Z) => Action::ToggleFrames,
+        _ if plain(k, m, Z) => Action::ToggleZoom, // Zellij: Ctrl+p z toggles fullscreen/zoom
+        _ if shift(k, m, Z) => Action::ToggleFrames,
         _ if plain(k, m, W) => Action::CycleStack,
         _ if plain(k, m, C) => Action::RenamePane,
         _ if let Some(d) = dir => Action::MoveFocus(d),

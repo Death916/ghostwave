@@ -1265,7 +1265,59 @@ impl App {
     /// command. The ghostd binary is uploaded in the background on first
     /// use; a stale/missing binary shows an error and the reconnect loop
     /// retries once the upload lands.
+    ///
+    /// ds sessions live in their OWN local session (`ssh-<host>`) so the
+    /// session manager lists them independently and can kill them; a
+    /// repeat `ds <host>` focuses/reconnects the existing attach pane
+    /// instead of stacking duplicates (the daemon serves one client at a
+    /// time anyway).
     pub fn connect_durable_ssh(&mut self, host: &str) {
+        let target = format!("ssh-{}", Self::sanitize_host(host));
+        if self.current_session != target {
+            if crate::session::load(&target).is_some() {
+                self.load_session(&target);
+            } else {
+                // Fresh empty session — no default shell tab; the remote
+                // attach pane is added below.
+                self.park_current();
+                self.tabs = Vec::new();
+                self.active_tab = 0;
+                self.finish_session_switch(&target);
+            }
+        }
+        // Dedup: an attach pane for this host already exists → focus it
+        // and reconnect if it's not live.
+        let mut existing: Option<(usize, usize)> = None;
+        for (ti, tab) in self.tabs.iter().enumerate() {
+            for (pi, pane) in tab.panes.iter().enumerate() {
+                if let Pane::Term(t) = pane {
+                    if t.remote.as_ref().is_some_and(|r| r.host == host) {
+                        existing = Some((ti, pi));
+                        break;
+                    }
+                }
+            }
+            if existing.is_some() {
+                break;
+            }
+        }
+        if let Some((t, p)) = existing {
+            self.active_tab = t;
+            self.current_tab_mut().active = p;
+            let needs_connect = match self.current_tab().panes.get(p) {
+                Some(Pane::Term(tp)) => {
+                    tp.exited.is_some() || tp.reconnect != crate::term::ReconnectState::Idle
+                }
+                _ => false,
+            };
+            if needs_connect {
+                self.connect_remote_pane(t, p);
+                self.toast(&format!("reconnecting durable ssh: {host}"));
+            } else {
+                self.toast(&format!("already attached to {host}"));
+            }
+            return;
+        }
         let session = Self::remote_session_name(host);
         let cmd = Self::remote_attach_cmd(host, &session);
         gdbg(format!("ds {host}: session={session} uploading-binary-check"));
@@ -1344,17 +1396,113 @@ impl App {
             return;
         };
         self.toast(&format!("killing remote session {session} on {host}"));
-        gdbg(format!("kill {session} on {host}: spawning ssh"));
+        Self::spawn_remote_kill(&host, &session);
+    }
+
+    /// ssh to `host` and kill the ghostd daemon for `dsession`, then pkill
+    /// stragglers. Runs on a fresh ssh connection (never the pane's own),
+    /// so it works when the local pane is dead or the daemon is wedged.
+    /// The remote ghostd escalates TERM→KILL and kills the session's
+    /// process group; the pkill is the last resort for orphans whose
+    /// pidfile is already gone.
+    fn spawn_remote_kill(host: &str, dsession: &str) {
+        let host = host.to_string();
+        let dsession = dsession.to_string();
+        gdbg(format!("kill {dsession} on {host}: spawning ssh"));
         std::thread::spawn(move || {
             let cmd = format!(
                 "sh -c 'BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
                  if [ ! -x \"$BIN\" ]; then echo \"no ghostd binary on {host}\"; exit 1; fi; \
-                 \"$BIN\" kill {session} 2>&1 || echo \"no session {session} on {host}\"'"
+                 \"$BIN\" kill {dsession} 2>&1 || true; \
+                 pkill -9 -f \"ghostd-$(uname -m) new {dsession}\" 2>/dev/null || true; true'"
             );
             let _ = std::process::Command::new("ssh")
                 .args(["-o", "ConnectTimeout=5", &host, &cmd])
                 .status();
         });
+    }
+
+    /// Session manager `k`: kill every durable remote daemon owned by the
+    /// selected session (fresh ssh, works when panes are dead/stuck), then
+    /// drop the entry — pure ds sessions are deleted wholesale, mixed
+    /// sessions keep their local tabs.
+    fn kill_session_remotes(&mut self, name: &str) {
+        let (specs, pure) = if name == self.current_session {
+            (Self::live_remote_specs(&self.tabs), Self::live_is_pure_remote(&self.tabs))
+        } else if let Some(p) = self.parked.iter().find(|s| s.name == name) {
+            (Self::live_remote_specs(&p.tabs), Self::live_is_pure_remote(&p.tabs))
+        } else {
+            (crate::session::remote_specs(name), crate::session::is_pure_remote(name))
+        };
+        if specs.is_empty() {
+            self.toast(&format!("no remote sessions in {name}"));
+            return;
+        }
+        // Dedupe by host (one daemon session per host).
+        let mut hosts: Vec<(String, String)> = Vec::new();
+        for (h, s) in specs {
+            if !hosts.iter().any(|(hh, _)| hh == &h) {
+                hosts.push((h, s));
+            }
+        }
+        for (host, dsession) in &hosts {
+            Self::spawn_remote_kill(host, dsession);
+        }
+        if name != self.current_session && pure {
+            if let Some(idx) = self.parked.iter().position(|s| s.name == name) {
+                self.parked.remove(idx);
+            }
+            crate::session::delete(name);
+            let entries = crate::session::list_sessions();
+            if let Some((e, sel)) = self.session_list.as_mut() {
+                *e = entries;
+                if *sel >= e.len() {
+                    *sel = e.len().saturating_sub(1);
+                }
+            }
+            self.toast(&format!(
+                "killed {} remote session(s) on {}, removed {name}",
+                hosts.len(),
+                hosts.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        } else {
+            self.toast(&format!(
+                "killed {} remote session(s) on {}",
+                hosts.len(),
+                hosts.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+
+    /// (host, daemon-session) pairs across live tabs (current or parked).
+    fn live_remote_specs(tabs: &[Tab]) -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for tab in tabs {
+            for pane in &tab.panes {
+                if let Pane::Term(t) = pane {
+                    if let Some(r) = &t.remote {
+                        v.push((r.host.clone(), r.session.clone()));
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// True when every live pane is a durable remote pane (a pure ds
+    /// session — deleteable after its daemons are killed).
+    fn live_is_pure_remote(tabs: &[Tab]) -> bool {
+        let mut total = 0;
+        let mut remote = 0;
+        for tab in tabs {
+            for pane in &tab.panes {
+                total += 1;
+                if matches!(pane, Pane::Term(t) if t.remote.is_some()) {
+                    remote += 1;
+                }
+            }
+        }
+        total > 0 && total == remote
     }
 
     /// Palette "Kill Remote Session": kill the remote ghostd session of the
@@ -1891,6 +2039,30 @@ impl App {
         let k = kp.key;
         let m = kp.mods;
 
+        // Locked mode: ONLY Ctrl+g unlocks. ALL other keys pass straight to terminal!
+        if self.mode == Mode::Locked {
+            if kp.key == Key::G && kp.mods.contains(Mods::CTRL) {
+                self.mode = Mode::Normal;
+                self.toast("unlocked");
+            } else if let Some(t) = self.active_term_mut() {
+                let consumed = if kp.text.is_some() && m.contains(Mods::SHIFT) {
+                    Mods::SHIFT
+                } else {
+                    Mods::empty()
+                };
+                let text = kp.text.map(|c| c.to_string());
+                let _ = t.handle_key(
+                    k,
+                    m,
+                    consumed,
+                    keymap::unshifted_codepoint(k),
+                    text.as_deref(),
+                    key::Action::Press,
+                );
+            }
+            return;
+        }
+
         if keymap::is_quit(k, m) {
             self.quit = true;
             return;
@@ -2032,6 +2204,15 @@ impl App {
                         }
                     }
                 }
+                Key::K => {
+                    let name = self
+                        .session_list
+                        .as_ref()
+                        .and_then(|(e, sel)| e.get(*sel).cloned());
+                    if let Some(name) = name {
+                        self.kill_session_remotes(&name);
+                    }
+                }
                 Key::N => {
                     let name = self.next_session_name();
                     self.session_list = None;
@@ -2124,8 +2305,24 @@ impl App {
         if self.palette.is_some() {
             return;
         }
+        if self.mode == Mode::Locked {
+            if kp.key == Key::G && kp.mods.contains(Mods::CTRL) {
+                return;
+            }
+            if let Some(t) = self.active_term_mut() {
+                let _ = t.handle_key(
+                    kp.key,
+                    kp.mods,
+                    Mods::empty(),
+                    keymap::unshifted_codepoint(kp.key),
+                    None,
+                    key::Action::Release,
+                );
+            }
+            return;
+        }
         match self.mode {
-            Mode::Normal | Mode::Locked => {
+            Mode::Normal => {
                 // Only forward releases for keys the app did NOT consume on
                 // press (bound/entry/quit keys would spam the terminal with
                 // stray release events).
@@ -2372,6 +2569,39 @@ impl App {
                 padding,
                 MouseEv {
                     kind: MouseEvKind::Release(libghostty_vt::mouse::Button::Right),
+                    x: lx,
+                    y: ly,
+                    any_pressed,
+                    button_down,
+                },
+                mods,
+            );
+        }
+        if is_mouse_button_pressed(MouseButton::Middle) {
+            let _ = t.handle_mouse(
+                pane_rect,
+                cell,
+                padding,
+                MouseEv {
+                    kind: MouseEvKind::Press(libghostty_vt::mouse::Button::Middle),
+                    x: lx,
+                    y: ly,
+                    any_pressed,
+                    button_down,
+                },
+                mods,
+            );
+            if !t.is_mouse_tracking() {
+                t.paste_primary();
+            }
+        }
+        if is_mouse_button_released(MouseButton::Middle) {
+            let _ = t.handle_mouse(
+                pane_rect,
+                cell,
+                padding,
+                MouseEv {
+                    kind: MouseEvKind::Release(libghostty_vt::mouse::Button::Middle),
                     x: lx,
                     y: ly,
                     any_pressed,

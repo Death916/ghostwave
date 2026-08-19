@@ -690,6 +690,16 @@ impl TermPane {
         }
     }
 
+    pub fn paste_primary(&mut self) {
+        if let Some(text) = clipboard::read_primary_text().or_else(clipboard::read_text) {
+            self.write_input(text.as_bytes());
+        }
+    }
+
+    pub fn is_mouse_tracking(&self) -> bool {
+        self.term.is_mouse_tracking().unwrap_or(false)
+    }
+
     // ---- rendering -------------------------------------------------------
 
     /// Render this pane into `rect` (window-logical coords, but drawing is in

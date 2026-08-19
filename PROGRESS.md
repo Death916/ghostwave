@@ -12,6 +12,54 @@ Binary name: `ghostwave`
 
 ## STATUS: main terminal features solid — render/mouse/keybinds fixed, parity work in progress
 
+### agy branch — Fullscreen keybind + Strict Locked mode + Middle-click paste + Devenv cached setup
+- **WINDOW-SCOPED FULLSCREEN KEYBIND**:
+  - `Alt+f` (global) and `Ctrl+p z` (pane mode) added for Zellij-style pane zoom/fullscreen inside the application window (fills content area, does not toggle OS monitor fullscreen).
+  - Palette item updated: `"Fullscreen Pane (Window)"`.
+- **STRICT LOCKED MODE FIX**:
+  - Fixed `Mode::Locked` in `app.rs` & `keymap.rs`. When locked (`Ctrl+g`), **only** `Ctrl+g` unlocks to Normal mode. All other key combinations, releases, repeats, and app shortcuts (`Ctrl+p`, `Ctrl+w`, `Ctrl+d`, etc.) pass directly to the terminal application (full compatibility with `vim`, `micro`, `tmux`, `htop`, etc.).
+- **MIDDLE-CLICK PRIMARY PASTE**:
+  - `read_primary_text()` added in `clipboard.rs` (`wl-paste --primary`, `xclip -primary`, `xsel --primary`).
+  - Middle mouse click in `app.rs` sends mouse event if tracking is enabled in the terminal, or pastes the primary selection when tracking is inactive.
+- **DEVENV FAST CACHED SETUP & RUST-OVERLAY**:
+  - Configured `devenv.yaml` with `rust-overlay` (`github:oxalica/rust-overlay`) and `devenv-nixpkgs/rolling` matching the local Nix store cache from `halloy`.
+  - Updated `devenv.nix` with declarative `languages.rust` components (`rustc`, `cargo`, `clippy`, `rustfmt`, `rust-analyzer`), reused cached GUI/graphics packages (`mesa`, `libGL`, `wayland`, `libxkbcommon`, `libxcb`), X11 libraries, and dynamic `env.LD_LIBRARY_PATH` via `lib.makeLibraryPath`.
+  - Added `.envrc` for direnv integration and updated `.gitignore` for `.devenv`, `.direnv`, and `ghostd/.toolchain`.
+
+
+### 0.1.3 — ds sessions own session-manager entry + reliable kill (feat/ds-session-kill)
+- `ds <host>` now creates/switches to its OWN local session `ssh-<host>`
+  (was: dumped a tab into the current session, invisible in the manager).
+  Repeat `ds <host>` focuses/reconnects the existing attach pane instead
+  of stacking duplicates (ghostd serves one client at a time anyway).
+- Session manager `k` = kill the selected session's remote daemons over a
+  FRESH ssh (`ghostd kill <session>` + `pkill -9` fallback) — works even
+  when the local pane is dead/stuck. Pure ds sessions (`ssh-<host>`) are
+  removed from the list after the kill; mixed sessions keep their local
+  tabs. Hint line updated: `k kill remote`.
+- ghostd hardened for stuck daemons:
+  - spawn_child returns the pty child's pid; pidfile now two lines
+    (daemon pid + child pid).
+  - `ghostd kill` escalates: SIGTERM daemon → 3s → SIGKILL, then kills the
+    child's process group (TERM → KILL). Old behavior gave up after 5s and
+    removed the pidfile while a wedged daemon lived on, with no pidfile
+    left to ever find it again.
+  - FIXED BUG: daemon cleanup used `kill(-1, SIGTERM)` — a broadcast to
+    EVERY process the user owns on the remote host. Now kills only the
+    session's process group.
+  - child is a session leader (forkpty login_tty), so group-kill by
+    -child_pid reaches the shell AND its children (sleep 300, builds…).
+- App + ghostd bumped 0.1.2 → 0.1.3 — the remote version check
+  (`ghostd <ver>`) forces re-upload of the hardened daemon.
+- REQUIRES `bash scripts/build-ghostd.sh` before testing (assets still
+  0.1.2 until the embedded binaries are rebuilt).
+- ROFI LAUNCH FIX (outside repo): ~/.local/bin/ghostwave-launcher — NixOS
+  has no loader cache and rofi/hyprland sessions don't carry
+  LD_LIBRARY_PATH, so miniquad's runtime dlopen of wayland/EGL/X11 died
+  silently ("Wayland backend failed") when launched from a menu. Wrapper
+  discovers store lib dirs (maxdepth 3, package-name-scoped to dodge
+  lmstudio/wine bundles) and execs. Desktop entry points at the wrapper.
+
 ### Recent work (commits 2571ca2 → HEAD)
 - Render: always-redraw per libghostty-vt docs (ghostling-rs pattern);
   pane bg = terminal default from snapshot.colors(). Fixed blank/flicker.

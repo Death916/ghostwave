@@ -338,7 +338,7 @@ fn render(app: &mut App) {
             }
         }
         draw_text_ex(
-            "↑/↓ select | Enter switch | n new | r rename | d delete | Esc close",
+            "↑/↓ select | Enter switch | n new | r rename | d delete | k kill remote | Esc close",
             x + 12.0,
             y + h - 8.0,
             TextParams { font: Some(&font), font_size: 12, color: color_theme(theme.status_fg), ..Default::default() },
