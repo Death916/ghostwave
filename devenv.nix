@@ -1,15 +1,28 @@
-# ghostwave dev environment via devenv (optional — shell.nix also works).
-#
-#   devenv shell        # enter (requires devenv installed)
-#
-# Same toolchain as shell.nix. `languages.rust` provides cargo/rustc/rustfmt
-# on PATH; zig_0_15 is the only non-Rust piece the build needs.
-# devenv's `libs` = packages whose lib dirs go on LD_LIBRARY_PATH (the
-# runtime dlopen deps for miniquad).
+{
+  pkgs,
+  lib,
+  config,
+  inputs,
+  ...
+}:
 
-{ pkgs, ... }: {
+{
   name = "ghostwave";
 
+  # Rust toolchain managed declaratively via rust-overlay (cached)
+  languages.rust = {
+    enable = true;
+    channel = "stable";
+    components = [
+      "rustc"
+      "cargo"
+      "clippy"
+      "rustfmt"
+      "rust-analyzer"
+    ];
+  };
+
+  # Packages: Reuses Halloy's cached GUI/graphics libs + Ghostwave specific tools
   packages = with pkgs; [
     zig_0_15
     pkg-config
@@ -18,23 +31,37 @@
     git
     curl
     jq
-  ];
-
-  libs = with pkgs; [
+    # Graphics & GUI libs (shared with Halloy cache)
+    mesa
     libGL
     wayland
     libxkbcommon
+    libxcb
+    # X11 fallback libs for miniquad
     libx11
     libxcursor
     libxrandr
     libxi
     libxext
-    libxcb
   ];
 
-  languages.rust.enable = true;
+  # Dynamic linker path for runtime dlopen (miniquad)
+  env.LD_LIBRARY_PATH = lib.makeLibraryPath (
+    with pkgs;
+    [
+      libGL
+      wayland
+      libxkbcommon
+      libxcb
+      libx11
+      libxcursor
+      libxrandr
+      libxi
+      libxext
+    ]
+  );
 
   enterShell = ''
-    echo "ghostwave devenv active"
+    echo "ghostwave dev shell active (rust $(rustc --version) / zig $(zig version))"
   '';
 }
