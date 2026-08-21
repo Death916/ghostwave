@@ -23,6 +23,12 @@ pub struct PreviewPane {
     /// Decoded image (for Image kind).
     image: Option<Texture2D>,
     img_size: Option<(u32, u32)>,
+    /// Image preview zoom factor (1.0 = fit).
+    pub zoom: f32,
+    /// Image preview pan offset X.
+    pub pan_x: f32,
+    /// Image preview pan offset Y.
+    pub pan_y: f32,
 }
 
 const MAX_TEXT: u64 = 4 * 1024 * 1024;
@@ -38,6 +44,9 @@ impl PreviewPane {
             error: None,
             image: None,
             img_size: None,
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
         };
         pane.load();
         pane
@@ -125,13 +134,14 @@ impl PreviewPane {
         draw_rectangle(rect.x, rect.y, rect.w, rect.h, color_u8!(theme.bg.0, theme.bg.1, theme.bg.2, 255));
 
         // Header: path
+        let kind_str = match self.kind {
+            PreviewKind::Text => "text".to_string(),
+            PreviewKind::Image => format!("image (zoom {:.0}%)", self.zoom * 100.0),
+            PreviewKind::Dir => "directory".to_string(),
+            PreviewKind::Binary => "binary".to_string(),
+        };
         draw_text_ex(
-            &format!("{} — {}", self.path.display(), match self.kind {
-                PreviewKind::Text => "text",
-                PreviewKind::Image => "image",
-                PreviewKind::Dir => "directory",
-                PreviewKind::Binary => "binary",
-            }),
+            &format!("{} — {}", self.path.display(), kind_str),
             rect.x + 8.0,
             rect.y + font_px as f32 + 4.0,
             TextParams { font: Some(font), font_size: font_px, color: color_u8!(theme.tab_inactive_text.0, theme.tab_inactive_text.1, theme.tab_inactive_text.2, 255), ..Default::default() },
@@ -148,15 +158,16 @@ impl PreviewPane {
         match self.kind {
             PreviewKind::Image => {
                 if let (Some(tex), Some((w, h))) = (&self.image, self.img_size) {
-                    let avail_w = rect.w - 16.0;
-                    let avail_h = rect.h - header_h - 8.0;
-                    let scale = (avail_w / w as f32).min(avail_h / h as f32).min(1.0);
+                    let avail_w = (rect.w - 16.0).max(1.0);
+                    let avail_h = (rect.h - header_h - 8.0).max(1.0);
+                    let base_scale = (avail_w / w as f32).min(avail_h / h as f32);
+                    let scale = base_scale * self.zoom;
                     let dw = w as f32 * scale;
                     let dh = h as f32 * scale;
                     draw_texture_ex(
                         tex,
-                        rect.x + 8.0 + (avail_w - dw) / 2.0,
-                        rect.y + header_h + (avail_h - dh) / 2.0,
+                        rect.x + 8.0 + (avail_w - dw) / 2.0 + self.pan_x,
+                        rect.y + header_h + (avail_h - dh) / 2.0 + self.pan_y,
                         WHITE,
                         DrawTextureParams { dest_size: Some(vec2(dw, dh)), ..Default::default() },
                     );
@@ -188,8 +199,84 @@ impl PreviewPane {
     pub fn scroll_lines(&mut self, delta: i32) {
         self.scroll = (self.scroll as i32 + delta).max(0) as usize;
     }
+
+    pub fn zoom_in(&mut self) {
+        self.zoom = (self.zoom * 1.25).min(10.0);
+    }
+
+    pub fn zoom_out(&mut self) {
+        self.zoom = (self.zoom / 1.25).max(0.1);
+    }
+
+    pub fn reset_zoom(&mut self) {
+        self.zoom = 1.0;
+        self.pan_x = 0.0;
+        self.pan_y = 0.0;
+    }
+
+    pub fn pan(&mut self, dx: f32, dy: f32) {
+        self.pan_x += dx;
+        self.pan_y += dy;
+    }
 }
 
 fn avail_h(rect: crate::layout::Rect, header_h: f32) -> f32 {
     (rect.h - header_h).max(1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_zoom_and_pan() {
+        let mut p = PreviewPane {
+            path: PathBuf::from("test.png"),
+            kind: PreviewKind::Image,
+            lines: Vec::new(),
+            scroll: 0,
+            error: None,
+            image: None,
+            img_size: Some((800, 600)),
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+        };
+
+        p.zoom_in();
+        assert!((p.zoom - 1.25).abs() < 1e-4);
+        p.zoom_out();
+        assert!((p.zoom - 1.0).abs() < 1e-4);
+
+        p.pan(50.0, -30.0);
+        assert_eq!(p.pan_x, 50.0);
+        assert_eq!(p.pan_y, -30.0);
+
+        p.reset_zoom();
+        assert_eq!(p.zoom, 1.0);
+        assert_eq!(p.pan_x, 0.0);
+        assert_eq!(p.pan_y, 0.0);
+    }
+
+    #[test]
+    fn preview_scroll_lines() {
+        let mut p = PreviewPane {
+            path: PathBuf::from("test.txt"),
+            kind: PreviewKind::Text,
+            lines: vec!["line 1".into(), "line 2".into()],
+            scroll: 0,
+            error: None,
+            image: None,
+            img_size: None,
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+        };
+        p.scroll_lines(5);
+        assert_eq!(p.scroll, 5);
+        p.scroll_lines(-3);
+        assert_eq!(p.scroll, 2);
+        p.scroll_lines(-10);
+        assert_eq!(p.scroll, 0, "scroll clamps to zero");
+    }
 }

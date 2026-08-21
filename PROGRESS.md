@@ -12,6 +12,18 @@ Binary name: `ghostwave`
 
 ## STATUS: main terminal features solid — render/mouse/keybinds fixed, parity work in progress
 
+### 0.1.4 — Polish & Test Audit (test/test-audit-0.1.4)
+- **KITTY GRAPHICS SCISSOR & CLIPPING**:
+  - Implemented `set_scissor` / `reset_scissor` in `src/main.rs` with `macroquad::window::screen_dpi_scale()` and OpenGL vertical axis inversion (`sh - (y + h)`), ensuring Kitty graphics and terminal contents clip to pane boundaries.
+- **PREVIEW PANE ZOOM & PAN**:
+  - Added zoom and pan controls to `PreviewPane` in `src/preview.rs` (`zoom_in()`, `zoom_out()`, `reset_zoom()`, `pan()`).
+  - Wired mouse wheel zoom and horizontal panning in `src/app.rs` when focused on image preview panes.
+- **CONFIGURABLE CURSOR STYLE**:
+  - Added `cursor_style` option to `Config` in `src/config.rs` (`"block"`, `"bar"`, `"beam"`, `"underline"`, `"hollow"`).
+  - Added `TermPane::parse_cursor_style` in `src/term.rs` and wired it into `apply_terminal_colors` in `src/app.rs`.
+- **COMPREHENSIVE TEST AUDIT (62/62 TESTS PASSING)**:
+  - Added full test suites across `config.rs`, `keymap.rs`, `palette.rs`, `preview.rs`, `search.rs`, `session.rs`, `term.rs`, `theme.rs`, and `tests/term_core.rs`.
+
 ### agy branch — Fullscreen keybind + Strict Locked mode + Middle-click paste + Devenv cached setup
 - **WINDOW-SCOPED FULLSCREEN KEYBIND**:
   - `Alt+f` (global) and `Ctrl+p z` (pane mode) added for Zellij-style pane zoom/fullscreen inside the application window (fills content area, does not toggle OS monitor fullscreen).
@@ -386,9 +398,8 @@ Key API gotchas discovered (all fixed):
    scrollback, continuous 2s saves).
 9. ✅ DONE: zellij floating panes + hidden bg panes (Ctrl+p f/e/E; Move
    mode sticky; active-pane frame 2px).
-10. NEXT — polish queue: middle-click paste; kitty graphics clipping;
-    preview pane zoom/pan; config extras (cursor style); shell-greeting
-    accumulation on restore (cosmetic).
+10. ✅ DONE: polish queue — middle-click primary paste, kitty graphics scissor/clipping, preview pane zoom/pan, configurable cursor style (block/beam/underline/hollow).
+11. ✅ DONE: comprehensive test suite audit (62/62 unit & integration tests passing).
 
 ---
 

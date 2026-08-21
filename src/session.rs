@@ -312,9 +312,18 @@ pub fn replay_pane_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SESS_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn unique_sess(prefix: &str) -> String {
+        let n = SESS_COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("{prefix}-{}-{}", std::process::id(), n)
+    }
 
     #[test]
     fn save_load_roundtrip() {
+        let name = unique_sess("test-sess-rt");
         let state = SessionState {
             tabs: vec![TabState {
                 name: "work".into(),
@@ -329,25 +338,77 @@ mod tests {
                 floating: vec![],
             }],
         };
-        save("test-sess", &state);
-        let loaded = load("test-sess").expect("session should reload");
+        save(&name, &state);
+        let loaded = load(&name).expect("session should reload");
         assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].name, "work");
         assert_eq!(loaded.tabs[0].panes[0].cwd.as_deref(), Some("/home/user"));
-        assert!(list_sessions().iter().any(|s| s == "test-sess"));
-        delete("test-sess");
-        assert!(!session_path("test-sess").exists());
+        assert_eq!(loaded.tabs[0].panes[0].log, "pane-test.log");
+        assert!(loaded.tabs[0].root.is_some(), "layout root should survive roundtrip");
+        assert!(list_sessions().iter().any(|s| s == &name), "saved session should appear in list");
+        // multi-tab roundtrip
+        let name2 = unique_sess("test-sess-multi");
+        let state2 = SessionState {
+            tabs: vec![
+                TabState { name: "a".into(), panes: vec![PaneState { program: Some("/bin/sh".into()), args: vec!["-c".into()], cwd: None, remote: None, log: "l1".into() }], root: None, floating: vec![] },
+                TabState { name: "b".into(), panes: vec![PaneState { program: None, args: vec![], cwd: None, remote: None, log: "l2".into() }], root: None, floating: vec![] },
+            ],
+        };
+        save(&name2, &state2);
+        let loaded2 = load(&name2).unwrap();
+        assert_eq!(loaded2.tabs.len(), 2);
+        assert_eq!(loaded2.tabs[1].name, "b");
+        delete(&name);
+        delete(&name2);
+        assert!(!session_path(&name).exists(), "deleted session file should be gone");
+        assert!(!session_path(&name2).exists());
     }
 
     #[test]
     fn truncate_keeps_tail() {
         let dir = dir();
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("trunc-test.log");
+        let path = dir.join(format!("trunc-test-{}-{}.log", std::process::id(), SESS_COUNTER.fetch_add(1, Ordering::SeqCst)));
         let big = vec![b'x'; 100_000];
         std::fs::write(&path, &big).unwrap();
         let tail = truncate_log_front(&path, 10_000);
         assert_eq!(tail.len(), 10_000);
+        assert!(tail.iter().all(|&b| b == b'x'), "tail should be all x's");
         assert!(std::fs::metadata(&path).unwrap().len() <= 10_000);
+        assert_eq!(std::fs::read(&path).unwrap(), tail, "file should now equal the returned tail");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn truncate_under_cap_is_noop() {
+        let dir = dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("trunc-noop-{}-{}.log", std::process::id(), SESS_COUNTER.fetch_add(1, Ordering::SeqCst)));
+        let small = b"hello".to_vec();
+        std::fs::write(&path, &small).unwrap();
+        let tail = truncate_log_front(&path, 10_000);
+        assert!(tail.is_empty(), "under-cap should return empty (no truncation needed)");
+        assert_eq!(std::fs::read(&path).unwrap(), small, "file should be untouched");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn session_path_sanitizes() {
+        // Slashes and dots become underscores, so path traversal is blocked
+        let p2 = session_path("a/b");
+        assert!(p2.file_name().unwrap().to_string_lossy().contains("a_b"), "slash should become underscore, got {:?}", p2);
+        assert!(p2.to_string_lossy().ends_with(".json"));
+        let p3 = session_path("../../etc/passwd");
+        let fname = p3.file_name().unwrap().to_string_lossy();
+        assert!(!fname.contains('/'), "filename should not contain slash, got {fname:?}");
+        assert!(!fname.contains(".."), "filename should not contain .. traversal");
+        // stays under sessions_dir
+        assert!(p3.starts_with(sessions_dir()), "sanitized path should stay under sessions dir, got {p3:?}");
+    }
+
+    #[test]
+    fn load_missing_returns_none() {
+        let name = unique_sess("does-not-exist-zzz");
+        assert!(load(&name).is_none(), "missing session should be None");
     }
 }

@@ -1589,11 +1589,13 @@ impl App {
     pub fn apply_terminal_colors(&mut self) {
         use libghostty_vt::style::RgbColor;
         let (fg, bg) = (self.theme.fg, self.theme.bg);
+        let cursor_style = self.config.cursor_style.as_deref().and_then(TermPane::parse_cursor_style);
         for tab in self.tabs.iter_mut() {
             for pane in tab.panes.iter_mut() {
                 if let Pane::Term(t) = pane {
                     let _ = t.term.set_default_fg_color(Some(RgbColor { r: fg.0, g: fg.1, b: fg.2 }));
                     let _ = t.term.set_default_bg_color(Some(RgbColor { r: bg.0, g: bg.1, b: bg.2 }));
+                    t.cursor_style = cursor_style;
                 }
             }
         }
@@ -2504,9 +2506,20 @@ impl App {
         let Some(Pane::Term(t)) = tab.panes.get_mut(pane_id) else {
             // Preview/AI panes: wheel scrolls.
             if let Some(Pane::Preview(p)) = tab.panes.get_mut(pane_id) {
-                let (_, wy) = mouse_wheel();
+                let (wx, wy) = mouse_wheel();
                 if wy != 0.0 {
-                    p.scroll_lines(if wy > 0.0 { -3 } else { 3 });
+                    if p.kind == crate::preview::PreviewKind::Image {
+                        if wy > 0.0 {
+                            p.zoom_in();
+                        } else {
+                            p.zoom_out();
+                        }
+                    } else {
+                        p.scroll_lines(if wy > 0.0 { -3 } else { 3 });
+                    }
+                }
+                if wx != 0.0 && p.kind == crate::preview::PreviewKind::Image {
+                    p.pan(wx * 10.0, 0.0);
                 }
             } else if let Some(Pane::Ai(p)) = tab.panes.get_mut(pane_id) {
                 let (_, wy) = mouse_wheel();

@@ -132,6 +132,8 @@ pub struct TermPane {
     log_cap: u64,
     /// Bytes written to the log since the last truncation.
     log_bytes: u64,
+    /// Optional cursor visual style override (from config).
+    pub cursor_style: Option<libghostty_vt::render::CursorVisualStyle>,
 }
 
 impl TermPane {
@@ -314,6 +316,7 @@ impl TermPane {
             log_file: Some(log_file),
             log_cap: log_cap_bytes.max(1024),
             log_bytes: 0,
+            cursor_style: None,
         })
         .map(|mut pane| {
             if spawn {
@@ -321,6 +324,17 @@ impl TermPane {
             }
             pane
         })
+    }
+
+    /// Parse a cursor style name string to `CursorVisualStyle`.
+    pub fn parse_cursor_style(s: &str) -> Option<libghostty_vt::render::CursorVisualStyle> {
+        match s.to_lowercase().trim() {
+            "block" => Some(libghostty_vt::render::CursorVisualStyle::Block),
+            "bar" | "beam" => Some(libghostty_vt::render::CursorVisualStyle::Bar),
+            "underline" => Some(libghostty_vt::render::CursorVisualStyle::Underline),
+            "hollow" | "block_hollow" => Some(libghostty_vt::render::CursorVisualStyle::BlockHollow),
+            _ => None,
+        }
     }
 
     /// Drain the child's initial output burst right away. Shells (fish 4+)
@@ -891,7 +905,10 @@ impl TermPane {
             {
                 let draw_cursor = self.blink_on || !snapshot.cursor_blinking()?;
                 let cursor_color = colors.cursor.unwrap_or(colors.foreground);
-                let style = snapshot.cursor_visual_style()?;
+                let style = match self.cursor_style {
+                    Some(s) => s,
+                    None => snapshot.cursor_visual_style()?,
+                };
                 let (cx, cy) = (
                     ox + padding + vp.x as f32 * cell.w as f32,
                     oy + padding + vp.y as f32 * cell.h as f32,
@@ -1274,7 +1291,8 @@ mod tests {
     use super::*;
 
     /// Does the terminal core generate responses for the standard startup
-    /// probes at all? (Isolates response generation from the pty path.)
+    /// probes? Checks each probe type individually so a single response
+    /// can't mask a missing handler.
     #[test]
     fn terminal_responds_to_probes() {
         let mut term =
@@ -1305,15 +1323,40 @@ mod tests {
             })
         })
         .unwrap();
-        // Set a bg color first (OSC 11 queries only get answered once a
-        // color has been set — base16 does this at startup), then fire the
-        // standard fish-4 startup probes: kitty query, XTVERSION (CSI > q),
-        // DA query, OSC 11 query.
+
+        // Prime bg color: OSC 11 queries only get answered once a color has been set.
         let _ = term.vt_write(b"\x1b]11;rgb:1b/1e/28\x1b\\");
-        let _ = term.vt_write(b"\x1b[?u\x1b[>q\x1b[c\x1b]11;?\x1b\\");
-        let got = resp.lock().unwrap().clone();
-        eprintln!("RESP {:?}", String::from_utf8_lossy(&got));
-        assert!(got.len() > 0, "terminal generated no responses");
+
+        // Fire each probe separately and assert its response shape, so we
+        // verify the *right* handler fired, not just \"something happened\".
+        // Kitty keyboard protocol query -> CSI ? <flags> u
+        resp.lock().unwrap().clear();
+        let _ = term.vt_write(b"\x1b[?u");
+        assert!(!resp.lock().unwrap().is_empty(), "kitty query should get a response");
+
+        // XTVERSION (CSI > q) -> DCS > |ghostwave ST
+        resp.lock().unwrap().clear();
+        let _ = term.vt_write(b"\x1b[>q");
+        let got = String::from_utf8_lossy(&resp.lock().unwrap().clone()).into_owned();
+        assert!(got.contains("ghostwave"), "XTVERSION should contain ghostwave, got {got:?}");
+
+        // Device Attributes query (CSI c) -> CSI ? 62 ; ... c
+        resp.lock().unwrap().clear();
+        let _ = term.vt_write(b"\x1b[c");
+        let got = String::from_utf8_lossy(&resp.lock().unwrap().clone()).into_owned();
+        assert!(got.contains("\x1b["), "DA query should produce CSI response, got {got:?}");
+
+        // OSC 11 query (after bg set) -> OSC 11;rgb:... ST
+        resp.lock().unwrap().clear();
+        let _ = term.vt_write(b"\x1b]11;?\x1b\\");
+        assert!(!resp.lock().unwrap().is_empty(), "OSC 11 query should get a response after bg set");
+
+        // Bulk: all four at once still produces all responses
+        resp.lock().unwrap().clear();
+        let _ = term.vt_write(
+            b"\x1b]11;rgb:1b/1e/28\x1b\\\x1b[?u\x1b[>q\x1b[c\x1b]11;?\x1b\\",
+        );
+        assert!(!resp.lock().unwrap().is_empty(), "bulk probes should produce responses");
     }
 
     /// The prime drain must process the child's EARLY output synchronously
@@ -1344,5 +1387,17 @@ mod tests {
             title.contains("PRIME-TEST"),
             "prime drain missed early child output (title={title:?})"
         );
+    }
+
+    #[test]
+    fn parse_cursor_style_variants() {
+        use libghostty_vt::render::CursorVisualStyle;
+        assert_eq!(TermPane::parse_cursor_style("block"), Some(CursorVisualStyle::Block));
+        assert_eq!(TermPane::parse_cursor_style("BAR"), Some(CursorVisualStyle::Bar));
+        assert_eq!(TermPane::parse_cursor_style("beam"), Some(CursorVisualStyle::Bar));
+        assert_eq!(TermPane::parse_cursor_style("underline"), Some(CursorVisualStyle::Underline));
+        assert_eq!(TermPane::parse_cursor_style("hollow"), Some(CursorVisualStyle::BlockHollow));
+        assert_eq!(TermPane::parse_cursor_style("block_hollow"), Some(CursorVisualStyle::BlockHollow));
+        assert_eq!(TermPane::parse_cursor_style("unknown"), None);
     }
 }

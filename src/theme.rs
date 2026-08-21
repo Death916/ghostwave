@@ -113,3 +113,44 @@ pub fn by_name_opt(name: &str) -> Option<Theme> {
 pub fn names() -> Vec<&'static str> {
     THEMES.iter().map(|t| t.name).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn by_name_known_and_unknown() {
+        assert_eq!(by_name("tokyonight").name, "tokyonight");
+        assert_eq!(by_name("dracula").name, "dracula");
+        // unknown falls back to first theme — and we verify it's the actual first element, not a copy
+        let fallback = by_name("not-a-theme");
+        assert_eq!(fallback.name, THEMES[0].name);
+        assert_eq!(fallback.bg, THEMES[0].bg, "fallback should be THEMES[0] exactly");
+    }
+
+    #[test]
+    fn by_name_opt_none_for_unknown() {
+        assert!(by_name_opt("tokyonight").is_some());
+        assert!(by_name_opt("nope").is_none());
+    }
+
+    #[test]
+    fn names_matches_themes_len() {
+        let n = names();
+        assert_eq!(n.len(), THEMES.len());
+        assert!(n.contains(&"tokyonight"));
+        assert!(n.contains(&"gruvbox"));
+        // all names unique
+        let mut dedup = n.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(dedup.len(), n.len());
+    }
+
+    #[test]
+    fn rgb_hex_splits_correctly() {
+        assert_eq!(Rgb::hex(0x1a2b3c), Rgb(0x1a, 0x2b, 0x3c));
+        assert_eq!(Rgb::hex(0xffffff), Rgb(255, 255, 255));
+        assert_eq!(Rgb::hex(0x000000), Rgb(0, 0, 0));
+    }
+}

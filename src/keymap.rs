@@ -671,3 +671,123 @@ pub fn unshifted_codepoint(key: Key) -> char {
         _ => '\0',
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libghostty_vt::key::{Key, Mods};
+
+    fn kp(key: Key, mods: Mods) -> KeyPress { KeyPress { key, mods, text: None } }
+    fn kp_char(key: Key, mods: Mods, c: char) -> KeyPress { KeyPress { key, mods, text: Some(c) } }
+    fn ctrl_mod() -> Mods { Mods::CTRL }
+    fn no_mod() -> Mods { Mods::empty() }
+
+    #[test]
+    fn locked_passes_and_only_ctrl_g_exits() {
+        assert!(matches!(handle(Mode::Locked, &kp(Key::A, no_mod())), Dispatch::Pass));
+        assert!(matches!(handle(Mode::Locked, &kp(Key::Enter, no_mod())), Dispatch::Pass));
+        assert!(matches!(handle(Mode::Locked, &kp(Key::G, ctrl_mod())), Dispatch::Action(Action::Unlock)));
+        // Ctrl+Shift+G is not unlock
+        assert!(matches!(handle(Mode::Locked, &kp(Key::G, Mods::CTRL | Mods::SHIFT)), Dispatch::Pass));
+    }
+
+    #[test]
+    fn normal_unbound_passes_to_terminal() {
+        assert!(matches!(handle(Mode::Normal, &kp(Key::A, no_mod())), Dispatch::Pass));
+        assert!(matches!(handle(Mode::Normal, &kp(Key::Enter, no_mod())), Dispatch::Pass));
+    }
+
+    #[test]
+    fn esc_exits_modal_but_not_locked_or_normal() {
+        assert!(matches!(handle(Mode::Pane, &kp(Key::Escape, no_mod())), Dispatch::Action(Action::ExitMode)));
+        assert!(matches!(handle(Mode::Tab, &kp(Key::Escape, no_mod())), Dispatch::Action(Action::ExitMode)));
+        assert!(matches!(handle(Mode::Locked, &kp(Key::Escape, no_mod())), Dispatch::Pass), "Esc in Locked should pass, not exit");
+        assert!(!matches!(handle(Mode::Normal, &kp(Key::Escape, no_mod())), Dispatch::Action(Action::ExitMode)));
+    }
+
+    #[test]
+    fn is_quit_only_ctrl_q() {
+        assert!(is_quit(Key::Q, Mods::CTRL));
+        assert!(!is_quit(Key::Q, Mods::empty()));
+        assert!(!is_quit(Key::Q, Mods::CTRL | Mods::SHIFT));
+        assert!(!is_quit(Key::W, Mods::CTRL));
+    }
+
+    #[test]
+    fn entry_binds_for_all_modes() {
+        assert_eq!(entry_bind(Key::P, Mods::CTRL), Some(Mode::Pane));
+        assert_eq!(entry_bind(Key::T, Mods::CTRL), Some(Mode::Tab));
+        assert_eq!(entry_bind(Key::N, Mods::CTRL), Some(Mode::Resize));
+        assert_eq!(entry_bind(Key::S, Mods::CTRL), Some(Mode::Scroll));
+        assert_eq!(entry_bind(Key::O, Mods::CTRL), Some(Mode::Session));
+        assert_eq!(entry_bind(Key::H, Mods::CTRL), Some(Mode::Move));
+        assert_eq!(entry_bind(Key::G, Mods::CTRL), Some(Mode::Locked));
+        assert_eq!(entry_bind(Key::A, Mods::CTRL), None);
+        assert_eq!(entry_bind(Key::P, Mods::empty()), None);
+    }
+
+    #[test]
+    fn global_binds_ctrl_shift_p_is_command_bar() {
+        assert!(matches!(global_binds(Key::P, Mods::CTRL | Mods::SHIFT), Some(Action::OpenCommandBar)));
+        assert!(matches!(global_binds(Key::C, Mods::CTRL | Mods::SHIFT), Some(Action::Copy)));
+        assert!(matches!(global_binds(Key::V, Mods::CTRL | Mods::SHIFT), Some(Action::Paste)));
+        assert_eq!(global_binds(Key::A, Mods::empty()), None);
+    }
+
+    #[test]
+    fn pane_binds_basic() {
+        assert!(matches!(handle(Mode::Pane, &kp(Key::N, no_mod())), Dispatch::Action(Action::NewPane)));
+        assert!(matches!(handle(Mode::Pane, &kp(Key::X, no_mod())), Dispatch::Action(Action::ClosePane)));
+        assert!(matches!(handle(Mode::Pane, &kp(Key::H, no_mod())), Dispatch::Action(Action::MoveFocus(Dir::Left))));
+        // unbound in pane mode is Ignore, not Pass
+        assert!(matches!(handle(Mode::Pane, &kp(Key::A, no_mod())), Dispatch::Ignore));
+    }
+
+    #[test]
+    fn tab_binds_goto_and_new() {
+        assert!(matches!(handle(Mode::Tab, &kp(Key::N, no_mod())), Dispatch::Action(Action::NewTab)));
+        assert!(matches!(handle(Mode::Tab, &kp(Key::Digit1, no_mod())), Dispatch::Action(Action::GoToTab(1))));
+        assert!(matches!(handle(Mode::Tab, &kp(Key::Digit9, no_mod())), Dispatch::Action(Action::GoToTab(9))));
+    }
+
+    #[test]
+    fn rename_modes_capture_text_and_confirm() {
+        assert!(matches!(handle(Mode::RenameTab, &kp_char(Key::A, no_mod(), 'a')), Dispatch::Char('a')));
+        assert!(matches!(handle(Mode::RenameTab, &kp(Key::Enter, no_mod())), Dispatch::Action(Action::ConfirmRename)));
+        assert!(matches!(handle(Mode::RenameTab, &kp(Key::Escape, no_mod())), Dispatch::Action(Action::ExitMode)));
+        assert!(matches!(handle(Mode::RenameTab, &kp(Key::Backspace, no_mod())), Dispatch::Action(Action::Toast(_))));
+        // non-char, non-special is Ignore
+        assert!(matches!(handle(Mode::RenameTab, &kp(Key::F1, no_mod())), Dispatch::Ignore));
+    }
+
+    #[test]
+    fn enter_search_captures_and_confirms() {
+        assert!(matches!(handle(Mode::EnterSearch, &kp_char(Key::A, no_mod(), 'x')), Dispatch::Char('x')));
+        assert!(matches!(handle(Mode::EnterSearch, &kp(Key::Enter, no_mod())), Dispatch::Action(Action::ConfirmSearch)));
+        assert!(matches!(handle(Mode::EnterSearch, &kp(Key::Escape, no_mod())), Dispatch::Action(Action::ExitMode)));
+    }
+
+    #[test]
+    fn session_binds() {
+        assert!(matches!(handle(Mode::Session, &kp(Key::W, no_mod())), Dispatch::Action(Action::SessionManager)));
+        assert!(matches!(handle(Mode::Session, &kp(Key::D, no_mod())), Dispatch::Action(Action::Detach)));
+        assert!(matches!(handle(Mode::Session, &kp(Key::A, no_mod())), Dispatch::Ignore));
+    }
+
+    #[test]
+    fn unshifted_codepoint_letters_and_digits() {
+        assert_eq!(unshifted_codepoint(Key::A), 'a');
+        assert_eq!(unshifted_codepoint(Key::Z), 'z');
+        assert_eq!(unshifted_codepoint(Key::Digit0), '0');
+        assert_eq!(unshifted_codepoint(Key::Minus), '-');
+        assert_eq!(unshifted_codepoint(Key::F1), '\0');
+    }
+
+    #[test]
+    fn mode_labels_non_empty() {
+        for m in [Mode::Normal, Mode::Pane, Mode::Tab, Mode::Resize, Mode::Scroll, Mode::Search, Mode::EnterSearch, Mode::Move, Mode::Session, Mode::Locked, Mode::RenameTab] {
+            assert!(!m.label().is_empty());
+            assert!(!m.hints().is_empty());
+        }
+    }
+}
