@@ -212,6 +212,13 @@ pub enum Child {
 }
 
 impl Child {
+    pub fn pid(&self) -> Option<Pid> {
+        match *self {
+            Child::Active(pid) | Child::Exited(pid) => Some(pid),
+            Child::Reaped(_) => None,
+        }
+    }
+
     /// WNOHANG reap; transitions Exited -> Reaped. Returns the child's exit
     /// code (128+signal for signal deaths) once it has actually exited.
     /// Call each frame.
