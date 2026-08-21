@@ -132,6 +132,8 @@ pub struct TermPane {
     log_cap: u64,
     /// Bytes written to the log since the last truncation.
     log_bytes: u64,
+    /// Optional cursor visual style override (from config).
+    pub cursor_style: Option<libghostty_vt::render::CursorVisualStyle>,
 }
 
 impl TermPane {
@@ -314,7 +316,53 @@ impl TermPane {
             log_file: Some(log_file),
             log_cap: log_cap_bytes.max(1024),
             log_bytes: 0,
+            cursor_style: None,
         })
+        .map(|mut pane| {
+            if spawn {
+                pane.prime_pty();
+            }
+            pane
+        })
+    }
+
+    /// Parse a cursor style name string to `CursorVisualStyle`.
+    pub fn parse_cursor_style(s: &str) -> Option<libghostty_vt::render::CursorVisualStyle> {
+        match s.to_lowercase().trim() {
+            "block" => Some(libghostty_vt::render::CursorVisualStyle::Block),
+            "bar" | "beam" => Some(libghostty_vt::render::CursorVisualStyle::Bar),
+            "underline" => Some(libghostty_vt::render::CursorVisualStyle::Underline),
+            "hollow" | "block_hollow" => Some(libghostty_vt::render::CursorVisualStyle::BlockHollow),
+            _ => None,
+        }
+    }
+
+    /// Drain the child's initial output burst right away. Shells (fish 4+)
+    /// probe the terminal at startup — kitty keyboard protocol, DA,
+    /// XTVERSION, OSC 11 — and read the responses with a short timeout. If
+    /// the app doesn't drain promptly (session-log replay at restore, slow
+    /// first frames), the responses land AFTER the shell's read window and
+    /// the line editor echoes them as caret-escaped garbage
+    /// (`^[[?0u^[P>|ghostwave^[\…`). Draining synchronously right after
+    /// spawn keeps the queries' responses inside the shell's timeout.
+    fn prime_pty(&mut self) {
+        let start = std::time::Instant::now();
+        let mut idle = std::time::Duration::ZERO;
+        // Cap ~250ms: a shell's startup burst (config + terminal probes)
+        // can take a while, but we must not block pane creation forever.
+        while start.elapsed() < std::time::Duration::from_millis(250) {
+            let active = self.poll_pty();
+            self.flush_response();
+            if active {
+                idle = std::time::Duration::ZERO;
+            } else {
+                idle += std::time::Duration::from_millis(2);
+                if idle > std::time::Duration::from_millis(60) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
     }
 
     pub fn title(&self) -> String {
@@ -407,38 +455,47 @@ impl TermPane {
         }
     }
 
-    /// Re-spawn the child (reconnect). Reuses the stored program/args; the
-    /// terminal state and log are untouched so history survives.
-    pub fn respawn(&mut self) -> bool {
-        let Some(program) = self.program.clone() else {
-            return false;
-        };
-        let args: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
+    /// Start the child process (or restart it). program=None → $SHELL.
+    /// Resets the exited/reconnect state. No priming (reconnect must not
+    /// block the main loop).
+    fn start_child(&mut self) -> crate::Result<()> {
         let size = WinSize {
             cols: self.cols,
             rows: self.rows,
             xpixel: 0,
             ypixel: 0,
         };
-        match Pty::new(size, Some(&program), &args, self.cwd.as_deref()) {
-            Ok((pty, child)) => {
-                self.pty = Some(pty);
-                self.child = Some(child);
-                if let Some(p) = self.pty.as_ref() {
-                    let old = std::mem::replace(&mut *self.shared.effect_fd.lock().unwrap(), -1);
-                    if old >= 0 {
-                        unsafe { nix::libc::close(old) };
-                    }
-                    *self.shared.effect_fd.lock().unwrap() = p.dup_raw().unwrap_or(-1);
-                }
-                self.exited = None;
-                self.last_exit_code = None;
-                self.reconnect = ReconnectState::Idle;
-                self.force_repaint = true;
-                true
+        let args: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
+        let (pty, child) = Pty::new(size, self.program.as_deref(), &args, self.cwd.as_deref())?;
+        self.pty = Some(pty);
+        self.child = Some(child);
+        if let Some(p) = self.pty.as_ref() {
+            let old = std::mem::replace(&mut *self.shared.effect_fd.lock().unwrap(), -1);
+            if old >= 0 {
+                unsafe { nix::libc::close(old) };
             }
-            Err(_) => false,
+            *self.shared.effect_fd.lock().unwrap() = p.dup_raw().unwrap_or(-1);
         }
+        self.exited = None;
+        self.last_exit_code = None;
+        self.reconnect = ReconnectState::Idle;
+        self.force_repaint = true;
+        Ok(())
+    }
+
+    /// Like start_child, then prime the pty so the shell's startup terminal
+    /// probes get answered inside its read timeout. Used by the session
+    /// restore path (terminal + history replay FIRST, shell second).
+    pub fn spawn_child(&mut self) -> crate::Result<()> {
+        self.start_child()?;
+        self.prime_pty();
+        Ok(())
+    }
+
+    /// Re-spawn the child (reconnect). Reuses the stored program/args; the
+    /// terminal state and log are untouched so history survives.
+    pub fn respawn(&mut self) -> bool {
+        self.start_child().is_ok()
     }
 
     /// Seed the session log with replayed history (durable restore) so the
@@ -647,6 +704,16 @@ impl TermPane {
         }
     }
 
+    pub fn paste_primary(&mut self) {
+        if let Some(text) = clipboard::read_primary_text().or_else(clipboard::read_text) {
+            self.write_input(text.as_bytes());
+        }
+    }
+
+    pub fn is_mouse_tracking(&self) -> bool {
+        self.term.is_mouse_tracking().unwrap_or(false)
+    }
+
     // ---- rendering -------------------------------------------------------
 
     /// Render this pane into `rect` (window-logical coords, but drawing is in
@@ -838,7 +905,10 @@ impl TermPane {
             {
                 let draw_cursor = self.blink_on || !snapshot.cursor_blinking()?;
                 let cursor_color = colors.cursor.unwrap_or(colors.foreground);
-                let style = snapshot.cursor_visual_style()?;
+                let style = match self.cursor_style {
+                    Some(s) => s,
+                    None => snapshot.cursor_visual_style()?,
+                };
                 let (cx, cy) = (
                     ox + padding + vp.x as f32 * cell.w as f32,
                     oy + padding + vp.y as f32 * cell.h as f32,
@@ -1213,5 +1283,121 @@ impl graphics::DecodePng for PngDecoder {
             height: info.height,
             data: bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Does the terminal core generate responses for the standard startup
+    /// probes? Checks each probe type individually so a single response
+    /// can't mask a missing handler.
+    #[test]
+    fn terminal_responds_to_probes() {
+        let mut term =
+            Terminal::new(TerminalOptions { cols: 80, rows: 24, max_scrollback: 100 }).unwrap();
+        let resp: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let r = resp.clone();
+        term.on_pty_write(move |_t, data| {
+            r.lock().unwrap().extend_from_slice(data);
+        })
+        .unwrap();
+        term.on_xtversion(|_t| Some("ghostwave")).unwrap();
+        term.on_device_attributes(|_t| {
+            Some(DeviceAttributes {
+                primary: PrimaryDeviceAttributes::new(
+                    ConformanceLevel::VT220,
+                    &[
+                        DeviceAttributeFeature::COLUMNS_132,
+                        DeviceAttributeFeature::SELECTIVE_ERASE,
+                        DeviceAttributeFeature::ANSI_COLOR,
+                    ],
+                ),
+                secondary: SecondaryDeviceAttributes {
+                    device_type: DeviceType::VT220,
+                    firmware_version: 1,
+                    rom_cartridge: 0,
+                },
+                tertiary: Default::default(),
+            })
+        })
+        .unwrap();
+
+        // Prime bg color: OSC 11 queries only get answered once a color has been set.
+        let _ = term.vt_write(b"\x1b]11;rgb:1b/1e/28\x1b\\");
+
+        // Fire each probe separately and assert its response shape, so we
+        // verify the *right* handler fired, not just \"something happened\".
+        // Kitty keyboard protocol query -> CSI ? <flags> u
+        resp.lock().unwrap().clear();
+        let _ = term.vt_write(b"\x1b[?u");
+        assert!(!resp.lock().unwrap().is_empty(), "kitty query should get a response");
+
+        // XTVERSION (CSI > q) -> DCS > |ghostwave ST
+        resp.lock().unwrap().clear();
+        let _ = term.vt_write(b"\x1b[>q");
+        let got = String::from_utf8_lossy(&resp.lock().unwrap().clone()).into_owned();
+        assert!(got.contains("ghostwave"), "XTVERSION should contain ghostwave, got {got:?}");
+
+        // Device Attributes query (CSI c) -> CSI ? 62 ; ... c
+        resp.lock().unwrap().clear();
+        let _ = term.vt_write(b"\x1b[c");
+        let got = String::from_utf8_lossy(&resp.lock().unwrap().clone()).into_owned();
+        assert!(got.contains("\x1b["), "DA query should produce CSI response, got {got:?}");
+
+        // OSC 11 query (after bg set) -> OSC 11;rgb:... ST
+        resp.lock().unwrap().clear();
+        let _ = term.vt_write(b"\x1b]11;?\x1b\\");
+        assert!(!resp.lock().unwrap().is_empty(), "OSC 11 query should get a response after bg set");
+
+        // Bulk: all four at once still produces all responses
+        resp.lock().unwrap().clear();
+        let _ = term.vt_write(
+            b"\x1b]11;rgb:1b/1e/28\x1b\\\x1b[?u\x1b[>q\x1b[c\x1b]11;?\x1b\\",
+        );
+        assert!(!resp.lock().unwrap().is_empty(), "bulk probes should produce responses");
+    }
+
+    /// The prime drain must process the child's EARLY output synchronously
+    /// during construction — this is what answers fish 4's startup terminal
+    /// probes inside its read timeout. Probe with an OSC 0 title (a side
+    /// effect we can read back via on_title_changed): the child prints it
+    /// immediately, and if priming works the pane's title reflects it by
+    /// the time the constructor returns.
+    #[test]
+    fn prime_drains_early_child_output() {
+        let cell = CellDims { w: 10, h: 26, baseline: 20.0 };
+        let pane = TermPane::new(
+            80,
+            24,
+            cell,
+            Some("/bin/sh"),
+            &["-c", "printf '\\033]0;PRIME-TEST\\033\\\\'; sleep 2"],
+            None,
+            1000,
+            1024 * 1024,
+            true,
+            None,
+        )
+        .expect("pane with early-output child");
+        let title = pane.title();
+        drop(pane);
+        assert!(
+            title.contains("PRIME-TEST"),
+            "prime drain missed early child output (title={title:?})"
+        );
+    }
+
+    #[test]
+    fn parse_cursor_style_variants() {
+        use libghostty_vt::render::CursorVisualStyle;
+        assert_eq!(TermPane::parse_cursor_style("block"), Some(CursorVisualStyle::Block));
+        assert_eq!(TermPane::parse_cursor_style("BAR"), Some(CursorVisualStyle::Bar));
+        assert_eq!(TermPane::parse_cursor_style("beam"), Some(CursorVisualStyle::Bar));
+        assert_eq!(TermPane::parse_cursor_style("underline"), Some(CursorVisualStyle::Underline));
+        assert_eq!(TermPane::parse_cursor_style("hollow"), Some(CursorVisualStyle::BlockHollow));
+        assert_eq!(TermPane::parse_cursor_style("block_hollow"), Some(CursorVisualStyle::BlockHollow));
+        assert_eq!(TermPane::parse_cursor_style("unknown"), None);
     }
 }

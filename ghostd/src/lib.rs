@@ -9,7 +9,7 @@
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::Read,
+    io::{Read, Write},
     os::{
         fd::{AsRawFd, IntoRawFd},
         unix::net::{UnixListener, UnixStream},
@@ -37,6 +37,97 @@ pub const ATTACH_RETRY_SECS: u64 = 5;
 
 /// Set when SIGTERM arrives (ghostd kill); the accept loop cleans up.
 pub static TERM_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Debug trace: eprintln + append to ~/.local/share/ghostwave/debug.log when
+/// GHOSTD_DEBUG is set. The daemon's stderr is /dev/null after daemonize, so
+/// the file is the only channel there; attach/new run over ssh -t so eprintln
+/// also lands in the pane.
+pub fn gdbg(tag: &str, msg: &str) {
+    if std::env::var_os("GHOSTD_DEBUG").is_none() {
+        return;
+    }
+    eprintln!("[ghostd:{tag}] {msg}");
+    if let Ok(home) = std::env::var("HOME") {
+        let p = PathBuf::from(home).join(".local/share/ghostwave/debug.log");
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .map(|mut f| {
+                let _ = writeln!(f, "[{tag}] {msg}");
+            });
+    }
+}
+
+/// Outcome of probing an existing session's daemon before `new`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Probe {
+    /// No reachable daemon (stale socket) — safe to rebind.
+    NoSession,
+    /// A live daemon answered the SIZE handshake — session is in use.
+    Healthy,
+    /// A daemon accepted the connection but never answered — wedged.
+    Unresponsive,
+}
+
+/// Ask an existing session's daemon whether it is alive: send the SIZE
+/// handshake and wait (bounded) for the daemon's "OK\n" ack. Daemons
+/// before the ack protocol replay the log instead; any byte counts as
+/// healthy. Unresponsive = accepted but silent (stuck daemon / dead
+/// client-handler) — the caller kills it and rebinds.
+pub fn probe_session(name: &str) -> Probe {
+    let sock = socket_path(name);
+    let Ok(mut s) = UnixStream::connect(&sock) else {
+        return Probe::NoSession; // stale socket
+    };
+    let _ = s.write_all(b"SIZE 100 30\n");
+    let _ = set_nonblock(s.as_raw_fd());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut buf = [0u8; 64];
+    loop {
+        if Instant::now() >= deadline {
+            gdbg("probe", &format!("{name}: no response in 2s -> Unresponsive"));
+            return Probe::Unresponsive;
+        }
+        match fd_poll(&mut [(s.as_raw_fd(), true)], 200) {
+            Ok(r) if !r.is_empty() => match fd_read(s.as_raw_fd(), &mut buf) {
+                Ok(0) => return Probe::NoSession,
+                Ok(n) => {
+                    if n > 0 {
+                        return Probe::Healthy;
+                    }
+                }
+                Err(Errno::EAGAIN) => {}
+                Err(_) => return Probe::NoSession,
+            },
+            _ => {}
+        }
+    }
+}
+
+/// Terminate a wedged daemon (SIGTERM, then SIGKILL after a 1s grace) and
+/// drop its state files so `new` can rebind the session fresh.
+pub fn recover_session(name: &str) {
+    let pid_file = pid_path(name);
+    if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            gdbg("recover", &format!("{name}: SIGTERM daemon {pid}"));
+            let _ = signal::kill(Pid::from_raw(pid), Signal::SIGTERM);
+            for _ in 0..10 {
+                if !pid_alive(Pid::from_raw(pid)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if pid_alive(Pid::from_raw(pid)) {
+                gdbg("recover", &format!("{name}: daemon {pid} stuck, SIGKILL"));
+                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+        }
+    }
+    let _ = fs::remove_file(socket_path(name));
+    let _ = fs::remove_file(pid_file);
+}
 
 pub fn die(msg: &str) -> ! {
     eprintln!("ghostd: {msg}");
@@ -140,12 +231,34 @@ pub fn pid_alive(pid: Pid) -> bool {
     signal::kill(pid, None).is_ok()
 }
 
+/// Kill the pty child and its whole process group (the child is a session
+/// leader, so pgid == pid): SIGTERM, escalate to SIGKILL after `grace`.
+/// Safe to call on a dead pid — errors are ignored. Used by the daemon's
+/// own cleanup AND by `ghostd kill` so a wedged daemon can't orphan the
+/// session's program.
+pub fn kill_child_group(child: Pid, grace: Duration) {
+    let group = Pid::from_raw(-child.as_raw());
+    let _ = signal::kill(group, Signal::SIGTERM);
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if !pid_alive(child) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if pid_alive(child) {
+        gdbg("kill", &format!("child {} stuck, SIGKILL group", child.as_raw()));
+        let _ = signal::kill(group, Signal::SIGKILL);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // daemon plumbing
 
 /// Spawn the pty child (the session's program). Returns the non-blocking
-/// master fd.
-pub fn spawn_child(cmd: &[String]) -> i32 {
+/// master fd and the child's pid (== its process group: forkpty makes the
+/// child a session leader, so a negative-pid kill reaches its whole group).
+pub fn spawn_child(cmd: &[String]) -> (i32, Pid) {
     let (shell, args): (PathBuf, Vec<String>) = if !cmd.is_empty() {
         (PathBuf::from(&cmd[0]), cmd[1..].to_vec())
     } else {
@@ -168,9 +281,9 @@ pub fn spawn_child(cmd: &[String]) -> i32 {
             _ = c.exec();
             std::process::exit(127);
         }
-        Ok(ForkptyResult::Parent { master, .. }) => {
+        Ok(ForkptyResult::Parent { master, child }) => {
             set_nonblock(master.as_raw_fd());
-            master.into_raw_fd()
+            (master.into_raw_fd(), child)
         }
         Err(e) => {
             eprintln!("ghostd: forkpty failed: {e}");

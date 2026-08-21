@@ -157,7 +157,8 @@ fn render(app: &mut App) {
     if show_frames {
         for (i, (id, rect)) in rects.iter().enumerate() {
             let col = if *id == active_id { theme.frame_active } else { theme.frame };
-            draw_rectangle_lines(rect.x - 2.0, rect.y - 2.0, rect.w + 4.0, rect.h + 4.0, 1.0, color_theme(col));
+            let thick = if *id == active_id { 2.0 } else { 1.0 };
+            draw_rectangle_lines(rect.x - 2.0, rect.y - 2.0, rect.w + 4.0, rect.h + 4.0, thick, color_theme(col));
             // Pane label: index + name (zellij style).
             let name = match &app.current_tab().panes[*id] {
                 Pane::Term(t) => {
@@ -171,6 +172,74 @@ fn render(app: &mut App) {
                 }
                 Pane::Preview(_) => format!("file {}", i + 1),
                 Pane::Ai(_) => format!("ai {}", i + 1),
+                Pane::Closed => String::new(),
+            };
+            let label = format!(" {} ", name);
+            let lw = measure_text(&label, Some(&font), 13, 1.0).width + 8.0;
+            draw_rectangle(rect.x - 2.0, rect.y - 14.0, lw, 14.0, color_theme(col));
+            draw_text_ex(
+                &label,
+                rect.x,
+                rect.y - 3.0,
+                TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.tab_bg), ..Default::default() },
+            );
+        }
+    }
+
+    // ---- floating panes (drawn last, on top of the tree) -----------------
+    let floats: Vec<(usize, crate::layout::Rect)> = app
+        .current_tab()
+        .floating
+        .iter()
+        .filter(|f| !f.hidden) // hidden floats are bg panes
+        .map(|f| (f.pane, f.rect))
+        .collect();
+    for (id, rect) in &floats {
+        let rect = *rect;
+        match &mut app.current_tab_mut().panes[*id] {
+            Pane::Term(t) => {
+                set_scissor(rect.x, rect.y, rect.w, rect.h);
+                let _ = t.render(
+                    rect,
+                    cell,
+                    padding,
+                    &font_stack,
+                    font_px,
+                    theme,
+                    *id == active_id,
+                );
+                reset_scissor();
+            }
+            Pane::Preview(p) => {
+                set_scissor(rect.x, rect.y, rect.w, rect.h);
+                p.render(rect, &font, font_px, theme);
+                reset_scissor();
+            }
+            Pane::Ai(a) => {
+                set_scissor(rect.x, rect.y, rect.w, rect.h);
+                a.render(rect, &font, font_px, theme);
+                reset_scissor();
+            }
+            Pane::Closed => {}
+        }
+    }
+    if show_frames {
+        for (i, (id, rect)) in floats.iter().enumerate() {
+            let col = if *id == active_id { theme.frame_active } else { theme.frame };
+            let thick = if *id == active_id { 2.0 } else { 1.0 };
+            draw_rectangle_lines(rect.x - 2.0, rect.y - 2.0, rect.w + 4.0, rect.h + 4.0, thick, color_theme(col));
+            let name = match &app.current_tab().panes[*id] {
+                Pane::Term(t) => {
+                    let title = t.title();
+                    let n = if !t.name.is_empty() { &t.name } else { "pane" };
+                    if title.is_empty() {
+                        format!("float {n} {i}")
+                    } else {
+                        format!("float {n} {i} — {title}")
+                    }
+                }
+                Pane::Preview(_) => format!("float file {i}"),
+                Pane::Ai(_) => format!("float ai {i}"),
                 Pane::Closed => String::new(),
             };
             let label = format!(" {} ", name);
@@ -269,7 +338,7 @@ fn render(app: &mut App) {
             }
         }
         draw_text_ex(
-            "↑/↓ select | Enter switch | n new | r rename | d delete | Esc close",
+            "↑/↓ select | Enter switch | n new | r rename | d delete | k kill remote | Esc close",
             x + 12.0,
             y + h - 8.0,
             TextParams { font: Some(&font), font_size: 12, color: color_theme(theme.status_fg), ..Default::default() },
@@ -413,10 +482,17 @@ fn reset_scissor() {
 }
 
 /// Clip drawing to a logical-pixel rect. macroquad has no public scissor
-/// API; quad_gl.scissor works in physical px (Y flipped internally).
+/// API; quad_gl.scissor works in physical px (Y flipped internally for OpenGL viewport).
 fn set_scissor(x: f32, y: f32, w: f32, h: f32) {
-    // TEMP: disabled to test whether the scissor clips everything away.
-    let _ = (x, y, w, h);
+    let dpi = macroquad::window::screen_dpi_scale();
+    let sh = macroquad::window::screen_height();
+    let sx = (x * dpi).max(0.0) as i32;
+    let sy = (((sh - (y + h)) * dpi).max(0.0)) as i32;
+    let sw = (w * dpi).max(0.0) as i32;
+    let sh_px = (h * dpi).max(0.0) as i32;
+    unsafe {
+        macroquad::window::get_internal_gl().quad_gl.scissor(Some((sx, sy, sw, sh_px)));
+    }
 }
 
 fn macroquad_conf() -> macroquad::conf::Conf {
@@ -482,7 +558,9 @@ async fn main() -> Result<()> {
         render(&mut app);
 
         if app.quit {
-            app.save_session();
+            // Persist the active session AND every parked (background) one —
+            // a parked session's metadata must not be lost on quit.
+            app.save_all_sessions();
             std::process::exit(0);
         }
 

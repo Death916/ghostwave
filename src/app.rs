@@ -26,6 +26,16 @@ pub const TAB_MENU_ITEMS: usize = 2;
 pub const TAB_BAR_H: f32 = 30.0;
 pub const STATUS_BAR_H: f32 = 26.0;
 
+/// Debug trace to stdout, ON BY DEFAULT (remote-session bring-up phase —
+/// the user runs the debug binary from a terminal and expects to see the
+/// steps); set GHOSTWAVE_DEBUG=0 to silence.
+pub fn gdbg(msg: impl AsRef<str>) {
+    if std::env::var("GHOSTWAVE_DEBUG").map(|v| v == "0").unwrap_or(false) {
+        return;
+    }
+    println!("[ghostwave] {}", msg.as_ref());
+}
+
 pub enum Pane {
     Term(TermPane),
     Preview(PreviewPane),
@@ -34,12 +44,30 @@ pub enum Pane {
     Closed,
 }
 
+/// A pane floating above the tab's layout tree (zellij Ctrl+p f). It keeps
+/// its own rect and can be moved/resized with Move/Resize modes; `f` again
+/// embeds it back at `origin`. A HIDDEN float ("bg pane") is not rendered
+/// or hit-tested but keeps running and draining (pane-mode `e` hides,
+/// pane-mode `E` cycles floats and shows them again).
+pub struct FloatingPane {
+    /// Index into `Tab.panes`.
+    pub pane: usize,
+    /// Overlay rect in logical px (content-area coords).
+    pub rect: Rect,
+    /// Where the pane came from in the tree (for exact re-embed).
+    pub origin: Option<crate::layout::FloatOrigin>,
+    /// True = background pane: running but invisible and unclickable.
+    pub hidden: bool,
+}
+
 pub struct Tab {
     pub name: String,
     pub root: Node,
     pub panes: Vec<Pane>,
     pub active: usize,
     pub zoomed: HashSet<usize>,
+    /// Floating panes (z-order: later entries draw on top).
+    pub floating: Vec<FloatingPane>,
 }
 
 impl Tab {
@@ -50,6 +78,7 @@ impl Tab {
             panes: vec![initial],
             active: 0,
             zoomed: HashSet::new(),
+            floating: Vec::new(),
         }
     }
 
@@ -60,6 +89,7 @@ impl Tab {
             panes,
             active: 0,
             zoomed: HashSet::new(),
+            floating: Vec::new(),
         }
     }
 
@@ -93,6 +123,15 @@ impl Tab {
     }
 }
 
+/// A session whose panes are still alive in this process but not visible:
+/// parked when the user switches sessions, so pty children keep running and
+/// their logs keep growing. Drained every frame in App::update().
+pub struct LiveSession {
+    pub name: String,
+    pub tabs: Vec<Tab>,
+    pub active_tab: usize,
+}
+
 pub struct App {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
@@ -104,11 +143,20 @@ pub struct App {
     pub toast: Option<(String, Instant)>,
     pub last_tab: Option<usize>,
     pub rename_buf: String,
+    /// Session being renamed (current or a parked one) — the manager's `r`
+    /// can target a non-current session, so ConfirmRename must not assume
+    /// the current session.
+    pub rename_target: String,
     pub search_mode_active: bool,
     /// Right-click tab context menu: (tab index, menu origin x, y).
     pub tab_menu: Option<(usize, f32, f32)>,
     /// Name of the session this app instance runs inside.
     pub current_session: String,
+    /// Sessions whose panes are STILL ALIVE in this process but not visible
+    /// (switched away from). Their pty children keep running and are drained
+    /// every frame in update(), so logs stay fresh and switching back swaps
+    /// the live tabs in — no shell respawn, no log replay.
+    pub parked: Vec<LiveSession>,
     /// Session manager overlay: (session names, selected index).
     pub session_list: Option<(Vec<String>, usize)>,
     pub cell: CellDims,
@@ -208,6 +256,7 @@ impl App {
             toast: None,
             last_tab: None,
             rename_buf: String::new(),
+            rename_target: String::new(),
             search_mode_active: false,
             cell,
             font_px,
@@ -221,6 +270,7 @@ impl App {
             session_list: None,
             last_session_save: std::time::Instant::now(),
             pty_activity: false,
+            parked: Vec::new(),
             remote_uploads,
             remote_upload_tx,
             binary_ready: Default::default(),
@@ -234,15 +284,16 @@ impl App {
 
     // ---- pane creation ---------------------------------------------------
 
-    fn new_term_pane(
-        &mut self,
+    /// Create a pane WITHOUT inserting it into a tab (for new-tab flows).
+    fn make_term_pane(
+        &self,
         cols: u16,
         rows: u16,
         program: Option<&str>,
         args: &[&str],
         cwd: Option<&str>,
         remote: Option<crate::term::RemoteSpec>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<TermPane> {
         let shell = program.or(self.config.shell.as_deref());
         let pane = TermPane::new(
             cols,
@@ -256,6 +307,28 @@ impl App {
             true,
             remote,
         )?;
+        Ok(pane)
+    }
+
+    /// Push a new tab containing `pane` and switch to it.
+    fn push_new_tab(&mut self, pane: Pane, name: &str) {
+        self.tabs.push(Tab::new(pane, name.to_string()));
+        self.active_tab = self.tabs.len() - 1;
+        self.last_tab = None;
+        self.apply_terminal_colors();
+        self.layout_all();
+    }
+
+    fn new_term_pane(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        program: Option<&str>,
+        args: &[&str],
+        cwd: Option<&str>,
+        remote: Option<crate::term::RemoteSpec>,
+    ) -> crate::Result<usize> {
+        let pane = self.make_term_pane(cols, rows, program, args, cwd, remote)?;
         let id = {
             let tab = self.current_tab_mut();
             let id = tab.panes.len();
@@ -278,6 +351,16 @@ impl App {
 
     pub fn active_pane_id(&self) -> usize {
         self.current_tab().active
+    }
+
+    /// Tree path of the active pane; when the active pane is floating (no
+    /// tree path), fall back to the first tree leaf so tree ops (split,
+    /// stack, side panes) never operate on the root.
+    fn active_tree_path(&self) -> layout::Path {
+        let tab = self.current_tab();
+        layout::path_to_pane(&tab.root, tab.active)
+            .or_else(|| tab.root.leaves().into_iter().next().map(|(p, _)| p))
+            .unwrap_or_default()
     }
 
     pub fn active_term(&self) -> Option<&TermPane> {
@@ -304,12 +387,25 @@ impl App {
             Action::ClosePane => self.close_pane(),
             Action::MoveFocus(dir) => self.focus(dir),
             Action::SwitchFocus => {
-                let next = layout::next_leaf(&self.current_tab().root, self.active_pane_id());
-                if let Some(n) = next {
-                    self.current_tab_mut().active = n;
+                // Cycle through tree panes; from a floating pane, jump into
+                // the tree (floats aren't part of the DFS cycle).
+                let tab = self.current_tab();
+                if tab.floating.iter().any(|f| f.pane == tab.active) {
+                    if let Some((_, p)) = tab.root.leaves().into_iter().next() {
+                        self.current_tab_mut().active = p;
+                    }
+                } else {
+                    let next =
+                        layout::next_leaf(&self.current_tab().root, self.active_pane_id());
+                    if let Some(n) = next {
+                        self.current_tab_mut().active = n;
+                    }
                 }
             }
             Action::ToggleZoom => self.toggle_zoom(),
+            Action::ToggleFloating => self.toggle_floating(),
+            Action::ToggleHideFloat => self.toggle_hide_float(),
+            Action::CycleFloat => self.cycle_float(),
             Action::ToggleFrames => {
                 self.show_frames = !self.show_frames;
                 self.layout_all();
@@ -466,6 +562,7 @@ impl App {
             Action::OpenFile(path) => self.open_file(path),
             Action::ConnectSsh(host) => self.connect_ssh(&host),
             Action::ConnectDurableSsh(host) => self.connect_durable_ssh(&host),
+            Action::KillRemoteSession => self.kill_active_remote_pane(),
             Action::NewAi => self.new_ai_pane(),
             Action::SessionManager => self.open_session_manager(),
             Action::SessionNew => {
@@ -475,6 +572,7 @@ impl App {
             Action::SessionRename => {
                 self.mode = Mode::RenameSession;
                 self.rename_buf = self.current_session.clone();
+                self.rename_target = self.current_session.clone();
                 self.repaint_all(); // input box is drawn over content
             }
             Action::SessionDelete => {
@@ -483,7 +581,11 @@ impl App {
                 } else {
                     let name = self.current_session.clone();
                     crate::session::delete(&name);
-                    self.current_session = "default".into();
+                    // Drop the session's panes (kills their processes) rather
+                    // than parking them: its file is gone, and the continuous
+                    // save would otherwise resurrect it on quit.
+                    self.tabs = Vec::new();
+                    self.active_tab = 0;
                     self.load_session("default");
                     self.toast(&format!("deleted session: {name}"));
                 }
@@ -540,12 +642,22 @@ impl App {
                     }
                     Mode::RenameSession => {
                         self.mode = Mode::Normal;
-                        if !name.is_empty() && name != self.current_session {
-                            let old = self.current_session.clone();
-                            crate::session::rename(&old, &name);
-                            self.current_session = name.clone();
-                            crate::session::set_last_session(&name);
-                            self.toast(&format!("session renamed: {name}"));
+                        if !name.is_empty() {
+                            let old = std::mem::take(&mut self.rename_target);
+                            if old == self.current_session {
+                                crate::session::rename(&old, &name);
+                                self.current_session = name.clone();
+                                crate::session::set_last_session(&name);
+                                self.toast(&format!("session renamed: {name}"));
+                            } else if !old.is_empty() {
+                                crate::session::rename(&old, &name);
+                                // The renamed session may be parked (alive):
+                                // update its in-memory entry too.
+                                if let Some(live) = self.parked.iter_mut().find(|s| s.name == old) {
+                                    live.name = name.clone();
+                                }
+                                self.toast(&format!("session renamed: {name}"));
+                            }
                         }
                     }
                     _ => self.mode = Mode::Normal,
@@ -684,9 +796,12 @@ impl App {
                 return;
             }
         };
+        let path = self.active_tree_path();
         let tab = self.current_tab_mut();
-        let path = layout::path_to_pane(&tab.root, tab.active).unwrap_or_default();
-        if stacked {
+        if matches!(tab.root, Node::Leaf { pane: usize::MAX }) {
+            // Tree is empty (the only pane is floating): it becomes the root.
+            tab.root = Node::Leaf { pane: id };
+        } else if stacked {
             layout::stack_at(&mut tab.root, &path, id);
         } else {
             layout::split_at(&mut tab.root, &path, dir, id);
@@ -698,21 +813,41 @@ impl App {
     pub fn close_pane(&mut self) {
         let root_empty = {
             let tab = self.current_tab_mut();
-            let path = match layout::path_to_pane(&tab.root, tab.active) {
-                Some(p) => p,
-                None => return,
-            };
-            layout::close_at(&mut tab.root, &path);
-            // close_at marks the root as an empty sentinel when the last
-            // leaf was removed.
-            let empty = matches!(tab.root, Node::Leaf { pane: usize::MAX });
-            if !empty {
-                // Remove the closed pane from the vec (by its old id).
-                if let Some(id) = layout::path_to_pane(&tab.root, usize::MAX) {
-                    let _ = id;
+            // Closing a floating pane: drop it from the float list (its pty
+            // child gets SIGHUP'd like any closed pane) and focus the tree.
+            if let Some(fi) = tab.floating.iter().position(|f| f.pane == tab.active) {
+                let f = tab.floating.remove(fi);
+                tab.panes[f.pane] = Pane::Closed;
+                let tree_empty = matches!(tab.root, Node::Leaf { pane: usize::MAX })
+                    || tab.root.leaves().is_empty();
+                if tree_empty {
+                    tab.root = Node::Leaf { pane: usize::MAX };
+                    tab.active = 0;
+                    true
+                } else {
+                    let next = tab.root.leaves().into_iter().next().map(|(_, p)| p);
+                    tab.active = next.unwrap_or(0);
+                    false
+                }
+            } else {
+                match layout::path_to_pane(&tab.root, tab.active) {
+                    Some(path) => {
+                        layout::close_at(&mut tab.root, &path);
+                        // close_at marks the root as an empty sentinel when
+                        // the last leaf was removed.
+                        let empty = matches!(tab.root, Node::Leaf { pane: usize::MAX });
+                        if !empty {
+                            // Remove the closed pane from the vec (by its
+                            // old id).
+                            if let Some(id) = layout::path_to_pane(&tab.root, usize::MAX) {
+                                let _ = id;
+                            }
+                        }
+                        empty
+                    }
+                    None => false,
                 }
             }
-            empty
         };
 
         if root_empty {
@@ -752,12 +887,15 @@ impl App {
     }
 
     /// Remove panes from the vec that are no longer referenced by the tree,
-    /// then remap the tree to the compacted ids.
+    /// then remap the tree (AND floating panes) to the compacted ids.
     fn remove_dangling_panes(&mut self) {
         let tab = self.current_tab_mut();
-        // Collect referenced ids.
+        // Collect referenced ids (tree leaves + floating panes).
         let mut referenced: HashSet<usize> = HashSet::new();
         collect_tree_ids(&tab.root, &mut referenced);
+        for f in &tab.floating {
+            referenced.insert(f.pane);
+        }
         // Build new vec of referenced panes in ascending old-id order.
         let mut new_panes: Vec<Pane> = Vec::new();
         let mut remap: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -769,12 +907,26 @@ impl App {
             new_panes.push(pane);
         }
         remap_tree(&mut tab.root, &remap);
+        for f in tab.floating.iter_mut() {
+            if let Some(n) = remap.get(&f.pane) {
+                f.pane = *n;
+            }
+        }
         tab.panes = new_panes;
         tab.active = remap.get(&tab.active).copied().unwrap_or(0);
         tab.zoomed.retain(|id| remap.contains_key(id));
     }
 
     pub fn focus(&mut self, dir: Dir) {
+        let tab = self.current_tab();
+        // Directional focus from a floating pane: floats don't participate
+        // in the tree's rect-based navigation — jump to the first tree leaf.
+        if tab.floating.iter().any(|f| f.pane == tab.active) {
+            if let Some((_, p)) = tab.root.leaves().into_iter().next() {
+                self.current_tab_mut().active = p;
+            }
+            return;
+        }
         let content = self.content_rect();
         let rects = self.current_tab().pane_rects(content, self.show_frames);
         let next = layout::focus_in_direction(&rects, self.active_pane_id(), dir);
@@ -784,14 +936,157 @@ impl App {
     }
 
     pub fn toggle_zoom(&mut self) {
+        // Zoom applies to tree panes; a floating pane can't be zoomed
+        // (its rect is already arbitrary). Ctrl+M on a float: tell them.
+        let tab = self.current_tab();
+        if tab.floating.iter().any(|f| f.pane == tab.active) {
+            self.toast("floating pane — embed it (pane-mode f) to zoom");
+            return;
+        }
         let tab = self.current_tab_mut();
         if !tab.zoomed.insert(tab.active) {
             tab.zoomed.remove(&tab.active);
         }
     }
 
+    /// Zellij float toggle: the focused tree pane floats above the layout
+    /// (drawn last, moveable/resizable); the focused floating pane embeds
+    /// back into the tree at its original spot.
+    pub fn toggle_floating(&mut self) {
+        let active = self.active_pane_id();
+        // &self reads first (no &mut borrow yet).
+        let (float_idx, is_term, tree_path) = {
+            let tab = self.current_tab();
+            (
+                tab.floating.iter().position(|f| f.pane == active),
+                matches!(tab.panes.get(active), Some(Pane::Term(_))),
+                layout::path_to_pane(&tab.root, active),
+            )
+        };
+
+        // Embed the active floating pane back into the tree.
+        if let Some(fi) = float_idx {
+            let tab = self.current_tab_mut();
+            let f = tab.floating.remove(fi);
+            let pane = f.pane;
+            let origin = f.origin;
+            let embedded = origin
+                .as_ref()
+                .map(|o| layout::embed_at(&mut tab.root, pane, o))
+                .unwrap_or(false);
+            if !embedded {
+                // Origin stale (tree changed while it floated): embed next
+                // to the tree's active pane (or alone in an empty tree).
+                if matches!(tab.root, Node::Leaf { pane: usize::MAX }) {
+                    tab.root = Node::Leaf { pane };
+                } else {
+                    let path = layout::path_to_pane(&tab.root, tab.active)
+                        .or_else(|| tab.root.leaves().into_iter().next().map(|(p, _)| p))
+                        .unwrap_or_default();
+                    layout::split_at(&mut tab.root, &path, layout::SplitDir::Horizontal, pane);
+                }
+            }
+            tab.active = pane;
+            self.layout_all();
+            self.toast("pane embedded");
+            return;
+        }
+
+        // Float the active tree pane (Term panes only).
+        if !is_term {
+            self.toast("only terminal panes can float");
+            return;
+        }
+        let Some(path) = tree_path else {
+            return;
+        };
+        // Grab its current rect BEFORE it leaves the tree.
+        let rect = self
+            .pane_rect_of(active)
+            .unwrap_or_else(|| self.content_rect());
+        let tab = self.current_tab_mut();
+        let Some((_, origin)) = layout::float_out(&mut tab.root, &path) else {
+            return;
+        };
+        tab.zoomed.remove(&active);
+        tab.floating.push(FloatingPane {
+            pane: active,
+            rect,
+            origin: Some(origin),
+            hidden: false,
+        });
+        self.layout_all();
+        self.toast("pane floating — f to embed, Ctrl+h move, Ctrl+n resize");
+    }
+
+    /// Pane-mode `e`: toggle the active floating pane hidden ("bg pane").
+    /// Hidden panes keep running (drained every frame) but are not rendered
+    /// or clickable; `E` cycles floats and shows them again.
+    pub fn toggle_hide_float(&mut self) {
+        let (fi, hidden, first_leaf, tree_has_leaf) = {
+            let tab = self.current_tab();
+            let Some(fi) = tab.floating.iter().position(|f| f.pane == tab.active) else {
+                self.toast("no floating pane to hide (float one with pane-mode f)");
+                return;
+            };
+            let hidden = tab.floating[fi].hidden;
+            let leaves = tab.root.leaves();
+            let tree_has_leaf = !leaves.is_empty();
+            let first_leaf = leaves.into_iter().next().map(|(_, p)| p);
+            (fi, hidden, first_leaf, tree_has_leaf)
+        };
+        let tab = self.current_tab_mut();
+        tab.floating[fi].hidden = !hidden;
+        if !hidden && tree_has_leaf {
+            // Hiding steals focus from a now-invisible pane.
+            tab.active = first_leaf.unwrap_or(tab.active);
+        }
+        self.toast(if !hidden {
+            "pane hidden (bg) — Ctrl+p E to show"
+        } else {
+            "pane shown"
+        });
+    }
+
+    /// Pane-mode `E`: focus the next floating pane (wrapping), showing it
+    /// first if it was hidden. From a tree pane, focuses the first float.
+    pub fn cycle_float(&mut self) {
+        let (next_idx, was_hidden, len) = {
+            let tab = self.current_tab();
+            if tab.floating.is_empty() {
+                self.toast("no floating panes");
+                return;
+            }
+            let cur = tab.floating.iter().position(|f| f.pane == tab.active);
+            let next_idx = match cur {
+                Some(i) => (i + 1) % tab.floating.len(),
+                None => 0,
+            };
+            (next_idx, tab.floating[next_idx].hidden, tab.floating.len())
+        };
+        {
+            let tab = self.current_tab_mut();
+            tab.floating[next_idx].hidden = false;
+            tab.active = tab.floating[next_idx].pane;
+        }
+        if was_hidden {
+            // Grid was not maintained while hidden.
+            self.layout_all();
+        }
+        let msg = if was_hidden {
+            format!("float {next_idx}/{len} shown")
+        } else {
+            format!("float {next_idx}/{len}")
+        };
+        self.toast(&msg);
+    }
+
     fn cycle_stack(&mut self) {
         let tab = self.current_tab_mut();
+        if tab.floating.iter().any(|f| f.pane == tab.active) {
+            self.toast("floating panes aren't in a stack");
+            return;
+        }
         let path = layout::path_to_pane(&tab.root, tab.active).unwrap_or_default();
         if layout::cycle_stack(&mut tab.root, &path) {
             let id = tab.root.pane_id_of_path(&path);
@@ -802,7 +1097,30 @@ impl App {
     }
 
     pub fn resize(&mut self, dir: Dir, delta: f32) {
+        // A floating pane is resized directly (cell steps); the tree is
+        // untouched.
+        let cell = self.cell;
+        let content = self.content_rect();
         let tab = self.current_tab_mut();
+        if let Some(fi) = tab.floating.iter().position(|f| f.pane == tab.active) {
+            let f = &mut tab.floating[fi];
+            let (min_w, min_h) = (2.0 * cell.w as f32, 2.0 * cell.h as f32);
+            match dir {
+                Dir::Left | Dir::Right => {
+                    let step = cell.w as f32 * if delta > 0.0 { 1.0 } else { -1.0 };
+                    f.rect.w = (f.rect.w + step).max(min_w);
+                }
+                Dir::Up | Dir::Down => {
+                    let step = cell.h as f32 * if delta > 0.0 { 1.0 } else { -1.0 };
+                    f.rect.h = (f.rect.h + step).max(min_h);
+                }
+            }
+            // Keep it inside the content area.
+            f.rect.w = f.rect.w.min(content.w - (f.rect.x - content.x));
+            f.rect.h = f.rect.h.min(content.h - (f.rect.y - content.y));
+            self.layout_all();
+            return;
+        }
         let path = match layout::path_to_pane(&tab.root, tab.active) {
             Some(p) => p,
             None => return,
@@ -811,7 +1129,23 @@ impl App {
     }
 
     pub fn move_pane(&mut self, dir: Dir) {
+        // A floating pane is moved directly (cell steps) — zellij Move mode.
+        let cell = self.cell;
         let content = self.content_rect();
+        let tab = self.current_tab_mut();
+        if let Some(fi) = tab.floating.iter().position(|f| f.pane == tab.active) {
+            let f = &mut tab.floating[fi];
+            match dir {
+                Dir::Left => f.rect.x -= cell.w as f32,
+                Dir::Right => f.rect.x += cell.w as f32,
+                Dir::Up => f.rect.y -= cell.h as f32,
+                Dir::Down => f.rect.y += cell.h as f32,
+            }
+            f.rect.x = f.rect.x.clamp(content.x, content.x + content.w - f.rect.w);
+            f.rect.y = f.rect.y.clamp(content.y, content.y + content.h - f.rect.h);
+            self.layout_all();
+            return;
+        }
         let rects = self.current_tab().pane_rects(content, self.show_frames);
         let from = self.active_pane_id();
         let Some(target) = layout::focus_in_direction(&rects, from, dir) else {
@@ -875,11 +1209,26 @@ impl App {
     }
 
     pub fn connect_ssh(&mut self, host: &str) {
+        // Each plain ssh connection lives in its OWN named session (visible
+        // in the session list, no durable marker), so it is identifiable
+        // and resumable like any other session.
+        let sess = format!("ssh-{}", Self::sanitize_host(host));
+        if sess != self.current_session {
+            if crate::session::list_sessions().contains(&sess) {
+                self.load_session(&sess);
+            } else {
+                // Park the outgoing session (its panes keep running) and
+                // start the ssh session fresh.
+                self.park_current();
+                self.current_session = sess.clone();
+                crate::session::set_last_session(&sess);
+            }
+        }
         let cols = 100;
         let rows = 30;
-        match self.new_term_pane(cols, rows, Some("ssh"), &[host], None, None) {
-            Ok(id) => {
-                self.current_tab_mut().active = id;
+        match self.make_term_pane(cols, rows, Some("ssh"), &[host], None, None) {
+            Ok(pane) => {
+                self.push_new_tab(Pane::Term(pane), &format!("ssh {host}"));
                 self.toast(&format!("connecting to {host}"));
             }
             Err(e) => self.toast(&format!("ssh failed: {e}")),
@@ -889,22 +1238,25 @@ impl App {
     // ---- durable remote sessions (ghostd) --------------------------------
 
     /// Remote session name for a host: `ghostwave-<host>` (sanitized).
-    pub fn remote_session_name(host: &str) -> String {
-        let h: String = host
-            .chars()
+    /// Host string → filesystem-safe token (used for session names).
+    fn sanitize_host(host: &str) -> String {
+        host.chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
-            .collect();
-        format!("ghostwave-{h}")
+            .collect()
+    }
+
+    pub fn remote_session_name(host: &str) -> String {
+        format!("ghostwave-{}", Self::sanitize_host(host))
     }
 
     /// The remote shell command the pane runs: check the cached ghostd
     /// binary, then attach (creating the session if missing).
     fn remote_attach_cmd(host: &str, session: &str) -> String {
         format!(
-            "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
+            "sh -c 'BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
              if [ ! -x \"$BIN\" ] || [ \"$($BIN --version 2>/dev/null)\" != \"ghostd {ver}\" ]; then \
              echo \"ghostd missing/stale on {host} — reconnect to upload\"; exit 1; fi; \
-             exec \"$BIN\" attach {session} 2>/dev/null || {{ \"$BIN\" new {session} >/dev/null 2>&1 && exec \"$BIN\" attach {session}; }}",
+             \"$BIN\" attach {session} 2>/dev/null || {{ \"$BIN\" new {session} >/dev/null 2>&1 && exec \"$BIN\" attach {session}; }}'",
             ver = env!("CARGO_PKG_VERSION")
         )
     }
@@ -913,14 +1265,68 @@ impl App {
     /// command. The ghostd binary is uploaded in the background on first
     /// use; a stale/missing binary shows an error and the reconnect loop
     /// retries once the upload lands.
+    ///
+    /// ds sessions live in their OWN local session (`ssh-<host>`) so the
+    /// session manager lists them independently and can kill them; a
+    /// repeat `ds <host>` focuses/reconnects the existing attach pane
+    /// instead of stacking duplicates (the daemon serves one client at a
+    /// time anyway).
     pub fn connect_durable_ssh(&mut self, host: &str) {
+        let target = format!("ssh-{}", Self::sanitize_host(host));
+        if self.current_session != target {
+            if crate::session::load(&target).is_some() {
+                self.load_session(&target);
+            } else {
+                // Fresh empty session — no default shell tab; the remote
+                // attach pane is added below.
+                self.park_current();
+                self.tabs = Vec::new();
+                self.active_tab = 0;
+                self.finish_session_switch(&target);
+            }
+        }
+        // Dedup: an attach pane for this host already exists → focus it
+        // and reconnect if it's not live.
+        let mut existing: Option<(usize, usize)> = None;
+        for (ti, tab) in self.tabs.iter().enumerate() {
+            for (pi, pane) in tab.panes.iter().enumerate() {
+                if let Pane::Term(t) = pane {
+                    if t.remote.as_ref().is_some_and(|r| r.host == host) {
+                        existing = Some((ti, pi));
+                        break;
+                    }
+                }
+            }
+            if existing.is_some() {
+                break;
+            }
+        }
+        if let Some((t, p)) = existing {
+            self.active_tab = t;
+            self.current_tab_mut().active = p;
+            let needs_connect = match self.current_tab().panes.get(p) {
+                Some(Pane::Term(tp)) => {
+                    tp.exited.is_some() || tp.reconnect != crate::term::ReconnectState::Idle
+                }
+                _ => false,
+            };
+            if needs_connect {
+                self.connect_remote_pane(t, p);
+                self.toast(&format!("reconnecting durable ssh: {host}"));
+            } else {
+                self.toast(&format!("already attached to {host}"));
+            }
+            return;
+        }
         let session = Self::remote_session_name(host);
         let cmd = Self::remote_attach_cmd(host, &session);
+        gdbg(format!("ds {host}: session={session} uploading-binary-check"));
         self.ensure_remote_binary(host, &session);
         let cols = 100;
         let rows = 30;
         let args = ["-t", "-o", "ConnectTimeout=10", host, &cmd];
-        match self.new_term_pane(
+        gdbg(format!("ds {host}: ssh argv: -t -o ConnectTimeout=10 {host} {cmd:?}"));
+        match self.make_term_pane(
             cols,
             rows,
             Some("ssh"),
@@ -931,8 +1337,8 @@ impl App {
                 session,
             }),
         ) {
-            Ok(id) => {
-                self.current_tab_mut().active = id;
+            Ok(pane) => {
+                self.push_new_tab(Pane::Term(pane), &format!("ssh {host}"));
                 self.toast(&format!("durable ssh: {host}"));
             }
             Err(e) => self.toast(&format!("ssh failed: {e}")),
@@ -948,8 +1354,10 @@ impl App {
         let tx = self.remote_upload_tx.clone();
         let host = host.to_string();
         let session = session.to_string();
+        gdbg(format!("upload thread for {host}: starting"));
         std::thread::spawn(move || {
             let ok = upload_ghostd(&host);
+            gdbg(format!("upload thread for {host}: result ok={ok}"));
             let _ = tx.send((host, session, ok));
         });
     }
@@ -988,14 +1396,130 @@ impl App {
             return;
         };
         self.toast(&format!("killing remote session {session} on {host}"));
+        Self::spawn_remote_kill(&host, &session);
+    }
+
+    /// ssh to `host` and kill the ghostd daemon for `dsession`, then pkill
+    /// stragglers. Runs on a fresh ssh connection (never the pane's own),
+    /// so it works when the local pane is dead or the daemon is wedged.
+    /// The remote ghostd escalates TERM→KILL and kills the session's
+    /// process group; the pkill is the last resort for orphans whose
+    /// pidfile is already gone.
+    fn spawn_remote_kill(host: &str, dsession: &str) {
+        let host = host.to_string();
+        let dsession = dsession.to_string();
+        gdbg(format!("kill {dsession} on {host}: spawning ssh"));
         std::thread::spawn(move || {
             let cmd = format!(
-                "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \"$BIN\" kill {session} 2>&1 || echo \"no ghostd binary on {host}\""
+                "sh -c 'BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
+                 if [ ! -x \"$BIN\" ]; then echo \"no ghostd binary on {host}\"; exit 1; fi; \
+                 \"$BIN\" kill {dsession} 2>&1 || true; \
+                 pkill -9 -f \"ghostd-$(uname -m) new {dsession}\" 2>/dev/null || true; true'"
             );
             let _ = std::process::Command::new("ssh")
                 .args(["-o", "ConnectTimeout=5", &host, &cmd])
                 .status();
         });
+    }
+
+    /// Session manager `k`: kill every durable remote daemon owned by the
+    /// selected session (fresh ssh, works when panes are dead/stuck), then
+    /// drop the entry — pure ds sessions are deleted wholesale, mixed
+    /// sessions keep their local tabs.
+    fn kill_session_remotes(&mut self, name: &str) {
+        let (specs, pure) = if name == self.current_session {
+            (Self::live_remote_specs(&self.tabs), Self::live_is_pure_remote(&self.tabs))
+        } else if let Some(p) = self.parked.iter().find(|s| s.name == name) {
+            (Self::live_remote_specs(&p.tabs), Self::live_is_pure_remote(&p.tabs))
+        } else {
+            (crate::session::remote_specs(name), crate::session::is_pure_remote(name))
+        };
+        if specs.is_empty() {
+            self.toast(&format!("no remote sessions in {name}"));
+            return;
+        }
+        // Dedupe by host (one daemon session per host).
+        let mut hosts: Vec<(String, String)> = Vec::new();
+        for (h, s) in specs {
+            if !hosts.iter().any(|(hh, _)| hh == &h) {
+                hosts.push((h, s));
+            }
+        }
+        for (host, dsession) in &hosts {
+            Self::spawn_remote_kill(host, dsession);
+        }
+        if name != self.current_session && pure {
+            if let Some(idx) = self.parked.iter().position(|s| s.name == name) {
+                self.parked.remove(idx);
+            }
+            crate::session::delete(name);
+            let entries = crate::session::list_sessions();
+            if let Some((e, sel)) = self.session_list.as_mut() {
+                *e = entries;
+                if *sel >= e.len() {
+                    *sel = e.len().saturating_sub(1);
+                }
+            }
+            self.toast(&format!(
+                "killed {} remote session(s) on {}, removed {name}",
+                hosts.len(),
+                hosts.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        } else {
+            self.toast(&format!(
+                "killed {} remote session(s) on {}",
+                hosts.len(),
+                hosts.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+
+    /// (host, daemon-session) pairs across live tabs (current or parked).
+    fn live_remote_specs(tabs: &[Tab]) -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for tab in tabs {
+            for pane in &tab.panes {
+                if let Pane::Term(t) = pane {
+                    if let Some(r) = &t.remote {
+                        v.push((r.host.clone(), r.session.clone()));
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// True when every live pane is a durable remote pane (a pure ds
+    /// session — deleteable after its daemons are killed).
+    fn live_is_pure_remote(tabs: &[Tab]) -> bool {
+        let mut total = 0;
+        let mut remote = 0;
+        for tab in tabs {
+            for pane in &tab.panes {
+                total += 1;
+                if matches!(pane, Pane::Term(t) if t.remote.is_some()) {
+                    remote += 1;
+                }
+            }
+        }
+        total > 0 && total == remote
+    }
+
+    /// Palette "Kill Remote Session": kill the remote ghostd session of the
+    /// ACTIVE pane (connected or disconnected) and close the local pane —
+    /// the only way to fully get rid of a durable remote session.
+    fn kill_active_remote_pane(&mut self) {
+        let t = self.active_tab;
+        let p = self.active_pane_id();
+        let Some((host, session)) = self.remote_spec_of(t, p) else {
+            self.toast("no remote session in active pane");
+            return;
+        };
+        self.kill_remote_pane(t, p);
+        // Close the local pane too (the remote session is gone — the pane
+        // is useless; its ssh/attach dies with the daemon anyway).
+        self.close_pane();
+        self.toast(&format!("killed remote session {session} on {host}"));
     }
 
     fn remote_spec_of(&self, tab_idx: usize, pane_idx: usize) -> Option<(String, String)> {
@@ -1009,9 +1533,16 @@ impl App {
     }
 
     /// Respawn every pane waiting to reconnect to `host` (binary just
-    /// became ready).
+    /// became ready) — including parked sessions' panes.
     fn respawn_waiting(&mut self, host: &str) {
-        for tab in self.tabs.iter_mut() {
+        Self::respawn_waiting_tabs(&mut self.tabs, host);
+        for live in self.parked.iter_mut() {
+            Self::respawn_waiting_tabs(&mut live.tabs, host);
+        }
+    }
+
+    fn respawn_waiting_tabs(tabs: &mut [Tab], host: &str) {
+        for tab in tabs.iter_mut() {
             for pane in tab.panes.iter_mut() {
                 if let Pane::Term(t) = pane {
                     let is_host = t.remote.as_ref().is_some_and(|r| r.host == host);
@@ -1030,11 +1561,15 @@ impl App {
 
     /// Add a non-terminal pane as a right split.
     fn push_side_pane(&mut self, pane: Pane) {
+        let path = self.active_tree_path();
         let tab = self.current_tab_mut();
         let id = tab.panes.len();
         tab.panes.push(pane);
-        let path = layout::path_to_pane(&tab.root, tab.active).unwrap_or_default();
-        layout::split_at(&mut tab.root, &path, SplitDir::Horizontal, id);
+        if matches!(tab.root, Node::Leaf { pane: usize::MAX }) {
+            tab.root = Node::Leaf { pane: id };
+        } else {
+            layout::split_at(&mut tab.root, &path, SplitDir::Horizontal, id);
+        }
         tab.active = id;
         self.layout_all();
     }
@@ -1054,11 +1589,13 @@ impl App {
     pub fn apply_terminal_colors(&mut self) {
         use libghostty_vt::style::RgbColor;
         let (fg, bg) = (self.theme.fg, self.theme.bg);
+        let cursor_style = self.config.cursor_style.as_deref().and_then(TermPane::parse_cursor_style);
         for tab in self.tabs.iter_mut() {
             for pane in tab.panes.iter_mut() {
                 if let Pane::Term(t) = pane {
                     let _ = t.term.set_default_fg_color(Some(RgbColor { r: fg.0, g: fg.1, b: fg.2 }));
                     let _ = t.term.set_default_bg_color(Some(RgbColor { r: bg.0, g: bg.1, b: bg.2 }));
+                    t.cursor_style = cursor_style;
                 }
             }
         }
@@ -1066,9 +1603,28 @@ impl App {
 
     /// Persist the durable session state (JSON + pane logs). Called on quit.
     pub fn save_session(&self) {
-        let state = crate::session::SessionState {
-            tabs: self
-                .tabs
+        crate::session::save(
+            &self.current_session,
+            &Self::session_state_for(&self.tabs, self.cell),
+        );
+        crate::session::set_last_session(&self.current_session);
+    }
+
+    /// Persist every live session (active + parked) — used on quit so a
+    /// background session's metadata isn't lost (its pane logs are already
+    /// fresh; they grow at drain time even while parked).
+    pub fn save_all_sessions(&self) {
+        self.save_session();
+        for live in &self.parked {
+            crate::session::save(&live.name, &Self::session_state_for(&live.tabs, self.cell));
+        }
+    }
+
+    /// Build the on-disk session state for a set of tabs (terminal panes
+    /// only; preview/AI panes are not restored).
+    fn session_state_for(tabs: &[Tab], cell: CellDims) -> crate::session::SessionState {
+        crate::session::SessionState {
+            tabs: tabs
                 .iter()
                 .map(|tab| {
                     // Terminal panes only (preview/AI panes are not restored);
@@ -1098,25 +1654,83 @@ impl App {
                         .map(|(new_id, old_id)| (*old_id, new_id))
                         .collect();
                     let root = Self::remap_layout(&tab.root, &map);
+                    // Floating panes: remap ids, store overlay rect in cells
+                    // (grid-independent across window sizes).
+                    let floating: Vec<crate::session::FloatingPaneState> = tab
+                        .floating
+                        .iter()
+                        .filter_map(|f| {
+                            let new_id = *map.get(&f.pane)?;
+                            Some(crate::session::FloatingPaneState {
+                                pane: new_id,
+                                x: (f.rect.x / cell.w as f32).max(0.0) as u16,
+                                y: ((f.rect.y - TAB_BAR_H) / cell.h as f32).max(0.0) as u16,
+                                w: (f.rect.w / cell.w as f32).max(1.0) as u16,
+                                h: (f.rect.h / cell.h as f32).max(1.0) as u16,
+                                origin: f.origin.clone(),
+                                hidden: f.hidden,
+                            })
+                        })
+                        .collect();
                     crate::session::TabState {
                         name: tab.name.clone(),
                         panes,
                         root: Some(root),
+                        floating,
                     }
                 })
                 .collect(),
-        };
-        crate::session::save(&self.current_session, &state);
-        crate::session::set_last_session(&self.current_session);
+        }
     }
 
-    /// Set every remote pane on `host` to Manual (upload failed).
+    /// Save + park the current session: its panes keep RUNNING in the
+    /// background (drained every frame in update()) while another session
+    /// is shown. The active tab set is cleared; callers must populate it.
+    /// An empty session is not parked (nothing to keep alive) and is not
+    /// written to disk — a deleted or never-populated session must not be
+    /// resurrected by a switch.
+    fn park_current(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        self.save_session();
+        self.parked.push(LiveSession {
+            name: self.current_session.clone(),
+            tabs: std::mem::take(&mut self.tabs),
+            active_tab: self.active_tab,
+        });
+        self.active_tab = 0;
+    }
+
+    /// Common tail of load_session/new_session: adopt `name` as the current
+    /// session, persist the marker, and refresh colors/layout.
+    fn finish_session_switch(&mut self, name: &str) {
+        self.current_session = name.to_string();
+        crate::session::set_last_session(name);
+        self.apply_terminal_colors();
+        self.layout_all();
+        self.toast(&format!("session: {name}"));
+    }
+
+    /// Set every remote pane on `host` to Manual (upload failed) — active
+    /// and parked sessions alike.
     fn set_remote_manual(&mut self, host: &str) {
         for tab in self.tabs.iter_mut() {
             for pane in tab.panes.iter_mut() {
                 if let Pane::Term(t) = pane {
                     if t.remote.as_ref().is_some_and(|r| r.host == host) {
                         t.reconnect = crate::term::ReconnectState::Manual;
+                    }
+                }
+            }
+        }
+        for live in self.parked.iter_mut() {
+            for tab in live.tabs.iter_mut() {
+                for pane in tab.panes.iter_mut() {
+                    if let Pane::Term(t) = pane {
+                        if t.remote.as_ref().is_some_and(|r| r.host == host) {
+                            t.reconnect = crate::term::ReconnectState::Manual;
+                        }
                     }
                 }
             }
@@ -1161,11 +1775,13 @@ impl App {
             let mut panes: Vec<Pane> = Vec::new();
             for ps in &ts.panes {
                 let args: Vec<&str> = ps.args.iter().map(String::as_str).collect();
-                // Remote panes restore DISCONNECTED: history shows, but the
-                // ssh only connects when the user presses Enter (or an
-                // in-session reconnect loop fires — never on restore).
-                let spawn = ps.remote.is_none();
-                let Ok(pane) = TermPane::new(
+                // Create the terminal WITHOUT spawning, replay history first,
+                // THEN start the shell. If the shell started before the
+                // replay, its startup terminal probes (fish 4: kitty/DA/
+                // XTVERSION/OSC 11) would sit in the pty buffer during the
+                // replay and get answered after the shell's read timeout —
+                // the responses then get echoed as caret-escaped garbage.
+                let Ok(mut pane) = TermPane::new(
                     cols,
                     rows,
                     cell,
@@ -1174,24 +1790,29 @@ impl App {
                     ps.cwd.as_deref(),
                     config.scrollback,
                     config.max_log_mb * 1024 * 1024,
-                    spawn,
+                    false,
                     ps.remote.clone(),
                 ) else {
                     continue;
                 };
-                let mut pane = pane;
                 let seeded = crate::session::replay_pane_log(
                     &ps.log,
                     &mut pane.term,
                     config.max_log_mb * 1024 * 1024,
                 );
                 pane.log_seed(&seeded);
-                if !spawn {
+                if let Some(remote) = &ps.remote {
+                    // Remote panes restore DISCONNECTED: history shows, but
+                    // the ssh only connects when the user presses Enter (or
+                    // an in-session reconnect loop fires — never on restore).
                     pane.exited = Some("disconnected (remote session)".into());
                     pane.last_exit_code = Some(1);
                     pane.reconnect = crate::term::ReconnectState::Manual;
-                    pane.force_repaint = true;
+                } else if let Err(e) = pane.spawn_child() {
+                    pane.exited = Some(format!("failed to start: {e}"));
+                    pane.last_exit_code = Some(1);
                 }
+                pane.force_repaint = true;
                 panes.push(Pane::Term(pane));
             }
             if !panes.is_empty() {
@@ -1201,6 +1822,31 @@ impl App {
                 if let Some(root) = &ts.root {
                     tab.root = root.clone();
                 }
+                // Restore floating panes (cells → logical px at this cell
+                // size). Skip states referencing panes that failed to build.
+                tab.floating = ts
+                    .floating
+                    .iter()
+                    .filter_map(|fs| {
+                        if fs.pane >= tab.panes.len() {
+                            return None;
+                        }
+                        if !matches!(tab.panes[fs.pane], Pane::Term(_)) {
+                            return None;
+                        }
+                        Some(FloatingPane {
+                            pane: fs.pane,
+                            rect: Rect {
+                                x: fs.x as f32 * cell.w as f32,
+                                y: TAB_BAR_H + fs.y as f32 * cell.h as f32,
+                                w: (fs.w as f32 * cell.w as f32).max(1.0),
+                                h: (fs.h as f32 * cell.h as f32).max(1.0),
+                            },
+                            origin: fs.origin.clone(),
+                            hidden: fs.hidden,
+                        })
+                    })
+                    .collect();
                 tabs.push(tab);
             }
         }
@@ -1213,7 +1859,20 @@ impl App {
             self.toast(&format!("already in session: {name}"));
             return;
         }
-        self.save_session(); // persist the outgoing session
+        // If the target session is STILL ALIVE in this process (parked when
+        // we switched away), swap the live tab sets — no shell respawn, no
+        // log replay; its processes kept running the whole time.
+        if let Some(idx) = self.parked.iter().position(|s| s.name == name) {
+            let mut live = self.parked.remove(idx);
+            self.park_current();
+            self.tabs = std::mem::take(&mut live.tabs);
+            self.active_tab = live.active_tab;
+            self.finish_session_switch(name);
+            return;
+        }
+        // Not alive this run → restore from disk (fresh shells + log replay).
+        // Build the incoming session FIRST so a failure leaves the current
+        // session untouched (it is only parked once the new one is ready).
         let cols: u16 = 100;
         let rows: u16 = 30;
         let tabs = match crate::session::load(name) {
@@ -1242,21 +1901,17 @@ impl App {
                 }
             }
         }
+        self.park_current();
         self.tabs = tabs;
         self.active_tab = 0;
-        self.current_session = name.to_string();
-        crate::session::set_last_session(name);
-        self.apply_terminal_colors();
-        self.layout_all();
-        self.toast(&format!("session: {name}"));
+        self.finish_session_switch(name);
     }
 
     /// Start a fresh (empty) session under `name`.
     pub fn new_session(&mut self, name: &str) {
-        self.save_session();
         let cols: u16 = 100;
         let rows: u16 = 30;
-        match TermPane::new(
+        let pane = match TermPane::new(
             cols,
             rows,
             self.cell,
@@ -1268,17 +1923,16 @@ impl App {
             true,
             None,
         ) {
-            Ok(p) => {
-                self.tabs = vec![Tab::new(Pane::Term(p), "Tab 1".into())];
-                self.active_tab = 0;
-                self.current_session = name.to_string();
-                crate::session::set_last_session(name);
-                self.apply_terminal_colors();
-                self.layout_all();
-                self.toast(&format!("new session: {name}"));
+            Ok(p) => p,
+            Err(e) => {
+                self.toast(&format!("failed to start session: {e}"));
+                return;
             }
-            Err(e) => self.toast(&format!("failed to start session: {e}")),
-        }
+        };
+        self.park_current();
+        self.tabs = vec![Tab::new(Pane::Term(pane), "Tab 1".into())];
+        self.active_tab = 0;
+        self.finish_session_switch(name);
     }
 
     /// Next free auto-generated session name (session-1, session-2, …).
@@ -1344,6 +1998,18 @@ impl App {
                 let _ = t.set_grid(cols, rows, cell);
             }
         }
+        // Floating panes keep their own rects (move/resize adjust them);
+        // their grids follow (hidden bg panes skip — no visible rect).
+        for f in tab.floating.iter_mut() {
+            if f.hidden {
+                continue;
+            }
+            if let Some(Pane::Term(t)) = tab.panes.get_mut(f.pane) {
+                let cols = ((f.rect.w - 2.0 * pad) / cell.w as f32).max(1.0) as u16;
+                let rows = ((f.rect.h - 2.0 * pad) / cell.h as f32).max(1.0) as u16;
+                let _ = t.set_grid(cols, rows, cell);
+            }
+        }
     }
 
     /// Rects for the active tab's panes (respecting zoom).
@@ -1374,6 +2040,30 @@ impl App {
     pub fn handle_key(&mut self, kp: KeyPress) {
         let k = kp.key;
         let m = kp.mods;
+
+        // Locked mode: ONLY Ctrl+g unlocks. ALL other keys pass straight to terminal!
+        if self.mode == Mode::Locked {
+            if kp.key == Key::G && kp.mods.contains(Mods::CTRL) {
+                self.mode = Mode::Normal;
+                self.toast("unlocked");
+            } else if let Some(t) = self.active_term_mut() {
+                let consumed = if kp.text.is_some() && m.contains(Mods::SHIFT) {
+                    Mods::SHIFT
+                } else {
+                    Mods::empty()
+                };
+                let text = kp.text.map(|c| c.to_string());
+                let _ = t.handle_key(
+                    k,
+                    m,
+                    consumed,
+                    keymap::unshifted_codepoint(k),
+                    text.as_deref(),
+                    key::Action::Press,
+                );
+            }
+            return;
+        }
 
         if keymap::is_quit(k, m) {
             self.quit = true;
@@ -1486,7 +2176,8 @@ impl App {
                         .take()
                         .and_then(|(e, sel)| e.get(sel).cloned());
                     self.mode = Mode::RenameSession;
-                    self.rename_buf = name.unwrap_or_default();
+                    self.rename_buf = name.clone().unwrap_or_default();
+                    self.rename_target = name.unwrap_or_default();
                 }
                 Key::D => {
                     let name = self
@@ -1496,6 +2187,12 @@ impl App {
                     if let Some(name) = name {
                         if name != self.current_session {
                             crate::session::delete(&name);
+                            // If the session is parked (still alive), drop it
+                            // too — its processes die, which is the point of
+                            // deleting a session.
+                            if let Some(idx) = self.parked.iter().position(|s| s.name == name) {
+                                self.parked.remove(idx);
+                            }
                             let entries = crate::session::list_sessions();
                             if let Some((e, sel)) = self.session_list.as_mut() {
                                 *e = entries;
@@ -1507,6 +2204,15 @@ impl App {
                         } else {
                             self.toast("cannot delete the current session");
                         }
+                    }
+                }
+                Key::K => {
+                    let name = self
+                        .session_list
+                        .as_ref()
+                        .and_then(|(e, sel)| e.get(*sel).cloned());
+                    if let Some(name) = name {
+                        self.kill_session_remotes(&name);
                     }
                 }
                 Key::N => {
@@ -1531,13 +2237,13 @@ impl App {
                 // Modal zellij modes return to Normal after most actions.
                 let was_modal = matches!(
                     self.mode,
-                    Mode::Pane | Mode::Tab | Mode::Resize | Mode::Move | Mode::Session
+                    Mode::Pane | Mode::Tab | Mode::Resize | Mode::Session
                 );
                 self.execute(action);
                 if was_modal
                     && matches!(
                         self.mode,
-                        Mode::Pane | Mode::Tab | Mode::Resize | Mode::Move | Mode::Session
+                        Mode::Pane | Mode::Tab | Mode::Resize | Mode::Session
                     )
                 {
                     self.mode = Mode::Normal;
@@ -1601,8 +2307,24 @@ impl App {
         if self.palette.is_some() {
             return;
         }
+        if self.mode == Mode::Locked {
+            if kp.key == Key::G && kp.mods.contains(Mods::CTRL) {
+                return;
+            }
+            if let Some(t) = self.active_term_mut() {
+                let _ = t.handle_key(
+                    kp.key,
+                    kp.mods,
+                    Mods::empty(),
+                    keymap::unshifted_codepoint(kp.key),
+                    None,
+                    key::Action::Release,
+                );
+            }
+            return;
+        }
         match self.mode {
-            Mode::Normal | Mode::Locked => {
+            Mode::Normal => {
                 // Only forward releases for keys the app did NOT consume on
                 // press (bound/entry/quit keys would spam the terminal with
                 // stray release events).
@@ -1731,10 +2453,26 @@ impl App {
         }
 
         let rects = self.active_pane_rects();
-        let hit = rects
-            .iter()
-            .find(|(_, r)| r.contains(mx, my))
-            .map(|(id, r)| (*id, *r));
+        // Floating panes are hit-tested FIRST (topmost; later floats draw
+        // above earlier ones). Tree panes only get the click if no float
+        // covers it.
+        let float_hit = {
+            let tab = self.current_tab();
+            tab.floating
+                .iter()
+                .rev()
+                .filter(|f| !f.hidden) // hidden floats are bg panes
+                .find(|f| f.rect.contains(mx, my))
+                .map(|f| (f.pane, f.rect))
+        };
+        let hit = if let Some(h) = float_hit {
+            Some(h)
+        } else {
+            rects
+                .iter()
+                .find(|(_, r)| r.contains(mx, my))
+                .map(|(id, r)| (*id, *r))
+        };
         let Some((pane_id, pane_rect)) = hit else {
             return;
         };
@@ -1768,9 +2506,20 @@ impl App {
         let Some(Pane::Term(t)) = tab.panes.get_mut(pane_id) else {
             // Preview/AI panes: wheel scrolls.
             if let Some(Pane::Preview(p)) = tab.panes.get_mut(pane_id) {
-                let (_, wy) = mouse_wheel();
+                let (wx, wy) = mouse_wheel();
                 if wy != 0.0 {
-                    p.scroll_lines(if wy > 0.0 { -3 } else { 3 });
+                    if p.kind == crate::preview::PreviewKind::Image {
+                        if wy > 0.0 {
+                            p.zoom_in();
+                        } else {
+                            p.zoom_out();
+                        }
+                    } else {
+                        p.scroll_lines(if wy > 0.0 { -3 } else { 3 });
+                    }
+                }
+                if wx != 0.0 && p.kind == crate::preview::PreviewKind::Image {
+                    p.pan(wx * 10.0, 0.0);
                 }
             } else if let Some(Pane::Ai(p)) = tab.panes.get_mut(pane_id) {
                 let (_, wy) = mouse_wheel();
@@ -1841,6 +2590,39 @@ impl App {
                 mods,
             );
         }
+        if is_mouse_button_pressed(MouseButton::Middle) {
+            let _ = t.handle_mouse(
+                pane_rect,
+                cell,
+                padding,
+                MouseEv {
+                    kind: MouseEvKind::Press(libghostty_vt::mouse::Button::Middle),
+                    x: lx,
+                    y: ly,
+                    any_pressed,
+                    button_down,
+                },
+                mods,
+            );
+            if !t.is_mouse_tracking() {
+                t.paste_primary();
+            }
+        }
+        if is_mouse_button_released(MouseButton::Middle) {
+            let _ = t.handle_mouse(
+                pane_rect,
+                cell,
+                padding,
+                MouseEv {
+                    kind: MouseEvKind::Release(libghostty_vt::mouse::Button::Middle),
+                    x: lx,
+                    y: ly,
+                    any_pressed,
+                    button_down,
+                },
+                mods,
+            );
+        }
 
         // Motion (drag / hover). The pane dedups identical positions.
         let _ = (mouse_position(), mouse_position());
@@ -1897,28 +2679,13 @@ impl App {
             }
         }
 
-        // Drain pty output for every pane in every tab.
-        for tab in self.tabs.iter_mut() {
-            let mut i = 0;
-            while i < tab.panes.len() {
-                match &mut tab.panes[i] {
-                    Pane::Term(t) => {
-                        if t.poll_pty() {
-                            self.pty_activity = true;
-                        }
-                    }
-                    Pane::Ai(a) => a.poll(),
-                    Pane::Preview(_) => {}
-                    Pane::Closed => {}
-                }
-                i += 1;
-            }
-            // Flush response buffers.
-            for pane in tab.panes.iter_mut() {
-                if let Pane::Term(t) = pane {
-                    t.flush_response();
-                }
-            }
+        // Drain pty output for every pane in every tab — active session AND
+        // parked sessions. Parked panes must keep draining or their pty
+        // buffers fill and the child processes stall; their logs also grow
+        // here, so the on-disk session stays current while hidden.
+        self.pty_activity |= drain_tab_panes(&mut self.tabs);
+        for live in self.parked.iter_mut() {
+            self.pty_activity |= drain_tab_panes(&mut live.tabs);
         }
 
         // ---- durable remote sessions ----
@@ -1926,6 +2693,7 @@ impl App {
         // ghostd upload results: mark the host ready and respawn panes that
         // were waiting for the binary.
         while let Ok((host, _session, ok)) = self.remote_uploads.try_recv() {
+            gdbg(format!("upload result {host}: ok={ok}"));
             if ok {
                 self.binary_ready.insert(host.clone());
                 self.respawn_waiting(&host);
@@ -1937,58 +2705,16 @@ impl App {
         }
 
         // Reconnect loop: a dead remote pane enters auto-reconnect (bounded),
-        // then drops to manual. Panes whose binary isn't uploaded yet wait
-        // for the upload signal instead of burning attempts.
+        // then drops to manual. Runs over the active session AND parked
+        // sessions — a durable remote session keeps reconnecting while you
+        // work elsewhere. Panes whose binary isn't uploaded yet wait for the
+        // upload signal instead of burning attempts.
         let now = std::time::Instant::now();
-        let mut to_respawn: Vec<(usize, usize)> = Vec::new();
-        let mut to_manual: Vec<(usize, usize)> = Vec::new();
-        for (ti, tab) in self.tabs.iter_mut().enumerate() {
-            for (pi, pane) in tab.panes.iter_mut().enumerate() {
-                let Pane::Term(t) = pane else { continue };
-                if t.remote.is_none() {
-                    continue;
-                }
-                if t.exited.is_some() && t.reconnect == crate::term::ReconnectState::Idle {
-                    let code = t.last_exit_code.unwrap_or(255);
-                    let auto = self.config.remote.auto_reconnect && code != 0;
-                    if auto && t.reconnect_failures < self.config.remote.reconnect_attempts {
-                        t.reconnect_failures += 1;
-                        let delay = self.config.remote.reconnect_delay_secs.max(1);
-                        t.reconnect = crate::term::ReconnectState::Waiting {
-                            attempt: t.reconnect_failures,
-                            next: now + std::time::Duration::from_secs(delay),
-                        };
-                    } else {
-                        t.reconnect = crate::term::ReconnectState::Manual;
-                    }
-                }
-                if let crate::term::ReconnectState::Waiting { attempt, next } = t.reconnect {
-                    if now >= next {
-                        let host = t.remote.as_ref().map(|r| r.host.clone());
-                        if let Some(h) = host {
-                            if self.binary_ready.contains(&h) {
-                                to_respawn.push((ti, pi));
-                            } else {
-                                t.reconnect = crate::term::ReconnectState::Waiting {
-                                    attempt,
-                                    next: now + std::time::Duration::from_millis(500),
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for (ti, pi) in to_respawn {
-            if let Pane::Term(t) = &mut self.tabs[ti].panes[pi] {
-                if !t.respawn() {
-                    t.reconnect = crate::term::ReconnectState::Manual;
-                }
-            }
-        }
-        for (ti, pi) in to_manual {
-            if let Pane::Term(t) = &mut self.tabs[ti].panes[pi] {
-                t.reconnect = crate::term::ReconnectState::Manual;
+        {
+            let App { tabs, parked, config, binary_ready, .. } = self;
+            remote_reconnect_pass(config, binary_ready, tabs, now);
+            for live in parked.iter_mut() {
+                remote_reconnect_pass(config, binary_ready, &mut live.tabs, now);
             }
         }
 
@@ -2000,6 +2726,99 @@ impl App {
             if !title.is_empty() && (tab.name.is_empty() || tab.name.starts_with("Tab ")) {
                 tab.name = title;
             }
+        }
+    }
+}
+
+/// Drain pty output for every pane in every tab; returns true if any pty
+/// produced data (drives the event-paced frame loop). Also flushes each
+/// pane's response buffer. Runs for the active session AND parked sessions
+/// every frame, so background children never stall on full pty buffers and
+/// their durable logs keep growing.
+fn drain_tab_panes(tabs: &mut [Tab]) -> bool {
+    let mut activity = false;
+    for tab in tabs.iter_mut() {
+        let mut i = 0;
+        while i < tab.panes.len() {
+            match &mut tab.panes[i] {
+                Pane::Term(t) => {
+                    if t.poll_pty() {
+                        activity = true;
+                    }
+                }
+                Pane::Ai(a) => a.poll(),
+                Pane::Preview(_) => {}
+                Pane::Closed => {}
+            }
+            i += 1;
+        }
+        // Flush response buffers.
+        for pane in tab.panes.iter_mut() {
+            if let Pane::Term(t) = pane {
+                t.flush_response();
+            }
+        }
+    }
+    activity
+}
+
+/// One reconnect pass over a session's tabs: advance dead remote panes
+/// through the bounded auto-reconnect state machine and respawn due ones.
+fn remote_reconnect_pass(
+    config: &Config,
+    binary_ready: &std::collections::HashSet<String>,
+    tabs: &mut [Tab],
+    now: std::time::Instant,
+) {
+    let mut to_respawn: Vec<(usize, usize)> = Vec::new();
+    let to_manual: Vec<(usize, usize)> = Vec::new();
+    for (ti, tab) in tabs.iter_mut().enumerate() {
+        for (pi, pane) in tab.panes.iter_mut().enumerate() {
+            let Pane::Term(t) = pane else { continue };
+            if t.remote.is_none() {
+                continue;
+            }
+            if t.exited.is_some() && t.reconnect == crate::term::ReconnectState::Idle {
+                let code = t.last_exit_code.unwrap_or(255);
+                let auto = config.remote.auto_reconnect && code != 0;
+                if auto && t.reconnect_failures < config.remote.reconnect_attempts {
+                    t.reconnect_failures += 1;
+                    let delay = config.remote.reconnect_delay_secs.max(1);
+                    t.reconnect = crate::term::ReconnectState::Waiting {
+                        attempt: t.reconnect_failures,
+                        next: now + std::time::Duration::from_secs(delay),
+                    };
+                } else {
+                    t.reconnect = crate::term::ReconnectState::Manual;
+                }
+            }
+            if let crate::term::ReconnectState::Waiting { attempt, next } = t.reconnect {
+                if now >= next {
+                    let host = t.remote.as_ref().map(|r| r.host.clone());
+                    if let Some(h) = host {
+                        if binary_ready.contains(&h) {
+                            to_respawn.push((ti, pi));
+                        } else {
+                            t.reconnect = crate::term::ReconnectState::Waiting {
+                                attempt,
+                                next: now + std::time::Duration::from_millis(500),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (ti, pi) in to_respawn {
+        if let Pane::Term(t) = &mut tabs[ti].panes[pi] {
+            if !t.respawn() {
+                t.reconnect = crate::term::ReconnectState::Manual;
+            }
+        }
+    }
+    for (ti, pi) in to_manual {
+        if let Pane::Term(t) = &mut tabs[ti].panes[pi] {
+            t.reconnect = crate::term::ReconnectState::Manual;
         }
     }
 }
@@ -2093,21 +2912,30 @@ fn upload_ghostd(host: &str) -> bool {
     // 1. Remote arch decides which embedded binary to ship.
     let arch = match ssh_out(host, "uname -m") {
         Some(a) => a.trim().to_string(),
-        None => return false,
+        None => {
+            gdbg(format!("upload {host}: uname -m failed"));
+            return false;
+        }
     };
+    gdbg(format!("upload {host}: arch={arch}"));
     let bytes: &[u8] = match arch.as_str() {
         "x86_64" => GHOSTD_X86_64,
         "aarch64" => GHOSTD_AARCH64,
-        _ => return false,
+        _ => {
+            gdbg(format!("upload {host}: unsupported arch {arch}"));
+            return false;
+        }
     };
     // 2. Already current? (version check on the remote).
     let check = format!(
-        "BIN=\"$HOME/.cache/ghostwave/ghostd-{arch}\"; [ -x \"$BIN\" ] && [ \"$($BIN --version 2>/dev/null)\" = \"ghostd {ver}\" ]",
+        "sh -c 'BIN=\"$HOME/.cache/ghostwave/ghostd-{arch}\"; [ -x \"$BIN\" ] && [ \"$($BIN --version 2>/dev/null)\" = \"ghostd {ver}\" ]'",
         ver = env!("CARGO_PKG_VERSION")
     );
     if ssh_ok(host, &check) {
+        gdbg(format!("upload {host}: binary current, no upload"));
         return true;
     }
+    gdbg(format!("upload {host}: uploading {} bytes", bytes.len()));
     // 3. Upload the binary over stdin.
     let mut child = match std::process::Command::new("ssh")
         .args([
@@ -2115,7 +2943,7 @@ fn upload_ghostd(host: &str) -> bool {
             "ConnectTimeout=5",
             host,
             &format!(
-                "mkdir -p \"$HOME/.cache/ghostwave\" && cat > \"$HOME/.cache/ghostwave/ghostd-{arch}\" && chmod +x \"$HOME/.cache/ghostwave/ghostd-{arch}\""
+                "sh -c 'mkdir -p \"$HOME/.cache/ghostwave\" && cat > \"$HOME/.cache/ghostwave/ghostd-{arch}.new\" && chmod +x \"$HOME/.cache/ghostwave/ghostd-{arch}.new\" && mv -f \"$HOME/.cache/ghostwave/ghostd-{arch}.new\" \"$HOME/.cache/ghostwave/ghostd-{arch}\"'"
             ),
         ])
         .stdin(std::process::Stdio::piped())

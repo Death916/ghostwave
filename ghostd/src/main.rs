@@ -28,10 +28,10 @@ use nix::{
 };
 
 use ghostd::{
-    daemonize, dcs_size_msg, die, fd_poll, fd_read, install_term_handler, log_path, pid_alive,
-    pid_path, set_nonblock, set_term_size, socket_path, spawn_child, state_dir, term_size,
-    truncate_log_front, write_all_blocking, DEFAULT_FIRST_ATTACH_SECS, DEFAULT_LOG_CAP_MB,
-    TERM_REQUESTED, VERSION,
+    daemonize, dcs_size_msg, die, fd_poll, fd_read, gdbg, install_term_handler, kill_child_group,
+    log_path, pid_alive, pid_path, probe_session, recover_session, set_nonblock, set_term_size,
+    socket_path, spawn_child, state_dir, term_size, truncate_log_front, write_all_blocking,
+    DEFAULT_FIRST_ATTACH_SECS, DEFAULT_LOG_CAP_MB, Probe, TERM_REQUESTED, VERSION,
 };
 
 fn eprintln_exit(msg: &str) -> ! {
@@ -42,8 +42,13 @@ fn eprintln_exit(msg: &str) -> ! {
 /// Accept loop. `tx` is where pty output is published for the client.
 fn accept_loop(listener: UnixListener, name: &str, log_cap: u64, first_attach_secs: u64) {
     let log_file = log_path(name);
-    let pty_fd = spawn_child(&[]);
-    let _ = fs::write(pid_path(name), format!("{}", nix::unistd::getpid()));
+    let (pty_fd, child_pid) = spawn_child(&[]);
+    // Two-line pidfile: daemon pid, then the pty child's pid. `ghostd kill`
+    // needs both so a wedged daemon can't orphan the session's program.
+    let _ = fs::write(
+        pid_path(name),
+        format!("{}\n{}", nix::unistd::getpid(), child_pid.as_raw()),
+    );
     let mut log = OpenOptions::new().create(true).append(true).open(&log_file).unwrap_or_else(|e| die(&format!("log: {e}")));
     let mut log_bytes = fs::metadata(&log_file).map(|m| m.len()).unwrap_or(0);
 
@@ -71,12 +76,22 @@ fn accept_loop(listener: UnixListener, name: &str, log_cap: u64, first_attach_se
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     if ever_attached && client_tx.lock().unwrap().is_some() {
-                        let _ = stream.write_all(b"busy: another client is attached\n");
+                        let _ = write_all_blocking(
+                            stream.as_raw_fd(),
+                            b"busy: another client is attached\n",
+                        );
                     } else {
                         ever_attached = true;
                         let tx = client_tx.clone();
                         let log_file = log_file.clone();
-                        std::thread::spawn(move || handle_client(stream, &log_file, pty_fd, tx));
+                        let name_owned = name.to_string();
+                        gdbg(
+                            "daemon",
+                            &format!("{name}: accepted client (ever_attached={ever_attached})"),
+                        );
+                        std::thread::spawn(move || {
+                            handle_client(stream, &name_owned, &log_file, pty_fd, tx)
+                        });
                     }
                 }
                 Err(_) => {}
@@ -110,16 +125,19 @@ fn accept_loop(listener: UnixListener, name: &str, log_cap: u64, first_attach_se
         _ = wait::waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
     }
 
-    // Cleanup: kill the child (if still alive), remove state.
-    _ = signal::kill(Pid::from_raw(-1), Signal::SIGTERM);
+    // Cleanup: kill the pty child's process group (TERM, then KILL if it
+    // ignores), remove state. Never kill(-1) — that broadcasts SIGTERM to
+    // every process this user owns on the host.
+    kill_child_group(child_pid, Duration::from_secs(2));
     let _ = wait::waitpid(Pid::from_raw(-1), None);
     let _ = fs::remove_file(socket_path(name));
     let _ = fs::remove_file(pid_path(name));
 }
 
-/// One attached client: apply size, replay the log, then live relay.
+/// One attached client: apply size, ack, replay the log, then live relay.
 fn handle_client(
     mut stream: UnixStream,
+    name: &str,
     log_file: &Path,
     pty_fd: i32,
     tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
@@ -128,13 +146,23 @@ fn handle_client(
     // Blocking dup for writes to the pty (client thread only).
     let pty_write = unsafe { nix::libc::dup(pty_fd) }.max(0);
 
-    // 1. SIZE line.
+    // 1. SIZE line, WAITED for. The original code read nonblocking and
+    //    bailed on EAGAIN — if the client's handshake hadn't landed yet,
+    //    the thread died silently and the attach hung forever with zero
+    //    output (the reported `ds` symptom).
     let mut first_line = Vec::new();
     let mut byte = [0u8; 1];
     let mut got_size = false;
-    while first_line.len() < 128 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while first_line.len() < 128 && Instant::now() < deadline {
+        if fd_poll(&mut [(stream.as_raw_fd(), true)], 200)
+            .map(|r| r.is_empty())
+            .unwrap_or(true)
+        {
+            continue;
+        }
         match fd_read(stream.as_raw_fd(), &mut byte) {
-            Ok(0) | Err(Errno::EAGAIN) => break,
+            Ok(0) => break,
             Ok(_) => {
                 first_line.push(byte[0]);
                 if byte[0] == b'\n' {
@@ -142,10 +170,12 @@ fn handle_client(
                     break;
                 }
             }
+            Err(Errno::EAGAIN) => {}
             Err(_) => break,
         }
     }
     if !got_size {
+        gdbg("daemon", &format!("{name}: client left without SIZE"));
         return;
     }
     let line = String::from_utf8_lossy(&first_line);
@@ -157,17 +187,25 @@ fn handle_client(
             }
         }
     } else {
+        gdbg("daemon", &format!("{name}: bad SIZE line {line:?}"));
         return;
     }
 
-    // 2. Replay the log (history continuity, including the drop-gap).
+    // 2. ACK so attach/probe know the daemon is alive. (New protocol:
+    //    a wedged daemon never answers, which lets attach fail fast and
+    //    `new` recover the session instead of hanging forever.)
+    if write_all_blocking(stream.as_raw_fd(), b"OK\n").is_err() {
+        return;
+    }
+
+    // 3. Replay the log (history continuity, including the drop-gap).
     if let Ok(mut f) = File::open(log_file) {
         let mut buf = [0u8; 32768];
         loop {
             match f.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if stream.write_all(&buf[..n]).is_err() {
+                    if write_all_blocking(stream.as_raw_fd(), &buf[..n]).is_err() {
                         return;
                     }
                 }
@@ -175,6 +213,7 @@ fn handle_client(
             }
         }
     }
+    gdbg("daemon", &format!("{name}: client attached, relaying"));
 
     // 3. Live relay. Publish our sender for the main loop.
     let (txc, rxc) = mpsc::channel::<Vec<u8>>();
@@ -194,31 +233,48 @@ fn handle_client(
         };
         let stream_ready = ready.contains(&0);
 
-        // Client -> pty (strip DCS size messages).
+        // Client -> pty (strip DCS size messages). Only `ESC P` (DCS
+        // introducer) starts a size message — ANY other ESC byte is a
+        // normal escape sequence (arrows = `ESC [ A`, etc.) and must pass
+        // through, or interactive TUI apps freeze on mangled input.
         if stream_ready {
             match fd_read(stream.as_raw_fd(), &mut read_buf) {
                 Ok(0) | Err(Errno::EAGAIN) => {}
                 Ok(n) => {
                     for &b in &read_buf[..n] {
                         if in_dcs {
-                            dcs_buf.push(b);
-                            if dcs_buf.len() > 64 {
+                            if dcs_buf.len() == 1 && b != b'P' {
+                                // ESC followed by anything but 'P': not a
+                                // DCS — emit the ESC and re-handle `b`.
+                                pty_out.push(0x1b);
                                 in_dcs = false;
                                 dcs_buf.clear();
-                            } else if b == b'\\' && dcs_buf.len() >= 2 && dcs_buf[dcs_buf.len() - 2] == 0x1b {
-                                // complete DCS: \x1bPgw-size <c> <r>\x1b\
-                                if let Some(rest) = dcs_buf.strip_prefix(b"Pgw-size ") {
-                                    let s = String::from_utf8_lossy(rest);
-                                    let s = s.trim_end_matches('\x1b').trim();
-                                    let mut it = s.split(' ');
-                                    if let (Some(c), Some(r)) = (it.next(), it.next()) {
-                                        if let (Ok(c), Ok(r)) = (c.parse::<u16>(), r.parse::<u16>()) {
-                                            set_term_size(pty_write, c, r);
+                                if b == 0x1b {
+                                    in_dcs = true;
+                                    dcs_buf.push(b);
+                                } else {
+                                    pty_out.push(b);
+                                }
+                            } else {
+                                dcs_buf.push(b);
+                                if dcs_buf.len() > 64 {
+                                    in_dcs = false;
+                                    dcs_buf.clear();
+                                } else if b == b'\\' && dcs_buf.len() >= 2 && dcs_buf[dcs_buf.len() - 2] == 0x1b {
+                                    // complete DCS: \x1bPgw-size <c> <r>\x1b\
+                                    if let Some(rest) = dcs_buf.strip_prefix(b"Pgw-size ") {
+                                        let s = String::from_utf8_lossy(rest);
+                                        let s = s.trim_end_matches('\x1b').trim();
+                                        let mut it = s.split(' ');
+                                        if let (Some(c), Some(r)) = (it.next(), it.next()) {
+                                            if let (Ok(c), Ok(r)) = (c.parse::<u16>(), r.parse::<u16>()) {
+                                                set_term_size(pty_write, c, r);
+                                            }
                                         }
                                     }
+                                    in_dcs = false;
+                                    dcs_buf.clear();
                                 }
-                                in_dcs = false;
-                                dcs_buf.clear();
                             }
                         } else if b == 0x1b {
                             in_dcs = true;
@@ -283,25 +339,30 @@ fn cmd_new(name: &str, cmd: &[String], log_cap: u64, first_attach_secs: u64) {
         die("bad session name");
     }
     let _ = fs::create_dir_all(state_dir());
-    // Liveness check: a socket that refuses connections is stale.
-    let sock = socket_path(name);
-    if sock.exists() {
-        match UnixStream::connect(&sock) {
-            Ok(_) => die(&format!("session '{name}' already exists (attach instead)")),
-            Err(_) => {
-                // Stale socket from a dead daemon.
-                let _ = fs::remove_file(&sock);
-                let _ = fs::remove_file(pid_path(name));
-            }
+    // Liveness check with RECOVERY: a socket that refuses connections is
+    // stale (rebind); a daemon that accepts but never answers the SIZE
+    // handshake is wedged — kill it and rebind fresh. Only a live,
+    // answering daemon refuses the new session.
+    match probe_session(name) {
+        Probe::Healthy => die(&format!("session '{name}' already exists (attach instead)")),
+        Probe::Unresponsive => {
+            gdbg("new", &format!("{name}: wedged daemon — recovering"));
+            recover_session(name);
         }
+        Probe::NoSession => {}
     }
     daemonize();
     install_term_handler();
+    let sock = socket_path(name);
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
         Err(e) => die(&format!("bind {sock:?}: {e}")),
     };
     set_nonblock(listener.as_raw_fd());
+    gdbg(
+        "new",
+        &format!("{name}: daemon up (pid {})", nix::unistd::getpid()),
+    );
     accept_loop(listener, name, log_cap, first_attach_secs);
 }
 
@@ -311,9 +372,22 @@ fn cmd_attach(name: &str) {
         std::process::exit(1);
     };
     // Send our terminal size; listen for SIGWINCH and re-send as DCS.
+    // Always send a SIZE line (the daemon's handshake requires it) —
+    // fall back to 80x24 when stdin isn't a tty.
     let stdin_fd = std::io::stdin().as_raw_fd();
-    if let Some((c, r)) = term_size(stdin_fd) {
-        let _ = stream.write_all(format!("SIZE {c} {r}\n").as_bytes());
+    let size = term_size(stdin_fd).unwrap_or((80, 24));
+    let _ = stream.write_all(format!("SIZE {} {}\n", size.0, size.1).as_bytes());
+    // Raw-mode stdin: the ssh pty's line discipline must not eat control
+    // bytes. In canonical mode Ctrl+C SIGINTs THIS process (dropping the
+    // connection) and arrow keys get echo-buffered as ^[[A instead of
+    // reaching the session's shell. cfmakeraw disables ICANON/ECHO/ISIG
+    // so every byte (0x03, arrows, …) flows through to the daemon, which
+    // writes it to the child pty (the shell there re-enables its own
+    // signal handling).
+    let mut t: nix::libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { nix::libc::tcgetattr(stdin_fd, &mut t) } == 0 {
+        unsafe { nix::libc::cfmakeraw(&mut t) };
+        unsafe { nix::libc::tcsetattr(stdin_fd, nix::libc::TCSANOW, &t) };
     }
     let mut last_size = term_size(stdin_fd);
     extern "C" fn on_winch(_: i32) {}
@@ -333,6 +407,43 @@ fn cmd_attach(name: &str) {
 
     let mut in_buf = [0u8; 32768];
     let mut out_buf: Vec<u8> = Vec::new(); // pending bytes to stdout
+
+    // Handshake: wait (bounded) for the daemon's "OK\n" ack. A healthy
+    // daemon acks right after the SIZE line; a wedged one never answers —
+    // exit 1 so the caller's `|| new` fallback recovers the session
+    // instead of hanging forever with zero output.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if fd_poll(&mut [(stream.as_raw_fd(), true)], 200)
+            .map(|r| r.is_empty())
+            .unwrap_or(true)
+        {
+            if Instant::now() >= deadline {
+                eprintln!("ghostd: session '{name}' not responding — recovering");
+                std::process::exit(1);
+            }
+            continue;
+        }
+        match fd_read(stream.as_raw_fd(), &mut in_buf) {
+            Ok(0) => {
+                eprintln!("ghostd: session '{name}' closed");
+                std::process::exit(1);
+            }
+            Ok(n) => {
+                let data = &in_buf[..n];
+                if out_buf.is_empty() && data.starts_with(b"OK\n") {
+                    out_buf.extend_from_slice(&data[3..]);
+                } else {
+                    out_buf.extend_from_slice(data);
+                }
+                break;
+            }
+            Err(Errno::EAGAIN) => {}
+            Err(_) => std::process::exit(1),
+        }
+    }
+    gdbg("attach", &format!("{name}: handshake ok, relaying"));
+
     loop {
         // SIGWINCH: resend the size.
         let now = term_size(stdin_fd);
@@ -349,18 +460,22 @@ fn cmd_attach(name: &str) {
         };
         if ready.contains(&0) {
             match fd_read(stdin_fd, &mut in_buf) {
-                Ok(0) | Err(Errno::EAGAIN) => {}
+                // stdin EOF/EIO: the ssh client is gone — exit instead of
+                // spinning on POLLHUP at 100% CPU (was ignored before).
+                Ok(0) | Err(Errno::EIO) => break,
                 Ok(n) => {
                     if stream.write_all(&in_buf[..n]).is_err() {
                         break;
                     }
                 }
+                Err(Errno::EAGAIN) => {}
                 Err(_) => break,
             }
         }
         if ready.contains(&1) {
             match fd_read(stream.as_raw_fd(), &mut in_buf) {
-                Ok(0) | Err(Errno::EAGAIN) => {}
+                Ok(0) => std::process::exit(1), // daemon gone: session over
+                Err(Errno::EAGAIN) => {}
                 Ok(n) => out_buf.extend_from_slice(&in_buf[..n]),
                 Err(_) => break,
             }
@@ -411,17 +526,33 @@ fn cmd_kill(name: &str) {
         eprintln!("ghostd: no session '{name}'");
         std::process::exit(1);
     };
-    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+    // Two-line pidfile: daemon pid, then the pty child's pid (old files
+    // have a single line — child unknown, daemon kill still works).
+    let mut lines = pid_str.lines();
+    let Some(daemon) = lines.next().and_then(|l| l.trim().parse::<i32>().ok()) else {
         eprintln!("ghostd: bad pid for '{name}'");
         std::process::exit(1);
     };
-    let _ = signal::kill(Pid::from_raw(pid), Signal::SIGTERM);
-    // Wait for cleanup (the daemon removes its own files).
-    for _ in 0..50 {
-        if !pid_alive(Pid::from_raw(pid)) {
+    let child = lines.next().and_then(|l| l.trim().parse::<i32>().ok());
+    let daemon = Pid::from_raw(daemon);
+    // SIGTERM the daemon; its handler cleans up its own files. If it's
+    // wedged, escalate: SIGKILL it and kill the session's process group
+    // directly so a stuck daemon can't orphan the running program.
+    let _ = signal::kill(daemon, Signal::SIGTERM);
+    let mut alive = true;
+    for _ in 0..30 {
+        if !pid_alive(daemon) {
+            alive = false;
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+    if alive {
+        gdbg("kill", &format!("{name}: daemon {daemon} stuck, SIGKILL"));
+        let _ = signal::kill(daemon, Signal::SIGKILL);
+    }
+    if let Some(c) = child {
+        kill_child_group(Pid::from_raw(c), Duration::from_secs(2));
     }
     let _ = fs::remove_file(socket_path(name));
     let _ = fs::remove_file(pid_file);

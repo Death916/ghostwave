@@ -161,3 +161,104 @@ fn is_word_boundary(text: &str, start: usize, end: usize) -> bool {
     let word = |c: Option<char>| c.map_or(false, |c| c.is_alphanumeric() || c == '_');
     !word(before) && !word(after)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whole_word_boundary() {
+        // positive: word at end, start, solo, surrounded by non-word chars
+        assert!(is_word_boundary("hello world", 6, 11), "world at end");
+        assert!(is_word_boundary("foo bar", 0, 3), "foo at start");
+        assert!(is_word_boundary("foo", 0, 3), "solo word");
+        assert!(is_word_boundary("foo,bar", 0, 3), "followed by comma (non-word)");
+        assert!(is_word_boundary("foo-bar", 4, 7), "after hyphen");
+        // negative: substring inside a word or joined by word char
+        assert!(!is_word_boundary("helloworld", 5, 10), "substring inside word");
+        assert!(!is_word_boundary("foo_bar", 0, 3), "underscore is word char, so foo is not a word");
+        assert!(!is_word_boundary("afoo", 1, 4), "preceded by word char");
+        assert!(!is_word_boundary("foobar", 0, 3), "followed by word char");
+        assert!(!is_word_boundary("foo_bar", 4, 7), "bar inside foo_bar");
+    }
+
+    #[test]
+    fn search_state_lifecycle() {
+        let mut s = SearchState::default();
+        assert!(!s.active(), "default should be inactive");
+        assert!(!s.active);
+        s.start();
+        assert!(s.active, "start sets flag");
+        assert!(s.dirty, "start marks dirty");
+        assert!(!s.active(), "active() still false when query is empty — probes the &&");
+        s.set_query("hi".into());
+        assert_eq!(s.query, "hi");
+        assert!(s.active(), "now truly active");
+        assert!(s.dirty);
+        assert_eq!(s.current, 0);
+        s.matches.push(Match { row: 0, col_start: 0, col_end: 2 });
+        s.stop();
+        assert!(!s.active);
+        assert!(s.query.is_empty(), "stop clears query");
+        assert!(s.matches.is_empty(), "stop clears matches");
+        assert!(!s.dirty);
+        assert!(!s.active(), "inactive after stop");
+    }
+
+    #[test]
+    fn next_prev_wraps() {
+        let mut s = SearchState::default();
+        s.matches = vec![
+            Match { row: 0, col_start: 0, col_end: 2 },
+            Match { row: 0, col_start: 5, col_end: 7 },
+            Match { row: 1, col_start: 0, col_end: 2 },
+        ];
+        assert_eq!(s.current, 0);
+        s.next_match();
+        assert_eq!(s.current, 1);
+        s.next_match();
+        assert_eq!(s.current, 2);
+        s.next_match();
+        assert_eq!(s.current, 0, "wraps around");
+        s.prev_match();
+        assert_eq!(s.current, 2, "prev from 0 wraps to last");
+        s.prev_match();
+        assert_eq!(s.current, 1);
+    }
+
+    #[test]
+    fn next_prev_empty_is_noop() {
+        let mut s = SearchState::default();
+        s.next_match();
+        s.prev_match();
+        assert_eq!(s.current, 0);
+    }
+
+    #[test]
+    fn contains_and_row_has_match() {
+        let mut s = SearchState::default();
+        s.matches = vec![
+            Match { row: 2, col_start: 3, col_end: 7 },
+            Match { row: 5, col_start: 0, col_end: 4 },
+        ];
+        assert!(s.contains(2, 3));
+        assert!(s.contains(2, 6));
+        assert!(!s.contains(2, 7), "end is exclusive");
+        assert!(!s.contains(2, 2));
+        assert!(!s.contains(3, 4));
+        assert!(s.contains(5, 0));
+        assert!(s.row_has_match(2));
+        assert!(s.row_has_match(5));
+        assert!(!s.row_has_match(3));
+    }
+
+    #[test]
+    fn set_query_resets_current() {
+        let mut s = SearchState::default();
+        s.matches = vec![Match { row: 0, col_start: 0, col_end: 2 }];
+        s.current = 1;
+        s.set_query("new".into());
+        assert_eq!(s.current, 0);
+        assert!(s.dirty);
+    }
+}

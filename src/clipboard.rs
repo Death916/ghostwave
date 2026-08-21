@@ -77,3 +77,37 @@ pub fn read_text() -> Option<String> {
         Err(_) => None,
     }
 }
+
+fn read_primary_text_blocking() -> Option<String> {
+    for cmd in ["wl-paste", "xclip", "xsel"] {
+        let mut c = Command::new(cmd);
+        if cmd == "wl-paste" {
+            c.arg("--primary");
+        } else if cmd == "xclip" {
+            c.arg("-selection").arg("primary").arg("-o");
+        } else if cmd == "xsel" {
+            c.arg("--primary").arg("--output");
+        }
+        let out = c.output().ok()?;
+        if out.status.success() && !out.stdout.is_empty() {
+            return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+    }
+    None
+}
+
+pub fn read_primary_text() -> Option<String> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_primary_text_blocking());
+    });
+    match rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(v) => v,
+        Err(RecvTimeoutError::Timeout) => {
+            eprintln!("ghostwave: primary selection paste timed out");
+            None
+        }
+        Err(_) => None,
+    }
+}
+

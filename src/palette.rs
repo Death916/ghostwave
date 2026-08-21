@@ -103,6 +103,7 @@ impl CommandPalette {
     pub fn default_items(themes: &[&'static str]) -> Vec<PaletteItem> {
         use crate::keymap::Action::*;
         let mut items = vec![
+            PaletteItem { label: "Kill Remote Session".into(), action: KillRemoteSession },
             PaletteItem { label: "New Tab".into(), action: NewTab },
             PaletteItem { label: "New Pane (down)".into(), action: NewPaneDown },
             PaletteItem { label: "New Pane (right)".into(), action: NewPaneRight },
@@ -114,7 +115,7 @@ impl CommandPalette {
             PaletteItem { label: "Focus Up".into(), action: MoveFocus(crate::layout::Dir::Up) },
             PaletteItem { label: "Focus Down".into(), action: MoveFocus(crate::layout::Dir::Down) },
             PaletteItem { label: "Next Pane".into(), action: SwitchFocus },
-            PaletteItem { label: "Zoom Pane".into(), action: ToggleZoom },
+            PaletteItem { label: "Fullscreen Pane (Window)".into(), action: ToggleZoom },
             PaletteItem { label: "Toggle Pane Frames".into(), action: ToggleFrames },
             PaletteItem { label: "Rename Tab".into(), action: RenameTab },
             PaletteItem { label: "Rename Pane".into(), action: RenamePane },
@@ -132,5 +133,170 @@ impl CommandPalette {
             });
         }
         items
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keymap::Action;
+
+    fn palette(labels: &[&str]) -> CommandPalette {
+        let items = labels.iter().map(|l| PaletteItem { label: l.to_string(), action: Action::Quit }).collect();
+        CommandPalette::new(items)
+    }
+
+    #[test]
+    fn filtered_empty_returns_all() {
+        let p = palette(&["Foo", "Bar", "Baz"]);
+        let all = p.filtered();
+        assert_eq!(all.len(), 3);
+        // Must be the original labels, not synthesized entries
+        let labels: Vec<_> = all.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"Foo") && labels.contains(&"Bar") && labels.contains(&"Baz"));
+        assert!(all.iter().all(|i| matches!(i.action, Action::Quit)), "empty filter returns original actions unchanged");
+    }
+
+    #[test]
+    fn filtered_case_insensitive_substring() {
+        let p = {
+            let mut c = palette(&["New Tab", "Close Tab", "New Pane"]);
+            c.input = "tab".into();
+            c
+        };
+        let out = p.filtered();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|i| i.label == "New Tab"));
+        assert!(out.iter().any(|i| i.label == "Close Tab"));
+    }
+
+    #[test]
+    fn filtered_no_match_is_empty() {
+        let mut p = palette(&["Foo", "Bar"]);
+        p.input = "zzz".into();
+        assert!(p.filtered().is_empty());
+    }
+
+    #[test]
+    fn dynamic_open_prefix() {
+        let mut p = palette(&["Foo"]);
+        p.input = "open /tmp/file.txt".into();
+        let out = p.filtered();
+        assert_eq!(out.len(), 1, "open prefix should produce exactly one synthetic entry");
+        assert_eq!(out[0].label, "Open file: /tmp/file.txt");
+        assert!(matches!(&out[0].action, Action::OpenFile(s) if s == "/tmp/file.txt"), "action should carry the path verbatim");
+        // trimmed value: "open   /tmp/a.txt  " should still extract /tmp/a.txt
+        p.input = "open   /tmp/a.txt  ".into();
+        let out2 = p.filtered();
+        assert!(matches!(&out2[0].action, Action::OpenFile(s) if s == "/tmp/a.txt"));
+        // bare "open " with no path falls through to normal filter, not a synthetic entry
+        p.input = "open ".into();
+        let bare = p.filtered();
+        assert!(bare.iter().all(|i| !matches!(i.action, Action::OpenFile(_))), "bare 'open ' should not synthesize OpenFile");
+    }
+
+    #[test]
+    fn dynamic_ssh_prefix() {
+        let mut p = palette(&["Foo"]);
+        p.input = "ssh myhost".into();
+        let out = p.filtered();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].label, "Connect SSH: myhost");
+        assert!(matches!(&out[0].action, Action::ConnectSsh(s) if s == "myhost"), "ssh action should carry host verbatim");
+        // trims surrounding whitespace
+        p.input = "ssh   myhost  ".into();
+        let out2 = p.filtered();
+        assert!(matches!(&out2[0].action, Action::ConnectSsh(s) if s == "myhost"));
+        // bare "ssh " is not a synthetic entry
+        p.input = "ssh ".into();
+        assert!(p.filtered().iter().all(|i| !matches!(i.action, Action::ConnectSsh(_))));
+    }
+
+    #[test]
+    fn dynamic_ds_prefix() {
+        let mut p = palette(&["Foo"]);
+        p.input = "ds myhost".into();
+        let out = p.filtered();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].label, "Durable SSH (ghostd): myhost");
+        assert!(matches!(&out[0].action, Action::ConnectDurableSsh(s) if s == "myhost"));
+        p.input = "ds ".into();
+        assert!(p.filtered().iter().all(|i| !matches!(i.action, Action::ConnectDurableSsh(_))));
+    }
+
+    #[test]
+    fn theme_prefix_filters_to_theme_items() {
+        let all = CommandPalette::default_items(&["tokyonight", "dracula"]);
+        let non_theme_count = all.iter().filter(|i| !i.label.starts_with("Theme:")).count();
+        assert!(non_theme_count > 0, "default items should have non-theme entries to filter out");
+        let mut p = CommandPalette::new(all);
+        p.input = "theme".into();
+        let out = p.filtered();
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|i| i.label.starts_with("Theme:")), "theme filter must hide non-theme items");
+        // And without the prefix those items are not hidden — "new" should find New Tab, not themes
+        p.input = "new".into();
+        let out2 = p.filtered();
+        assert!(out2.iter().any(|i| i.label == "New Tab"));
+    }
+
+    #[test]
+    fn selected_clamps_cursor() {
+        let mut p = palette(&["A", "B", "C"]);
+        p.cursor = 99;
+        // filtered has 3 items, cursor 99 should clamp to last
+        let sel = p.selected().unwrap();
+        assert_eq!(sel.label, "C");
+    }
+
+    #[test]
+    fn selected_none_when_filtered_empty() {
+        let mut p = palette(&["A"]);
+        p.input = "zzz".into();
+        assert!(p.selected().is_none());
+    }
+
+    #[test]
+    fn nav_up_down_wraps() {
+        let mut p = palette(&["A", "B", "C"]);
+        assert_eq!(p.cursor, 0);
+        p.up();
+        assert_eq!(p.cursor, 2, "up from 0 wraps to last");
+        p.down();
+        assert_eq!(p.cursor, 0, "down from last wraps to 0");
+        p.down();
+        assert_eq!(p.cursor, 1);
+        p.up();
+        assert_eq!(p.cursor, 0);
+        // single item: up/down are no-ops
+        let mut q = palette(&["Only"]);
+        q.up();
+        assert_eq!(q.cursor, 0);
+        q.down();
+        assert_eq!(q.cursor, 0);
+    }
+
+    #[test]
+    fn type_and_backspace_reset_cursor() {
+        let mut p = palette(&["A", "B", "C"]);
+        p.cursor = 2;
+        p.type_char('x');
+        assert_eq!(p.cursor, 0);
+        p.cursor = 2;
+        p.backspace();
+        assert_eq!(p.cursor, 0);
+    }
+
+    #[test]
+    fn default_items_include_theme_entries() {
+        let items = CommandPalette::default_items(&["tokyonight", "dracula"]);
+        assert!(items.iter().any(|i| i.label == "Theme: tokyonight" && matches!(&i.action, Action::Theme(s) if s == "tokyonight")));
+        assert!(items.iter().any(|i| i.label == "Theme: dracula" && matches!(&i.action, Action::Theme(s) if s == "dracula")));
+        // theme items carry the correct Action::Theme payload, not Quit or similar
+        let theme_actions: Vec<_> = items.iter().filter(|i| i.label.starts_with("Theme:")).collect();
+        assert_eq!(theme_actions.len(), 2);
+        for t in &theme_actions {
+            assert!(matches!(t.action, Action::Theme(_)), "theme label should map to Action::Theme, got {:?}", t.action);
+        }
     }
 }
