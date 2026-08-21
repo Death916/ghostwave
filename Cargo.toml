@@ -5,6 +5,14 @@ edition = "2024"
 description = "A waveterm-style terminal built on libghostty-vt (Rust), with zellij-style keybindings"
 license = "MIT"
 
+[lib]
+name = "ghostwave"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ghostwave"
+path = "src/main.rs"
+
 [dependencies]
 # Ghostty terminal emulation, safe Rust bindings (vendored zig build of libghostty-vt)
 libghostty-vt = { version = "0.2.1", features = ["png"] }

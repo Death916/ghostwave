@@ -27,7 +27,8 @@ const MAX_FONT_BYTES: u64 = 6 * 1024 * 1024;
 struct Inner {
     /// fontdue coverage parsers, parallel to `fonts` in FontStack.
     coverage: Vec<fontdue::Font>,
-    /// char -> index into the stack (0 = primary). Computed lazily.
+    ascii_coverage: [u8; 128],
+    /// char -> index into the stack (0 = primary). Computed lazily for non-ASCII.
     cache: Mutex<HashMap<char, usize>>,
 }
 
@@ -128,10 +129,18 @@ impl FontStack {
             coverage.push(fd);
         }
 
+        let mut ascii_coverage = [0u8; 128];
+        for b in 0..128u8 {
+            let c = b as char;
+            let idx = coverage.iter().position(|f| f.has_glyph(c)).unwrap_or(0);
+            ascii_coverage[b as usize] = idx as u8;
+        }
+
         Ok(Self {
             fonts,
             inner: Arc::new(Inner {
                 coverage,
+                ascii_coverage,
                 cache: Mutex::new(HashMap::new()),
             }),
         })
@@ -140,7 +149,12 @@ impl FontStack {
     /// Index of the first font in the stack that has `c` (0 = primary).
     /// Unknown characters fall back to the primary (renders as tofu, as
     /// before — no worse than today).
+    #[inline]
     pub fn font_for(&self, c: char) -> usize {
+        let cp = c as u32;
+        if cp < 128 {
+            return self.inner.ascii_coverage[cp as usize] as usize;
+        }
         let mut cache = self.inner.cache.lock().unwrap();
         if let Some(&idx) = cache.get(&c) {
             return idx;
@@ -157,6 +171,15 @@ impl FontStack {
 
     pub fn get(&self, idx: usize) -> &Font {
         &self.fonts[idx.min(self.fonts.len() - 1)]
+    }
+
+    /// Pre-warm font glyph caches by rasterizing printable ASCII into macroquad's atlas.
+    pub fn warmup(&self, font_size: u16) {
+        use macroquad::text::measure_text;
+        let ascii_str: String = (0x20..=0x7Eu8).map(|b| b as char).collect();
+        for font in &self.fonts {
+            let _ = measure_text(&ascii_str, Some(font), font_size, 1.0);
+        }
     }
 
     pub fn len(&self) -> usize {

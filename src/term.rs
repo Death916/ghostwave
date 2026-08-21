@@ -96,6 +96,7 @@ pub struct TermPane {
     selection: SelectionState<'static>,
     /// None when the pane is in a disconnected state (no child process).
     pub pty: Option<Pty>,
+    pub pty_rx: Option<std::sync::mpsc::Receiver<crate::pty::PtyMsg>>,
     pub child: Option<Child>,
     shared: Arc<Shared>,
     effect_fd: i32,
@@ -125,13 +126,9 @@ pub struct TermPane {
     pub reconnect: ReconnectState,
     /// Consecutive failed connect attempts (reset on manual connect).
     pub reconnect_failures: u32,
-    /// Pane output log (name + file) for durable sessions.
+    /// Pane output log for durable sessions (managed asynchronously).
     pub log_name: String,
-    log_file: Option<std::fs::File>,
-    /// Session log cap in bytes; the log is front-truncated when exceeded.
-    log_cap: u64,
-    /// Bytes written to the log since the last truncation.
-    log_bytes: u64,
+    pub log: Option<crate::session::AsyncPaneLog>,
     /// Optional cursor visual style override (from config).
     pub cursor_style: Option<libghostty_vt::render::CursorVisualStyle>,
 }
@@ -163,7 +160,7 @@ impl TermPane {
 
         // A remote pane may be created disconnected (restore) — no child
         // process until the user connects or the reconnect loop fires.
-        let (pty, child) = if spawn {
+        let (pty, child, pty_rx) = if spawn {
             let (p, c) = Pty::new(
                 WinSize {
                     cols,
@@ -175,15 +172,15 @@ impl TermPane {
                 args,
                 cwd,
             )?;
-            (Some(p), Some(c))
+            let rx = p.spawn_reader().ok();
+            (Some(p), Some(c), rx)
         } else {
-            (None, None)
+            (None, None, None)
         };
 
-        // Pane output log for durable sessions (best-effort; a missing log
-        // just means no session restore for this pane).
-        let (log_name, log_file) = crate::session::open_pane_log()
-            .unwrap_or((String::new(), std::fs::File::open("/dev/null").unwrap()));
+        // Pane output log for durable sessions (asynchronously written and truncated).
+        let log = crate::session::AsyncPaneLog::open(log_cap_bytes);
+        let log_name = log.as_ref().map(|l| l.name.clone()).unwrap_or_default();
 
         let effect_fd = match &pty {
             Some(p) => p.dup_raw().unwrap_or(-1),
@@ -291,6 +288,7 @@ impl TermPane {
             response: Vec::with_capacity(64),
             selection: SelectionState::new()?,
             pty,
+            pty_rx,
             child,
             shared,
             effect_fd,
@@ -313,9 +311,7 @@ impl TermPane {
             reconnect: ReconnectState::Idle,
             reconnect_failures: 0,
             log_name,
-            log_file: Some(log_file),
-            log_cap: log_cap_bytes.max(1024),
-            log_bytes: 0,
+            log,
             cursor_style: None,
         })
         .map(|mut pane| {
@@ -404,49 +400,36 @@ impl TermPane {
             }
             return false;
         }
-        let Some(pty) = self.pty.as_ref() else {
+
+        let Some(rx) = self.pty_rx.as_ref() else {
             return false;
         };
-        match pty.read() {
-            Ok(data) => {
-                // Tee output into the session log (durable sessions). The log
-                // is front-truncated when it exceeds the configured cap so it
-                // cannot balloon indefinitely (see session::truncate_log_front).
-                if !data.is_empty() {
-                    if let Some(f) = self.log_file.as_mut() {
-                        use std::io::Write;
-                        let _ = f.write_all(&data);
-                        self.log_bytes += data.len() as u64;
-                        if self.log_bytes > self.log_cap && !self.log_name.is_empty() {
-                            let path = crate::session::pane_log_path(&self.log_name);
-                            let _ = crate::session::truncate_log_front(&path, self.log_cap);
-                            self.log_bytes = self.log_cap;
+
+        let mut had_activity = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                crate::pty::PtyMsg::Data(data) => {
+                    if !data.is_empty() {
+                        if let Some(log) = self.log.as_mut() {
+                            log.write(&data);
                         }
+                        self.term.vt_write(&data);
+                        had_activity = true;
                     }
-                    self.term.vt_write(&data);
-                    return true;
                 }
-                return false;
-            }
-            Err(PtyError::EndOfStream) => {
-                self.exited = Some("process exited".into());
-                self.force_repaint = true;
-                self.last_exit_code = self.child.as_mut().and_then(|c| c.poll_reap());
-                return false;
-            }
-            Err(PtyError::OtherError(e)) => {
-                self.exited = Some(format!("pty error: {e}"));
-                self.force_repaint = true;
-                self.last_exit_code = self.child.as_mut().and_then(|c| c.poll_reap());
-                return false;
+                crate::pty::PtyMsg::Eof => {
+                    self.exited = Some("process exited".into());
+                    self.force_repaint = true;
+                    self.last_exit_code = self.child.as_mut().and_then(|c| c.poll_reap());
+                }
+                crate::pty::PtyMsg::Error(e) => {
+                    self.exited = Some(format!("pty error: {e}"));
+                    self.force_repaint = true;
+                    self.last_exit_code = self.child.as_mut().and_then(|c| c.poll_reap());
+                }
             }
         }
-        if let Some(child) = self.child.as_mut() {
-            if let Some(code) = child.poll_reap() {
-                self.last_exit_code = Some(code);
-            }
-        }
-        false
+        had_activity
     }
 
     pub fn write_input(&mut self, data: &[u8]) {
@@ -467,6 +450,7 @@ impl TermPane {
         };
         let args: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
         let (pty, child) = Pty::new(size, self.program.as_deref(), &args, self.cwd.as_deref())?;
+        self.pty_rx = pty.spawn_reader().ok();
         self.pty = Some(pty);
         self.child = Some(child);
         if let Some(p) = self.pty.as_ref() {
@@ -501,10 +485,8 @@ impl TermPane {
     /// Seed the session log with replayed history (durable restore) so the
     /// restored scrollback survives further restarts.
     pub fn log_seed(&mut self, data: &[u8]) {
-        if let Some(f) = self.log_file.as_mut() {
-            use std::io::Write;
-            let _ = f.write_all(data);
-            self.log_bytes += data.len() as u64;
+        if let Some(log) = self.log.as_mut() {
+            log.seed(data);
         }
     }
 
@@ -772,40 +754,81 @@ impl TermPane {
             let mut row_idx: u32 = 0;
             let mut text = String::with_capacity(32);
 
+            struct CellRun {
+                start_col: u16,
+                col_count: u16,
+                text: String,
+                draw_color: crate::theme::Rgb,
+                bg_color: Option<crate::theme::Rgb>,
+                bold: bool,
+                font_idx: usize,
+            }
+
+            let flush_run = |run: CellRun, y: f32| {
+                let rx = ox + padding + run.start_col as f32 * cell.w as f32;
+                let rw = run.col_count as f32 * cell.w as f32;
+                if let Some(bg) = run.bg_color {
+                    draw_rectangle(rx, y, rw, cell.h as f32, color_theme(bg));
+                }
+                if !run.text.is_empty() {
+                    let font = font_stack.get(run.font_idx);
+                    draw_text_ex(
+                        &run.text,
+                        rx,
+                        y + cell.baseline,
+                        TextParams {
+                            font: Some(font),
+                            font_size: font_px,
+                            color: color_theme(run.draw_color),
+                            ..Default::default()
+                        },
+                    );
+                    if run.bold {
+                        draw_text_ex(
+                            &run.text,
+                            rx + 1.0,
+                            y + cell.baseline,
+                            TextParams {
+                                font: Some(font),
+                                font_size: font_px,
+                                color: color_theme(run.draw_color),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+            };
+
             while let Some(row) = row_it.next() {
-                let mut x = ox + padding;
                 let mut col_idx: u16 = 0;
                 let mut cell_it = self.cell_it.update(row)?;
+                let mut current_run: Option<CellRun> = None;
 
                 while let Some(c) = cell_it.next() {
                     let selected = c.is_selected()?;
                     let graphemes = c.graphemes_len()?;
                     let bg_opt = c.bg_color()?;
 
-                    if graphemes == 0 {
-                        if selected {
-                            draw_rectangle(x, y, cell.w as f32, cell.h as f32, color_theme(theme.selection));
-                        } else if let Some(bg) = bg_opt {
-                            draw_rectangle(x, y, cell.w as f32, cell.h as f32, color(bg));
-                        }
+                    let (cell_text, font_idx, draw_color, bg_color, bold) = if graphemes == 0 {
+                        let bg = if selected {
+                            Some(theme.selection)
+                        } else {
+                            bg_opt.map(|bg| crate::theme::Rgb(bg.r, bg.g, bg.b))
+                        };
+                        (None, 0, theme.bg, bg, false)
                     } else {
+                        text.clear();
                         c.graphemes_utf8(&mut text)?;
-                        // Strip zero-width format chars (variation selectors,
-                        // ZWJ/ZWNJ/ZWSP, word joiner, BOM): they carry no ink
-                        // and almost no font has them, so drawing them yields
-                        // tofu boxes (e.g. starship's nix "❄️" = U+2744 + VS16).
                         text.retain(|ch| {
                             !matches!(
                                 ch,
-                                '\u{FE00}'..='\u{FE0F}'   // variation selectors
-                                    | '\u{200B}'..='\u{200D}' // ZWSP, ZWNJ, ZWJ
-                                    | '\u{2060}'             // word joiner
-                                    | '\u{FEFF}'             // BOM / ZWNBSP
+                                '\u{FE00}'..='\u{FE0F}'
+                                    | '\u{200B}'..='\u{200D}'
+                                    | '\u{2060}'
+                                    | '\u{FEFF}'
                             )
                         });
-                        // Font fallback: first stack font that covers the glyph
-                        // (primary = bundled JetBrains Mono).
-                        let font = font_stack.get(font_stack.font_for(text.chars().next().unwrap_or(' ')));
+                        let font_idx = font_stack.font_for(text.chars().next().unwrap_or(' '));
                         let mut fg = crate::theme::Rgb(colors.foreground.r, colors.foreground.g, colors.foreground.b);
                         let mut bg = theme.bg;
                         let mut has_bg = false;
@@ -833,51 +856,59 @@ impl TermPane {
                             has_bg = true;
                         }
 
-                        // Search match highlight (after selection, before draw):
-                        // fill the cell bg with the match color, draw the glyph
-                        // in the theme bg for contrast.
                         let matched = self.search.contains(row_idx, col_idx);
-
-                        if matched {
-                            draw_rectangle(x, y, cell.w as f32, cell.h as f32, color_theme(theme.search_match));
+                        let (draw_color, bg_color) = if matched {
+                            (theme.bg, Some(theme.search_match))
                         } else if has_bg {
-                            draw_rectangle(x, y, cell.w as f32, cell.h as f32, color_theme(bg));
-                        }
-
-                        let draw_color = if matched {
-                            theme.bg
+                            (fg, Some(bg))
                         } else {
-                            fg
+                            (fg, None)
                         };
 
-                        draw_text_ex(
-                            &text,
-                            x,
-                            y + cell.baseline,
-                            TextParams {
-                                font: Some(font),
-                                font_size: font_px,
-                                color: color_theme(draw_color),
-                                ..Default::default()
-                            },
-                        );
+                        (Some(text.as_str()), font_idx, draw_color, bg_color, bold)
+                    };
 
-                        if bold {
-                            draw_text_ex(
-                                &text,
-                                x + 1.0,
-                                y + cell.baseline,
-                                TextParams {
-                                    font: Some(font),
-                                    font_size: font_px,
-                                    color: color_theme(draw_color),
-                                    ..Default::default()
-                                },
-                            );
+                    let can_merge = match (&current_run, cell_text) {
+                        (Some(run), Some(_t)) => {
+                            run.font_idx == font_idx
+                                && run.draw_color == draw_color
+                                && run.bg_color == bg_color
+                                && run.bold == bold
+                                && (run.font_idx == 0 || run.text.is_empty())
                         }
+                        (Some(run), None) => {
+                            run.bg_color == bg_color && run.text.is_empty()
+                        }
+                        (None, _) => false,
+                    };
+
+                    if can_merge {
+                        if let Some(run) = current_run.as_mut() {
+                            run.col_count += 1;
+                            if let Some(t) = cell_text {
+                                run.text.push_str(t);
+                            }
+                        }
+                    } else {
+                        if let Some(run) = current_run.take() {
+                            flush_run(run, y);
+                        }
+                        current_run = Some(CellRun {
+                            start_col: col_idx,
+                            col_count: 1,
+                            text: cell_text.unwrap_or("").to_string(),
+                            draw_color,
+                            bg_color,
+                            bold,
+                            font_idx,
+                        });
                     }
-                    x += cell.w as f32;
+
                     col_idx += 1;
+                }
+
+                if let Some(run) = current_run.take() {
+                    flush_run(run, y);
                 }
 
                 // Search match row marker on the left edge.

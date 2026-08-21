@@ -3,7 +3,7 @@
 #![allow(unsafe_code)]
 
 use std::{
-    os::fd::{AsRawFd, IntoRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, IntoRawFd, OwnedFd},
     os::unix::process::CommandExt,
     path::PathBuf,
     process::Command,
@@ -34,6 +34,13 @@ impl WinSize {
             ws_ypixel: self.ypixel,
         }
     }
+}
+
+#[derive(Debug)]
+pub enum PtyMsg {
+    Data(Vec<u8>),
+    Eof,
+    Error(String),
 }
 
 /// Handle to a pseudo-terminal master.
@@ -89,22 +96,80 @@ impl Pty {
         }
     }
 
-    /// Drain available output; returns the raw bytes read (feed them to the
-    /// terminal via vt_write; callers may also tee them for session logs).
-    /// Returns Err(EndOfStream) on EOF/EIO, Ok(bytes) otherwise.
-    pub fn read(&self) -> Result<Vec<u8>, PtyError> {
-        let mut buf = [0u8; 8192];
-        let mut out: Vec<u8> = Vec::new();
+    /// Drain available output into `out` (caller reuses buffer to avoid allocation churn).
+    /// Returns Err(EndOfStream) on EOF/EIO, Ok(()) otherwise.
+    pub fn read_into(&self, out: &mut Vec<u8>) -> Result<(), PtyError> {
+        let mut buf = [0u8; 65536];
         loop {
             match nix::unistd::read(&self.0, &mut buf) {
                 Ok(0) => return Err(PtyError::EndOfStream),
                 Ok(len) => out.extend_from_slice(&buf[..len]),
-                Err(Errno::EAGAIN) => return Ok(out),
+                Err(Errno::EAGAIN) => return Ok(()),
                 Err(Errno::EINTR) => continue,
                 Err(Errno::EIO) => return Err(PtyError::EndOfStream),
                 Err(err) => return Err(PtyError::OtherError(err)),
             };
         }
+    }
+
+    /// Drain available output; returns the raw bytes read.
+    /// Returns Err(EndOfStream) on EOF/EIO, Ok(bytes) otherwise.
+    pub fn read(&self) -> Result<Vec<u8>, PtyError> {
+        let mut out: Vec<u8> = Vec::with_capacity(65536);
+        self.read_into(&mut out)?;
+        Ok(out)
+    }
+
+    /// Spawns a dedicated background thread that polls and reads from the master PTY fd.
+    /// This decouples PTY I/O throughput from the UI rendering/VSync frame rate.
+    pub fn spawn_reader(&self) -> std::io::Result<std::sync::mpsc::Receiver<PtyMsg>> {
+        let fd = self.0.try_clone()?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(512);
+        std::thread::Builder::new()
+            .name("ghostwave-pty-reader".into())
+            .spawn(move || {
+                use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+                let mut buf = [0u8; 65536];
+                let mut poll_fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR)];
+                loop {
+                    match poll(&mut poll_fds, PollTimeout::NONE) {
+                        Ok(_) => {
+                            let revents = poll_fds[0].revents().unwrap_or(PollFlags::empty());
+                            if revents.contains(PollFlags::POLLIN) {
+                                match nix::unistd::read(&fd, &mut buf) {
+                                    Ok(0) => {
+                                        let _ = tx.send(PtyMsg::Eof);
+                                        break;
+                                    }
+                                    Ok(len) => {
+                                        if tx.send(PtyMsg::Data(buf[..len].to_vec())).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(Errno::EINTR) | Err(Errno::EAGAIN) => continue,
+                                    Err(Errno::EIO) => {
+                                        let _ = tx.send(PtyMsg::Eof);
+                                        break;
+                                    }
+                                    Err(err) => {
+                                        let _ = tx.send(PtyMsg::Error(err.to_string()));
+                                        break;
+                                    }
+                                }
+                            } else if revents.contains(PollFlags::POLLHUP) || revents.contains(PollFlags::POLLERR) {
+                                let _ = tx.send(PtyMsg::Eof);
+                                break;
+                            }
+                        }
+                        Err(Errno::EINTR) => continue,
+                        Err(_) => {
+                            let _ = tx.send(PtyMsg::Eof);
+                            break;
+                        }
+                    }
+                }
+            })?;
+        Ok(rx)
     }
 
     /// Best-effort write; retries EINTR, advances past partial writes, drops

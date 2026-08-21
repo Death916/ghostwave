@@ -3,3 +3,5 @@ ghostd/target/
 .devenv/
 .direnv/
 ghostd/.toolchain/
+perf.data*
+flamegraph.html
