@@ -546,7 +546,7 @@ async fn main() -> Result<()> {
     let mut app = App::new(config, font, font_stack)?;
 
     loop {
-        let _frame_start = std::time::Instant::now();
+        let frame_start = std::time::Instant::now();
         app.update();
 
         // Recompute pane grids when the window/layout changes (no-op otherwise).
@@ -562,6 +562,14 @@ async fn main() -> Result<()> {
             // a parked session's metadata must not be lost on quit.
             app.save_all_sessions();
             std::process::exit(0);
+        }
+
+        // Frame pacing: sleep only when idle to target 120 FPS power efficiency (0% idle CPU).
+        // During PTY flood activity (app.pty_activity == true), sleep is 0 for maximum throughput.
+        const IDLE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(8_333);
+        let elapsed = frame_start.elapsed();
+        if !app.pty_activity && elapsed < IDLE_FRAME_TIME {
+            std::thread::sleep(IDLE_FRAME_TIME - elapsed);
         }
 
         next_frame().await
