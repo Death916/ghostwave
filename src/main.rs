@@ -546,7 +546,7 @@ async fn main() -> Result<()> {
     let mut app = App::new(config, font, font_stack)?;
 
     loop {
-        let frame_start = std::time::Instant::now();
+        let _frame_start = std::time::Instant::now();
         app.update();
 
         // Recompute pane grids when the window/layout changes (no-op otherwise).
@@ -562,16 +562,6 @@ async fn main() -> Result<()> {
             // a parked session's metadata must not be lost on quit.
             app.save_all_sessions();
             std::process::exit(0);
-        }
-
-        // Frame cap: sleep only when idle. While pty data is being drained
-        // (app.pty_activity) the loop runs back-to-back so output backlog is
-        // processed at full speed instead of one buffer per 16.6ms tick —
-        // this is the flood-throughput fix. Sleeping keeps idle CPU low.
-        const FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(16_667);
-        let elapsed = frame_start.elapsed();
-        if !app.pty_activity && elapsed < FRAME_TIME {
-            std::thread::sleep(FRAME_TIME - elapsed);
         }
 
         next_frame().await

@@ -80,13 +80,21 @@ impl SearchState {
         };
     }
 
+    #[inline]
     pub fn contains(&self, row: u32, col: u16) -> bool {
+        if self.matches.is_empty() {
+            return false;
+        }
         self.matches.iter().any(|m| {
             m.row == row && col >= m.col_start && col < m.col_end
         })
     }
 
+    #[inline]
     pub fn row_has_match(&self, row: u32) -> bool {
+        if self.matches.is_empty() {
+            return false;
+        }
         self.matches.iter().any(|m| m.row == row)
     }
 
