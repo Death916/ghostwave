@@ -265,6 +265,93 @@ pub fn open_pane_log() -> std::io::Result<(String, std::fs::File)> {
     ))
 }
 
+#[derive(Debug)]
+enum LogMsg {
+    Write(Vec<u8>),
+    Seed(Vec<u8>),
+    Truncate(u64),
+    Flush,
+}
+
+/// Asynchronous background worker for durable session logging.
+/// Eliminates all disk write and truncation latency from the terminal UI thread.
+pub struct AsyncPaneLog {
+    pub name: String,
+    tx: std::sync::mpsc::SyncSender<LogMsg>,
+    cap: u64,
+    written_bytes: u64,
+}
+
+impl AsyncPaneLog {
+    pub fn open(log_cap_bytes: u64) -> Option<Self> {
+        let (name, file) = open_pane_log().ok()?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(512);
+        let path = pane_log_path(&name);
+
+        std::thread::Builder::new()
+            .name(format!("pane-log-{}", name))
+            .spawn(move || {
+                use std::io::Write;
+                let mut writer = std::io::BufWriter::with_capacity(65536, file);
+                let mut bytes_since_trunc = 0u64;
+
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        LogMsg::Write(data) => {
+                            let _ = writer.write_all(&data);
+                            bytes_since_trunc += data.len() as u64;
+                        }
+                        LogMsg::Seed(data) => {
+                            let _ = writer.write_all(&data);
+                            let _ = writer.flush();
+                            bytes_since_trunc += data.len() as u64;
+                        }
+                        LogMsg::Truncate(cap) => {
+                            let _ = writer.flush();
+                            truncate_log_front(&path, cap);
+                            if let Ok(f) = std::fs::OpenOptions::new().append(true).open(&path) {
+                                writer = std::io::BufWriter::with_capacity(65536, f);
+                            }
+                            bytes_since_trunc = cap;
+                        }
+                        LogMsg::Flush => {
+                            let _ = writer.flush();
+                        }
+                    }
+                }
+                let _ = writer.flush();
+            })
+            .ok()?;
+
+        Some(Self {
+            name,
+            tx,
+            cap: log_cap_bytes.max(1024),
+            written_bytes: 0,
+        })
+    }
+
+    #[inline]
+    pub fn write(&mut self, data: &[u8]) {
+        self.written_bytes += data.len() as u64;
+        let _ = self.tx.try_send(LogMsg::Write(data.to_vec()));
+        const HYSTERESIS_BYTES: u64 = 2 * 1024 * 1024;
+        if self.written_bytes > self.cap.saturating_add(HYSTERESIS_BYTES) {
+            let _ = self.tx.send(LogMsg::Truncate(self.cap));
+            self.written_bytes = self.cap;
+        }
+    }
+
+    pub fn seed(&mut self, data: &[u8]) {
+        self.written_bytes += data.len() as u64;
+        let _ = self.tx.send(LogMsg::Seed(data.to_vec()));
+    }
+
+    pub fn flush(&self) {
+        let _ = self.tx.send(LogMsg::Flush);
+    }
+}
+
 /// Truncate a log from the front (keeps only the last `keep` bytes).
 /// Returns the bytes to replay (the retained tail).
 pub fn truncate_log_front(path: &PathBuf, keep: u64) -> Vec<u8> {

@@ -126,13 +126,9 @@ pub struct TermPane {
     pub reconnect: ReconnectState,
     /// Consecutive failed connect attempts (reset on manual connect).
     pub reconnect_failures: u32,
-    /// Pane output log (name + file) for durable sessions.
+    /// Pane output log for durable sessions (managed asynchronously).
     pub log_name: String,
-    log_file: Option<std::io::BufWriter<std::fs::File>>,
-    /// Session log cap in bytes; the log is front-truncated when exceeded.
-    log_cap: u64,
-    /// Bytes written to the log since the last truncation.
-    log_bytes: u64,
+    pub log: Option<crate::session::AsyncPaneLog>,
     /// Optional cursor visual style override (from config).
     pub cursor_style: Option<libghostty_vt::render::CursorVisualStyle>,
 }
@@ -182,10 +178,9 @@ impl TermPane {
             (None, None, None)
         };
 
-        // Pane output log for durable sessions (best-effort; a missing log
-        // just means no session restore for this pane).
-        let (log_name, log_file) = crate::session::open_pane_log()
-            .unwrap_or((String::new(), std::fs::File::open("/dev/null").unwrap()));
+        // Pane output log for durable sessions (asynchronously written and truncated).
+        let log = crate::session::AsyncPaneLog::open(log_cap_bytes);
+        let log_name = log.as_ref().map(|l| l.name.clone()).unwrap_or_default();
 
         let effect_fd = match &pty {
             Some(p) => p.dup_raw().unwrap_or(-1),
@@ -316,9 +311,7 @@ impl TermPane {
             reconnect: ReconnectState::Idle,
             reconnect_failures: 0,
             log_name,
-            log_file: Some(std::io::BufWriter::with_capacity(65536, log_file)),
-            log_cap: log_cap_bytes.max(1024),
-            log_bytes: 0,
+            log,
             cursor_style: None,
         })
         .map(|mut pane| {
@@ -417,19 +410,8 @@ impl TermPane {
             match msg {
                 crate::pty::PtyMsg::Data(data) => {
                     if !data.is_empty() {
-                        if let Some(f) = self.log_file.as_mut() {
-                            use std::io::Write;
-                            let _ = f.write_all(&data);
-                            self.log_bytes += data.len() as u64;
-                            // Hysteresis: only truncate when log exceeds cap by 2 MiB,
-                            // so we don't read/rewrite 32 MiB on every 64 KiB chunk.
-                            const HYSTERESIS_BYTES: u64 = 2 * 1024 * 1024;
-                            if self.log_bytes > self.log_cap.saturating_add(HYSTERESIS_BYTES) && !self.log_name.is_empty() {
-                                let _ = f.flush();
-                                let path = crate::session::pane_log_path(&self.log_name);
-                                let _ = crate::session::truncate_log_front(&path, self.log_cap);
-                                self.log_bytes = self.log_cap;
-                            }
+                        if let Some(log) = self.log.as_mut() {
+                            log.write(&data);
                         }
                         self.term.vt_write(&data);
                         had_activity = true;
@@ -503,11 +485,8 @@ impl TermPane {
     /// Seed the session log with replayed history (durable restore) so the
     /// restored scrollback survives further restarts.
     pub fn log_seed(&mut self, data: &[u8]) {
-        if let Some(f) = self.log_file.as_mut() {
-            use std::io::Write;
-            let _ = f.write_all(data);
-            let _ = f.flush();
-            self.log_bytes += data.len() as u64;
+        if let Some(log) = self.log.as_mut() {
+            log.seed(data);
         }
     }
 
