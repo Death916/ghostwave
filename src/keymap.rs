@@ -140,6 +140,7 @@ pub enum Action {
     MoveTab(Dir),
     ToggleSyncPanes,
     ToggleScratchpad,
+    Ghostwave,
     Toast(&'static str),
 }
 

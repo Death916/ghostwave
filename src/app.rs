@@ -40,6 +40,7 @@ pub enum Pane {
     Term(TermPane),
     Preview(PreviewPane),
     Ai(AiPane),
+    Visual(crate::visualizer::VisualizerPane),
     /// Transient placeholder used during reindexing; never rendered.
     Closed,
 }
@@ -177,6 +178,9 @@ pub struct App {
     /// True when the last update() drained pty data (event-driven pacing:
     /// the main loop skips its frame sleep while there's backlog).
     pub pty_activity: bool,
+    /// Living reactive sine-wave animation state (status bar visualizer).
+    pub wave_energy: f32,
+    pub wave_phase: f32,
     /// ghostd upload results: (host, session, ok). Polled each frame.
     remote_uploads: std::sync::mpsc::Receiver<(String, String, bool)>,
     remote_upload_tx: std::sync::mpsc::Sender<(String, String, bool)>,
@@ -273,6 +277,8 @@ impl App {
             session_list: None,
             last_session_save: std::time::Instant::now(),
             pty_activity: false,
+            wave_energy: 0.1,
+            wave_phase: 0.0,
             parked: Vec::new(),
             remote_uploads,
             remote_upload_tx,
@@ -631,6 +637,7 @@ impl App {
                 self.repaint_all();
             }
             Action::ToggleScratchpad => self.toggle_scratchpad(),
+            Action::Ghostwave => self.open_visualizer(),
             Action::Toast(msg) => self.toast(msg),
             Action::ExitMode => {
                 self.mode = Mode::Normal;
@@ -1636,6 +1643,12 @@ impl App {
         self.push_side_pane(pane);
     }
 
+    pub fn open_visualizer(&mut self) {
+        let pane = Pane::Visual(crate::visualizer::VisualizerPane::new());
+        self.push_side_pane(pane);
+        self.toast("ghostwave visualizer (Space: color mode)");
+    }
+
     /// Add a non-terminal pane as a right split.
     fn push_side_pane(&mut self, pane: Pane) {
         let path = self.active_tree_path();
@@ -2118,6 +2131,11 @@ impl App {
         let k = kp.key;
         let m = kp.mods;
 
+        // Keystroke energizes the living visual wave
+        if self.config.visual_wave {
+            self.wave_energy = (self.wave_energy + 0.25).min(2.5);
+        }
+
         // Locked mode: ONLY Ctrl+g unlocks. ALL other keys pass straight to terminal!
         if self.mode == Mode::Locked {
             if kp.key == Key::G && kp.mods.contains(Mods::CTRL) {
@@ -2348,6 +2366,17 @@ impl App {
                                 key::Action::Press,
                             );
                         }
+                    }
+                } else if let Some(Pane::Visual(v)) = tab.panes.get_mut(tab.active) {
+                    if k == Key::Space {
+                        v.cycle_mode();
+                        self.repaint_all();
+                    } else if k == Key::Equal {
+                        v.speed_mult = (v.speed_mult + 0.25).min(4.0);
+                    } else if k == Key::Minus {
+                        v.speed_mult = (v.speed_mult - 0.25).max(0.25);
+                    } else if k == Key::Q {
+                        self.close_pane();
                     }
                 } else if let Some(t) = tab.panes.get_mut(tab.active).and_then(|p| match p {
                     Pane::Term(t) => Some(t),
@@ -2815,6 +2844,27 @@ impl App {
             self.pty_activity |= drain_tab_panes(&mut live.tabs);
         }
 
+        // Living reactive sine-wave animation update:
+        if self.config.visual_wave {
+            if self.pty_activity {
+                self.wave_energy = (self.wave_energy + 0.12).min(2.5);
+            }
+            self.wave_energy = (self.wave_energy * 0.94).max(0.1);
+            self.wave_phase += 0.04 * self.config.wave_speed * (1.0 + self.wave_energy * 1.5);
+            if self.wave_phase > std::f32::consts::TAU * 100.0 {
+                self.wave_phase -= std::f32::consts::TAU * 100.0;
+            }
+        }
+
+        // Update all visualizer screensaver panes
+        for tab in &mut self.tabs {
+            for pane in &mut tab.panes {
+                if let Pane::Visual(v) = pane {
+                    v.update(0.016);
+                }
+            }
+        }
+
         // ---- durable remote sessions ----
 
         // ghostd upload results: mark the host ready and respawn panes that
@@ -2875,6 +2925,7 @@ fn drain_tab_panes(tabs: &mut [Tab]) -> bool {
                 }
                 Pane::Ai(a) => a.poll(),
                 Pane::Preview(_) => {}
+                Pane::Visual(_) => {}
                 Pane::Closed => {}
             }
             i += 1;

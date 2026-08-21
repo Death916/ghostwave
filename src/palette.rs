@@ -124,6 +124,7 @@ impl CommandPalette {
             PaletteItem { label: "Paste".into(), action: Paste },
             PaletteItem { label: "Clear Terminal".into(), action: ClearTerminal },
             PaletteItem { label: "New AI Chat".into(), action: NewAi },
+            PaletteItem { label: "Ghostwave (Screensaver Visualizer)".into(), action: Ghostwave },
             PaletteItem { label: "Toggle Synchronized Panes (Broadcast)".into(), action: ToggleSyncPanes },
             PaletteItem { label: "Toggle Scratchpad Drawer".into(), action: ToggleScratchpad },
             PaletteItem { label: "Quit".into(), action: Quit },
@@ -302,5 +303,6 @@ mod tests {
         }
         assert!(items.iter().any(|i| i.action == Action::ToggleSyncPanes));
         assert!(items.iter().any(|i| i.action == Action::ToggleScratchpad));
+        assert!(items.iter().any(|i| i.action == Action::Ghostwave));
     }
 }

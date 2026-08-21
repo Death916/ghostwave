@@ -14,5 +14,6 @@ pub mod search;
 pub mod session;
 pub mod term;
 pub mod theme;
+pub mod visualizer;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

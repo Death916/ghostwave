@@ -19,6 +19,7 @@ mod search;
 mod session;
 mod term;
 mod theme;
+mod visualizer;
 
 use std::collections::VecDeque;
 
@@ -145,6 +146,9 @@ fn render(app: &mut App) {
             Pane::Ai(a) => {
                 a.render(rect, &font, font_px, theme);
             }
+            Pane::Visual(v) => {
+                v.render(rect, &font, &theme);
+            }
             Pane::Closed => {}
         }
     }
@@ -168,6 +172,7 @@ fn render(app: &mut App) {
                 }
                 Pane::Preview(_) => format!("file {}", i + 1),
                 Pane::Ai(_) => format!("ai {}", i + 1),
+                Pane::Visual(_) => format!("ghostwave {}", i + 1),
                 Pane::Closed => String::new(),
             };
             let label = format!(" {} ", name);
@@ -212,6 +217,9 @@ fn render(app: &mut App) {
             Pane::Ai(a) => {
                 a.render(rect, &font, font_px, theme);
             }
+            Pane::Visual(v) => {
+                v.render(rect, &font, &theme);
+            }
             Pane::Closed => {}
         }
     }
@@ -232,6 +240,7 @@ fn render(app: &mut App) {
                 }
                 Pane::Preview(_) => format!("float file {i}"),
                 Pane::Ai(_) => format!("float ai {i}"),
+                Pane::Visual(_) => format!("float ghostwave {i}"),
                 Pane::Closed => String::new(),
             };
             let label = format!(" {} ", name);
@@ -462,6 +471,97 @@ fn render(app: &mut App) {
             h - 8.0,
             TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.bg), ..Default::default() },
         );
+    }
+
+    // ---- living reactive "ghostwave" waveform ----------------------------
+    if app.config.visual_wave {
+        let hints_w = measure_text(hints, Some(&font), 13, 1.0).width;
+        let wave_start_x = mw + 10.0 + hints_w + 24.0;
+        let wave_end_x = if app.current_tab().sync_panes {
+            let sw = measure_text(" [SYNC] ", Some(&font), 13, 1.0).width + 8.0;
+            w - rw - sw - 24.0
+        } else {
+            w - rw - 24.0
+        };
+
+        if wave_end_x > wave_start_x + 50.0 {
+            let wave_w = wave_end_x - wave_start_x;
+            let center_y = h - sh / 2.0;
+            let step = 3.0_f32;
+            let num_points = (wave_w / step).max(10.0) as usize;
+            let phase = app.wave_phase;
+            let energy = app.wave_energy;
+            let max_amp = (sh * 0.35 * app.config.wave_amplitude).clamp(2.0, 10.0);
+
+            let accent = theme.frame_active;
+            let sel = theme.palette_sel;
+
+            // Harmonic 1: Primary glowing neon ribbon
+            let mut prev_x = wave_start_x;
+            let mut prev_y = center_y;
+            for i in 0..=num_points {
+                let progress = i as f32 / num_points as f32;
+                let cur_x = wave_start_x + progress * wave_w;
+                let envelope = (progress * std::f32::consts::PI).sin();
+                let freq = 0.035;
+                let y_offset = ((cur_x * freq + phase).sin() * 0.7
+                    + (cur_x * freq * 1.8 - phase * 1.4).sin() * 0.3)
+                    * max_amp * energy * envelope;
+                let cur_y = center_y + y_offset;
+
+                if i > 0 {
+                    let alpha = (0.20 + 0.50 * (energy / 2.0).min(1.0)) * envelope;
+                    draw_line(
+                        prev_x,
+                        prev_y,
+                        cur_x,
+                        cur_y,
+                        1.5,
+                        Color::new(
+                            accent.0 as f32 / 255.0,
+                            accent.1 as f32 / 255.0,
+                            accent.2 as f32 / 255.0,
+                            alpha,
+                        ),
+                    );
+                }
+                prev_x = cur_x;
+                prev_y = cur_y;
+            }
+
+            // Harmonic 2: Secondary counter-phase ethereal glow
+            let mut prev_x2 = wave_start_x;
+            let mut prev_y2 = center_y;
+            for i in 0..=num_points {
+                let progress = i as f32 / num_points as f32;
+                let cur_x = wave_start_x + progress * wave_w;
+                let envelope = (progress * std::f32::consts::PI).sin();
+                let freq = 0.022;
+                let y_offset = ((cur_x * freq * 1.3 - phase * 0.8).sin() * 0.8
+                    + (cur_x * freq * 2.2 + phase * 1.9).sin() * 0.2)
+                    * (max_amp * 0.65) * energy * envelope;
+                let cur_y = center_y + y_offset;
+
+                if i > 0 {
+                    let alpha = (0.12 + 0.30 * (energy / 2.0).min(1.0)) * envelope;
+                    draw_line(
+                        prev_x2,
+                        prev_y2,
+                        cur_x,
+                        cur_y,
+                        1.0,
+                        Color::new(
+                            sel.0 as f32 / 255.0,
+                            sel.1 as f32 / 255.0,
+                            sel.2 as f32 / 255.0,
+                            alpha,
+                        ),
+                    );
+                }
+                prev_x2 = cur_x;
+                prev_y2 = cur_y;
+            }
+        }
     }
 
     // ---- toast -----------------------------------------------------------
