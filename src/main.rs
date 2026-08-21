@@ -127,7 +127,6 @@ fn render(app: &mut App) {
         let rect = rects.iter().find(|(p, _)| *p == id).map(|(_, r)| *r).unwrap_or_default();
         match &mut app.current_tab_mut().panes[id] {
             Pane::Term(t) => {
-                set_scissor(rect.x, rect.y, rect.w, rect.h);
                 let _ = t.render(
                     rect,
                     cell,
@@ -137,7 +136,6 @@ fn render(app: &mut App) {
                     theme,
                     id == active_id,
                 );
-                reset_scissor();
             }
             Pane::Preview(p) => {
                 set_scissor(rect.x, rect.y, rect.w, rect.h);
@@ -145,9 +143,7 @@ fn render(app: &mut App) {
                 reset_scissor();
             }
             Pane::Ai(a) => {
-                set_scissor(rect.x, rect.y, rect.w, rect.h);
                 a.render(rect, &font, font_px, theme);
-                reset_scissor();
             }
             Pane::Closed => {}
         }
@@ -198,7 +194,6 @@ fn render(app: &mut App) {
         let rect = *rect;
         match &mut app.current_tab_mut().panes[*id] {
             Pane::Term(t) => {
-                set_scissor(rect.x, rect.y, rect.w, rect.h);
                 let _ = t.render(
                     rect,
                     cell,
@@ -208,7 +203,6 @@ fn render(app: &mut App) {
                     theme,
                     *id == active_id,
                 );
-                reset_scissor();
             }
             Pane::Preview(p) => {
                 set_scissor(rect.x, rect.y, rect.w, rect.h);
@@ -216,9 +210,7 @@ fn render(app: &mut App) {
                 reset_scissor();
             }
             Pane::Ai(a) => {
-                set_scissor(rect.x, rect.y, rect.w, rect.h);
                 a.render(rect, &font, font_px, theme);
-                reset_scissor();
             }
             Pane::Closed => {}
         }
@@ -477,7 +469,9 @@ fn render(app: &mut App) {
 
 fn reset_scissor() {
     unsafe {
-        macroquad::window::get_internal_gl().quad_gl.scissor(None);
+        let mut gl = macroquad::window::get_internal_gl();
+        gl.flush();
+        gl.quad_gl.scissor(None);
     }
 }
 
@@ -491,7 +485,9 @@ fn set_scissor(x: f32, y: f32, w: f32, h: f32) {
     let sw = (w * dpi).max(0.0) as i32;
     let sh_px = (h * dpi).max(0.0) as i32;
     unsafe {
-        macroquad::window::get_internal_gl().quad_gl.scissor(Some((sx, sy, sw, sh_px)));
+        let mut gl = macroquad::window::get_internal_gl();
+        gl.flush();
+        gl.quad_gl.scissor(Some((sx, sy, sw, sh_px)));
     }
 }
 
