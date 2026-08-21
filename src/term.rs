@@ -366,7 +366,21 @@ impl TermPane {
     }
 
     pub fn pwd(&self) -> String {
-        self.shared.pwd.lock().unwrap().clone()
+        if let Some(child) = &self.child {
+            if let Some(pid) = child.pid() {
+                if let Ok(target) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                    let path = target.to_string_lossy().to_string();
+                    if !path.is_empty() {
+                        return path;
+                    }
+                }
+            }
+        }
+        let shared = self.shared.pwd.lock().unwrap().clone();
+        if !shared.is_empty() {
+            return shared;
+        }
+        self.cwd.clone().unwrap_or_default()
     }
 
     pub fn set_grid(&mut self, cols: u16, rows: u16, cell: CellDims) -> Result<()> {
@@ -1125,6 +1139,67 @@ impl TermPane {
         let y = ((py - rect.y - padding) / cell.h as f32).clamp(0.0, self.rows as f32) as u32;
         Point::Viewport(PointCoordinate { x, y })
     }
+
+    /// Detect if the cell at (row_idx, col_idx) contains a clickable URL or file path.
+    /// Returns (target_string, start_col, end_col) if found.
+    pub fn link_at_cell(&mut self, row_idx: u32, col_idx: u16) -> Option<(String, u16, u16)> {
+        let snapshot = self.render_state.update(&self.term).ok()?;
+        let mut row_it = self.row_it.update(&snapshot).ok()?;
+        let mut cur_row = 0u32;
+        while let Some(row) = row_it.next() {
+            if cur_row == row_idx {
+                let mut cell_it = self.cell_it.update(row).ok()?;
+                let mut row_text = String::with_capacity(128);
+                let mut buf = String::with_capacity(8);
+
+                while let Some(c) = cell_it.next() {
+                    let graphemes = c.graphemes_len().unwrap_or(0);
+                    if graphemes == 0 {
+                        row_text.push(' ');
+                    } else {
+                        buf.clear();
+                        if c.graphemes_utf8(&mut buf).is_ok() {
+                            buf.retain(|ch| !matches!(ch, '\u{FE00}'..='\u{FE0F}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'));
+                            row_text.push_str(if buf.is_empty() { " " } else { &buf });
+                        } else {
+                            row_text.push(' ');
+                        }
+                    }
+                }
+
+                // Scan row_text for URLs or file paths
+                let mut start = 0;
+                while start < row_text.len() {
+                    let remaining = &row_text[start..];
+                    if let Some(pos) = remaining.find(|c: char| !c.is_whitespace()) {
+                        let token_start = start + pos;
+                        let token_str = &row_text[token_start..];
+                        let token_len = token_str.find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '`' || c == '<' || c == '>' || c == '(' || c == ')' || c == '[' || c == ']').unwrap_or(token_str.len());
+                        let raw_token = &token_str[..token_len];
+                        let clean = raw_token.trim_end_matches(|c: char| c == ',' || c == ';' || c == '.');
+
+                        let is_url = clean.starts_with("http://") || clean.starts_with("https://");
+                        let is_path = clean.contains('/') || (clean.contains('.') && !clean.ends_with('.'));
+
+                        if (is_url || is_path) && clean.len() >= 3 {
+                            let end_idx = token_start + clean.len();
+                            let start_col = token_start as u16;
+                            let end_col = end_idx as u16;
+                            if col_idx >= start_col && col_idx < end_col {
+                                return Some((clean.to_string(), start_col, end_col));
+                            }
+                        }
+                        start = token_start + token_len.max(1);
+                    } else {
+                        break;
+                    }
+                }
+                break;
+            }
+            cur_row += 1;
+        }
+        None
+    }
 }
 
 impl Drop for TermPane {
@@ -1430,5 +1505,38 @@ mod tests {
         assert_eq!(TermPane::parse_cursor_style("hollow"), Some(CursorVisualStyle::BlockHollow));
         assert_eq!(TermPane::parse_cursor_style("block_hollow"), Some(CursorVisualStyle::BlockHollow));
         assert_eq!(TermPane::parse_cursor_style("unknown"), None);
+    }
+
+    #[test]
+    fn link_at_cell_detects_urls_and_files() {
+        let cell = CellDims { w: 10, h: 26, baseline: 20.0 };
+        let mut pane = TermPane::new(
+            80,
+            24,
+            cell,
+            None,
+            &[],
+            None,
+            1000,
+            1024 * 1024,
+            false,
+            None,
+        )
+        .unwrap();
+
+        pane.term.vt_write(b"Check out https://github.com/ghostty-org and src/main.rs:12:4 for details\r\n");
+        // Test URL detection
+        let url_hit = pane.link_at_cell(0, 15);
+        assert!(url_hit.is_some());
+        let (url, start, end) = url_hit.unwrap();
+        assert_eq!(url, "https://github.com/ghostty-org");
+        assert_eq!(start, 10);
+        assert_eq!(end, 40);
+
+        // Test File path detection
+        let file_hit = pane.link_at_cell(0, 48);
+        assert!(file_hit.is_some());
+        let (file, _, _) = file_hit.unwrap();
+        assert_eq!(file, "src/main.rs:12:4");
     }
 }

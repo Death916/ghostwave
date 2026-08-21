@@ -138,6 +138,8 @@ pub enum Action {
     Theme(String),
     FocusPane(u8),
     MoveTab(Dir),
+    ToggleSyncPanes,
+    ToggleScratchpad,
     Toast(&'static str),
 }
 
@@ -244,6 +246,8 @@ pub fn global_binds(k: Key, m: Mods) -> Option<Action> {
         _ if ctrl(k, m, Tab) => Action::NextTab,
         _ if ctrl_shift(k, m, Tab) => Action::PrevTab,
         _ if ctrl(k, m, Digit0) => Action::FocusPane(9),
+        _ if plain(k, m, F12) => Action::ToggleScratchpad,
+        _ if ctrl(k, m, Backquote) => Action::ToggleScratchpad,
         _ if digit_key(k).is_some() && mods_match(m, true, false, false, false) => {
             Action::GoToTab(digit_key(k).unwrap())
         }
@@ -402,6 +406,8 @@ fn pane_binds(k: Key, m: Mods) -> Option<Action> {
         _ if shift(k, m, Z) => Action::ToggleFrames,
         _ if plain(k, m, W) => Action::CycleStack,
         _ if plain(k, m, C) => Action::RenamePane,
+        _ if plain(k, m, B) => Action::ToggleSyncPanes,
+        _ if shift(k, m, D) => Action::ToggleScratchpad,
         _ if let Some(d) = dir => Action::MoveFocus(d),
         _ => return None,
     })
@@ -415,7 +421,7 @@ fn tab_binds(k: Key, m: Mods) -> Option<Action> {
         _ if plain(k, m, X) => Action::CloseTab,
         _ if plain(k, m, R) => Action::RenameTab,
         _ if plain(k, m, B) => Action::BreakPane,
-        _ if plain(k, m, S) => Action::Toast("active-sync not implemented"),
+        _ if plain(k, m, S) => Action::ToggleSyncPanes,
         _ if plain(k, m, BracketLeft) => Action::Toast("break-pane-left not implemented"),
         _ if plain(k, m, BracketRight) => Action::Toast("break-pane-right not implemented"),
         _ if plain(k, m, Tab) => Action::ToggleLastTab,

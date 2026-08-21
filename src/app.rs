@@ -68,6 +68,7 @@ pub struct Tab {
     pub zoomed: HashSet<usize>,
     /// Floating panes (z-order: later entries draw on top).
     pub floating: Vec<FloatingPane>,
+    pub sync_panes: bool,
 }
 
 impl Tab {
@@ -79,6 +80,7 @@ impl Tab {
             active: 0,
             zoomed: HashSet::new(),
             floating: Vec::new(),
+            sync_panes: false,
         }
     }
 
@@ -90,6 +92,7 @@ impl Tab {
             active: 0,
             zoomed: HashSet::new(),
             floating: Vec::new(),
+            sync_panes: false,
         }
     }
 
@@ -614,6 +617,20 @@ impl App {
                 self.tabs.swap(self.active_tab, next);
                 self.active_tab = next;
             }
+            Action::ToggleSyncPanes => {
+                let enabled = {
+                    let tab = self.current_tab_mut();
+                    tab.sync_panes = !tab.sync_panes;
+                    tab.sync_panes
+                };
+                self.toast(if enabled {
+                    "synchronized input ON (broadcasting to all panes)"
+                } else {
+                    "synchronized input OFF"
+                });
+                self.repaint_all();
+            }
+            Action::ToggleScratchpad => self.toggle_scratchpad(),
             Action::Toast(msg) => self.toast(msg),
             Action::ExitMode => {
                 self.mode = Mode::Normal;
@@ -694,13 +711,14 @@ impl App {
     pub fn new_tab(&mut self) {
         let cols = 100;
         let rows = 30;
+        let cwd = self.active_term().map(|t| t.pwd()).filter(|s| !s.is_empty());
         let pane = match TermPane::new(
             cols,
             rows,
             self.cell,
             self.config.shell.as_deref(),
             &[],
-            None,
+            cwd.as_deref(),
             self.config.scrollback,
             self.config.max_log_mb * 1024 * 1024,
             true,
@@ -792,7 +810,8 @@ impl App {
     pub fn split(&mut self, dir: SplitDir, stacked: bool) {
         let cols = 80;
         let rows = 24;
-        let id = match self.new_term_pane(cols, rows, None, &[], None, None) {
+        let cwd = self.active_term().map(|t| t.pwd()).filter(|s| !s.is_empty());
+        let id = match self.new_term_pane(cols, rows, None, &[], cwd.as_deref(), None) {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("ghostwave: failed to spawn shell: {e}");
@@ -1082,6 +1101,61 @@ impl App {
             format!("float {next_idx}/{len}")
         };
         self.toast(&msg);
+    }
+
+    /// Toggle a persistent dropdown floating scratchpad terminal (F12 or Ctrl+~).
+    pub fn toggle_scratchpad(&mut self) {
+        let content = self.content_rect();
+        let pad_w = (content.w * 0.80).clamp(400.0, 1600.0);
+        let pad_h = (content.h * 0.70).clamp(250.0, 1000.0);
+        let pad_x = content.x + (content.w - pad_w) / 2.0;
+        let pad_y = content.y + 12.0;
+        let rect = Rect {
+            x: pad_x,
+            y: pad_y,
+            w: pad_w,
+            h: pad_h,
+        };
+
+        let existing_pos = self.current_tab().floating.iter().position(|f| {
+            matches!(self.current_tab().panes.get(f.pane), Some(Pane::Term(t)) if t.name == "scratchpad")
+        });
+
+        if let Some(pos) = existing_pos {
+            let tab = self.current_tab_mut();
+            let is_hidden = tab.floating[pos].hidden;
+            if is_hidden {
+                tab.floating[pos].hidden = false;
+                tab.active = tab.floating[pos].pane;
+                self.toast("scratchpad opened (F12 to hide)");
+            } else {
+                tab.floating[pos].hidden = true;
+                if let Some((_, p)) = tab.root.leaves().into_iter().next() {
+                    tab.active = p;
+                }
+                self.toast("scratchpad hidden");
+            }
+        } else {
+            let cols = ((rect.w - 2.0 * self.config.padding) / self.cell.w as f32).max(10.0) as u16;
+            let rows = ((rect.h - 2.0 * self.config.padding) / self.cell.h as f32).max(5.0) as u16;
+            let cwd = self.active_term().map(|t| t.pwd()).filter(|s| !s.is_empty());
+            if let Ok(id) = self.new_term_pane(cols, rows, None, &[], cwd.as_deref(), None) {
+                let tab = self.current_tab_mut();
+                if let Some(Pane::Term(t)) = tab.panes.get_mut(id) {
+                    t.name = "scratchpad".to_string();
+                }
+                tab.floating.push(FloatingPane {
+                    pane: id,
+                    rect,
+                    origin: None,
+                    hidden: false,
+                });
+                tab.active = id;
+                self.toast("scratchpad opened (F12 to hide)");
+            }
+        }
+        self.layout_all();
+        self.repaint_all();
     }
 
     fn cycle_stack(&mut self) {
@@ -2253,18 +2327,37 @@ impl App {
                 }
             }
             Dispatch::Pass => {
-                if let Some(t) = self.active_term_mut() {
-                    let consumed = if kp.text.is_some() && m.contains(Mods::SHIFT) {
-                        Mods::SHIFT
-                    } else {
-                        Mods::empty()
-                    };
-                    let text = kp.text.map(|c| c.to_string());
+                let tab = self.current_tab_mut();
+                let consumed = if kp.text.is_some() && m.contains(Mods::SHIFT) {
+                    Mods::SHIFT
+                } else {
+                    Mods::empty()
+                };
+                let text = kp.text.map(|c| c.to_string());
+                let unshifted = keymap::unshifted_codepoint(k);
+
+                if tab.sync_panes {
+                    for pane in &mut tab.panes {
+                        if let Pane::Term(t) = pane {
+                            let _ = t.handle_key(
+                                k,
+                                m,
+                                consumed,
+                                unshifted,
+                                text.as_deref(),
+                                key::Action::Press,
+                            );
+                        }
+                    }
+                } else if let Some(t) = tab.panes.get_mut(tab.active).and_then(|p| match p {
+                    Pane::Term(t) => Some(t),
+                    _ => None,
+                }) {
                     let _ = t.handle_key(
                         k,
                         m,
                         consumed,
-                        keymap::unshifted_codepoint(k),
+                        unshifted,
                         text.as_deref(),
                         key::Action::Press,
                     );
@@ -2504,6 +2597,37 @@ impl App {
 
         // Local coords.
         let (lx, ly) = (mx - pane_rect.x, my - pane_rect.y);
+
+        // Ctrl+Click opens URLs in default browser or local files in Preview pane.
+        if is_mouse_button_pressed(MouseButton::Left) && mods.contains(Mods::CTRL) {
+            let pad = self.config.padding;
+            let cell = self.cell;
+            let cell_col = ((lx - pad) / cell.w as f32).max(0.0) as u16;
+            let cell_row = ((ly - pad) / cell.h as f32).max(0.0) as u32;
+            let link_opt = self.current_tab_mut().panes.get_mut(pane_id).and_then(|p| match p {
+                Pane::Term(t) => t.link_at_cell(cell_row, cell_col).map(|l| (l, t.pwd())),
+                _ => None,
+            });
+            if let Some(((link, _, _), pwd)) = link_opt {
+                if link.starts_with("http://") || link.starts_with("https://") {
+                    let _ = std::process::Command::new("xdg-open").arg(&link).spawn();
+                    self.toast(&format!("opened {link}"));
+                    return;
+                } else {
+                    let file_path = link.split(':').next().unwrap_or(&link);
+                    let full = if std::path::Path::new(file_path).is_absolute() {
+                        std::path::PathBuf::from(file_path)
+                    } else {
+                        std::path::PathBuf::from(pwd).join(file_path)
+                    };
+                    if full.exists() {
+                        let path_str = full.to_string_lossy().to_string();
+                        self.open_file(path_str);
+                        return;
+                    }
+                }
+            }
+        }
 
         let tab = self.current_tab_mut();
         let Some(Pane::Term(t)) = tab.panes.get_mut(pane_id) else {

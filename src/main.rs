@@ -451,6 +451,19 @@ fn render(app: &mut App) {
         TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.status_fg), ..Default::default() },
     );
 
+    if app.current_tab().sync_panes {
+        let sync_label = " [SYNC] ";
+        let sw = measure_text(sync_label, Some(&font), 13, 1.0).width + 8.0;
+        let sx = w - rw - sw - 4.0;
+        draw_rectangle(sx, h - sh + 2.0, sw, sh - 4.0, color_theme(theme.search_match));
+        draw_text_ex(
+            sync_label,
+            sx + 4.0,
+            h - 8.0,
+            TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.bg), ..Default::default() },
+        );
+    }
+
     // ---- toast -----------------------------------------------------------
     if let Some((msg, t0)) = &app.toast {
         if t0.elapsed().as_secs_f32() < 2.5 {

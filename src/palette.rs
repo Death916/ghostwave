@@ -124,6 +124,8 @@ impl CommandPalette {
             PaletteItem { label: "Paste".into(), action: Paste },
             PaletteItem { label: "Clear Terminal".into(), action: ClearTerminal },
             PaletteItem { label: "New AI Chat".into(), action: NewAi },
+            PaletteItem { label: "Toggle Synchronized Panes (Broadcast)".into(), action: ToggleSyncPanes },
+            PaletteItem { label: "Toggle Scratchpad Drawer".into(), action: ToggleScratchpad },
             PaletteItem { label: "Quit".into(), action: Quit },
         ];
         for t in themes {
@@ -298,5 +300,7 @@ mod tests {
         for t in &theme_actions {
             assert!(matches!(t.action, Action::Theme(_)), "theme label should map to Action::Theme, got {:?}", t.action);
         }
+        assert!(items.iter().any(|i| i.action == Action::ToggleSyncPanes));
+        assert!(items.iter().any(|i| i.action == Action::ToggleScratchpad));
     }
 }
