@@ -572,6 +572,23 @@ remote connection switcher (Ctrl+G — clashes with zellij locked).
 - zellij default.kdl (fetched from zellij-org/zellij main)
 - ghostty pinned commit a887df42 (1.3.2-dev) — vendored by build.rs
 
+## MAYBES / FUTURE EXPLORATION
+
+- **Long-Running Command Notifications (Foot / WezTerm style)**:
+  - System desktop notification via `notify-send` / FreeDesktop D-Bus when a background command takes >5s and finishes while unfocused (`cargo build`, `nix build`, `git clone`).
+- **Scrollback Error Minimap Track (Wave / Warp style)**:
+  - 4px right-side gutter rendering color tick marks (red for non-zero exit codes/compiler errors, yellow for search hits, blue for prompts) with click-to-jump.
+- **Quick-Select Regex Tagging Mode (WezTerm / Contour style)**:
+  - Fast keyboard picker overlaying 2-letter tags (`[aa]`, `[ab]`) over Git commit hashes, IPs, URLs, Docker IDs, UUIDs to copy or open without mouse.
+- **Remote SSH SFTP / File Tree Drawer (Tabby / Termius style)**:
+  - Slide-out file tree for durable SSH sessions (`ghostd`), drag-and-drop auto-upload/download, open remote files in local `PreviewPane`.
+- **Smart Semantic Double-Click (Contour style)**:
+  - Context-aware selection expanding over `file.rs:120:5`, inner quoted strings, and JSON key-values on double click.
+- **Subtle Cursor Micro-Glide Animation (Neovide / Rio style)**:
+  - Smooth spring interpolation (20-40ms) on cursor jump.
+- **Live Status Sparklines**:
+  - Live 1-char CPU / memory / git branch status widgets in status bar.
+
 ## External facts
 
 - Target platform: Linux/Wayland (Hyprland dev machine), wl-copy/wl-paste

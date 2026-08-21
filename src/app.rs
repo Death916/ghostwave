@@ -177,6 +177,9 @@ pub struct App {
     /// True when the last update() drained pty data (event-driven pacing:
     /// the main loop skips its frame sleep while there's backlog).
     pub pty_activity: bool,
+    /// Living reactive sine-wave animation state (status bar visualizer).
+    pub wave_energy: f32,
+    pub wave_phase: f32,
     /// ghostd upload results: (host, session, ok). Polled each frame.
     remote_uploads: std::sync::mpsc::Receiver<(String, String, bool)>,
     remote_upload_tx: std::sync::mpsc::Sender<(String, String, bool)>,
@@ -273,6 +276,8 @@ impl App {
             session_list: None,
             last_session_save: std::time::Instant::now(),
             pty_activity: false,
+            wave_energy: 0.1,
+            wave_phase: 0.0,
             parked: Vec::new(),
             remote_uploads,
             remote_upload_tx,
@@ -2118,6 +2123,11 @@ impl App {
         let k = kp.key;
         let m = kp.mods;
 
+        // Keystroke energizes the living visual wave
+        if self.config.visual_wave {
+            self.wave_energy = (self.wave_energy + 0.25).min(2.5);
+        }
+
         // Locked mode: ONLY Ctrl+g unlocks. ALL other keys pass straight to terminal!
         if self.mode == Mode::Locked {
             if kp.key == Key::G && kp.mods.contains(Mods::CTRL) {
@@ -2813,6 +2823,18 @@ impl App {
         self.pty_activity |= drain_tab_panes(&mut self.tabs);
         for live in self.parked.iter_mut() {
             self.pty_activity |= drain_tab_panes(&mut live.tabs);
+        }
+
+        // Living reactive sine-wave animation update:
+        if self.config.visual_wave {
+            if self.pty_activity {
+                self.wave_energy = (self.wave_energy + 0.12).min(2.5);
+            }
+            self.wave_energy = (self.wave_energy * 0.94).max(0.1);
+            self.wave_phase += 0.04 * self.config.wave_speed * (1.0 + self.wave_energy * 1.5);
+            if self.wave_phase > std::f32::consts::TAU * 100.0 {
+                self.wave_phase -= std::f32::consts::TAU * 100.0;
+            }
         }
 
         // ---- durable remote sessions ----

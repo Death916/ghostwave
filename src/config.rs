@@ -24,6 +24,12 @@ pub struct Config {
     pub max_log_mb: u64,
     /// Terminal cursor visual style ("block", "bar", "beam", "underline", "hollow").
     pub cursor_style: Option<String>,
+    /// Living reactive sine-wave visualizer in the status bar.
+    pub visual_wave: bool,
+    /// Wave animation speed multiplier (default 1.0).
+    pub wave_speed: f32,
+    /// Wave amplitude multiplier (default 1.0).
+    pub wave_amplitude: f32,
     /// AI assistant pane configuration (OpenAI-compatible chat completions).
     pub ai: AiConfig,
     /// Durable remote sessions (ghostd).
@@ -86,6 +92,9 @@ impl Default for Config {
             row_gap: 4.0,
             max_log_mb: 32,
             cursor_style: None,
+            visual_wave: true,
+            wave_speed: 1.0,
+            wave_amplitude: 1.0,
             ai: AiConfig::default(),
             remote: RemoteConfig::default(),
         }
@@ -136,6 +145,9 @@ mod tests {
         assert_eq!(cfg.padding, 6.0);
         assert_eq!(cfg.row_gap, 4.0);
         assert_eq!(cfg.max_log_mb, 32);
+        assert!(cfg.visual_wave);
+        assert!((cfg.wave_speed - 1.0).abs() < 1e-6);
+        assert!((cfg.wave_amplitude - 1.0).abs() < 1e-6);
         assert!(cfg.shell.is_none());
     }
 
@@ -146,6 +158,7 @@ mod tests {
         assert_eq!(cfg.theme, "dracula");
         assert_eq!(cfg.scrollback, 10_000, "unspecified field keeps default");
         assert_eq!(cfg.max_log_mb, 32);
+        assert!(cfg.visual_wave);
     }
 
     #[test]
@@ -158,6 +171,7 @@ mod tests {
         assert!((def.font_size - 12.0).abs() < 1e-6);
         assert_eq!(def.scrollback, 10_000);
         assert_eq!(def.theme, "tokyonight");
+        assert!(def.visual_wave);
     }
 
     #[test]
@@ -172,6 +186,9 @@ mod tests {
             row_gap = 2.0
             max_log_mb = 64
             cursor_style = "beam"
+            visual_wave = false
+            wave_speed = 1.5
+            wave_amplitude = 0.8
             [remote]
             auto_reconnect = false
             reconnect_attempts = 2
@@ -191,6 +208,9 @@ mod tests {
         assert!((cfg.row_gap - 2.0).abs() < 1e-6);
         assert_eq!(cfg.max_log_mb, 64);
         assert_eq!(cfg.cursor_style.as_deref(), Some("beam"));
+        assert!(!cfg.visual_wave);
+        assert!((cfg.wave_speed - 1.5).abs() < 1e-6);
+        assert!((cfg.wave_amplitude - 0.8).abs() < 1e-6);
         assert!(!cfg.remote.auto_reconnect);
         assert_eq!(cfg.remote.reconnect_attempts, 2);
         assert_eq!(cfg.remote.reconnect_delay_secs, 10);
