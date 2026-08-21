@@ -19,6 +19,7 @@ mod search;
 mod session;
 mod term;
 mod theme;
+mod visualizer;
 
 use std::collections::VecDeque;
 
@@ -145,6 +146,9 @@ fn render(app: &mut App) {
             Pane::Ai(a) => {
                 a.render(rect, &font, font_px, theme);
             }
+            Pane::Visual(v) => {
+                v.render(rect, &font, &theme);
+            }
             Pane::Closed => {}
         }
     }
@@ -168,6 +172,7 @@ fn render(app: &mut App) {
                 }
                 Pane::Preview(_) => format!("file {}", i + 1),
                 Pane::Ai(_) => format!("ai {}", i + 1),
+                Pane::Visual(_) => format!("ghostwave {}", i + 1),
                 Pane::Closed => String::new(),
             };
             let label = format!(" {} ", name);
@@ -212,6 +217,9 @@ fn render(app: &mut App) {
             Pane::Ai(a) => {
                 a.render(rect, &font, font_px, theme);
             }
+            Pane::Visual(v) => {
+                v.render(rect, &font, &theme);
+            }
             Pane::Closed => {}
         }
     }
@@ -232,6 +240,7 @@ fn render(app: &mut App) {
                 }
                 Pane::Preview(_) => format!("float file {i}"),
                 Pane::Ai(_) => format!("float ai {i}"),
+                Pane::Visual(_) => format!("float ghostwave {i}"),
                 Pane::Closed => String::new(),
             };
             let label = format!(" {} ", name);
