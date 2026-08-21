@@ -173,6 +173,15 @@ impl FontStack {
         &self.fonts[idx.min(self.fonts.len() - 1)]
     }
 
+    /// Pre-warm font glyph caches by rasterizing printable ASCII into macroquad's atlas.
+    pub fn warmup(&self, font_size: u16) {
+        use macroquad::text::measure_text;
+        let ascii_str: String = (0x20..=0x7Eu8).map(|b| b as char).collect();
+        for font in &self.fonts {
+            let _ = measure_text(&ascii_str, Some(font), font_size, 1.0);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.fonts.len()
     }

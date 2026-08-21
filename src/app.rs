@@ -279,6 +279,9 @@ impl App {
         // Apply the configured theme's fg/bg to the initial terminal.
         app.apply_terminal_colors();
 
+        // Warm up glyph atlas caches for smooth first-frame rendering.
+        app.font_stack.warmup(font_px);
+
         Ok(app)
     }
 
