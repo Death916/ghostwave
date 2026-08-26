@@ -2850,7 +2850,12 @@ impl App {
                 self.wave_energy = (self.wave_energy + 0.12).min(2.5);
             }
             self.wave_energy = (self.wave_energy * 0.94).max(0.1);
-            self.wave_phase += 0.04 * self.config.wave_speed * (1.0 + self.wave_energy * 1.5);
+            let speed_mult = if self.wave_energy > 0.15 {
+                1.0 + self.wave_energy * 1.5
+            } else {
+                0.35
+            };
+            self.wave_phase += 0.04 * self.config.wave_speed * speed_mult;
             if self.wave_phase > std::f32::consts::TAU * 100.0 {
                 self.wave_phase -= std::f32::consts::TAU * 100.0;
             }
