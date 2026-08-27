@@ -2119,6 +2119,10 @@ impl App {
 
     /// Pane rect for a pane id (content-area rect, unzoomed logic).
     pub fn pane_rect_of(&self, id: usize) -> Option<Rect> {
+        let tab = self.current_tab();
+        if let Some(f) = tab.floating.iter().rev().find(|f| f.pane == id && !f.hidden) {
+            return Some(f.rect);
+        }
         self.active_pane_rects()
             .into_iter()
             .find(|(p, _)| *p == id)
@@ -2520,95 +2524,124 @@ impl App {
         let cell = self.cell;
         let padding = self.config.padding;
 
-        // Tab context menu clicks (before the tab-bar check: the menu box
-        // opens at the cursor and extends below the tab bar).
-        if let Some((tab_idx, mx0, my0)) = self.tab_menu {
-            if is_mouse_button_pressed(MouseButton::Left) {
-                let menu_h = TAB_MENU_PAD + TAB_MENU_ITEMS as f32 * TAB_MENU_ITEM_H + TAB_MENU_PAD;
-                if mx >= mx0 && mx <= mx0 + TAB_MENU_W && my >= my0 && my <= my0 + menu_h {
-                    let item = ((my - my0 - TAB_MENU_PAD) / TAB_MENU_ITEM_H) as usize;
-                    match item {
-                        0 => {
-                            self.goto_tab(tab_idx);
-                            self.mode = Mode::RenameTab;
+        let any_pressed = is_mouse_button_down(MouseButton::Left)
+            || is_mouse_button_down(MouseButton::Right)
+            || is_mouse_button_down(MouseButton::Middle);
+        let any_released = is_mouse_button_released(MouseButton::Left)
+            || is_mouse_button_released(MouseButton::Right)
+            || is_mouse_button_released(MouseButton::Middle);
+
+        // If a mouse drag is in progress on the current tab, capture all mouse events to that pane.
+        let captured = if let Some((tab_idx, pane_id)) = self.mouse_pane {
+            if tab_idx == self.active_tab && (any_pressed || any_released) {
+                self.pane_rect_of(pane_id).map(|r| (pane_id, r))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let (pane_id, pane_rect) = if let Some(h) = captured {
+            h
+        } else {
+            // Tab context menu clicks (before the tab-bar check: the menu box
+            // opens at the cursor and extends below the tab bar).
+            if let Some((tab_idx, mx0, my0)) = self.tab_menu {
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    let menu_h = TAB_MENU_PAD + TAB_MENU_ITEMS as f32 * TAB_MENU_ITEM_H + TAB_MENU_PAD;
+                    if mx >= mx0 && mx <= mx0 + TAB_MENU_W && my >= my0 && my <= my0 + menu_h {
+                        let item = ((my - my0 - TAB_MENU_PAD) / TAB_MENU_ITEM_H) as usize;
+                        match item {
+                            0 => {
+                                self.goto_tab(tab_idx);
+                                self.mode = Mode::RenameTab;
+                            }
+                            1 => {
+                                self.goto_tab(tab_idx);
+                                self.close_tab();
+                            }
+                            _ => {}
                         }
-                        1 => {
-                            self.goto_tab(tab_idx);
-                            self.close_tab();
-                        }
-                        _ => {}
+                    }
+                    self.tab_menu = None;
+                    self.repaint_all(); // menu box covered pane content
+                    return;
+                }
+            }
+
+            // Tab bar clicks.
+            if my < TAB_BAR_H {
+                if is_mouse_button_pressed(MouseButton::Right) {
+                    let tab_w = 120.0;
+                    let idx = (mx / tab_w) as usize;
+                    if idx < self.tabs.len() {
+                        self.tab_menu = Some((idx, mx, my));
+                        self.repaint_all(); // menu box covers pane content
                     }
                 }
-                self.tab_menu = None;
-                self.repaint_all(); // menu box covered pane content
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    let tab_w = 120.0;
+                    let idx = (mx / tab_w) as usize;
+                    if idx < self.tabs.len() {
+                        self.goto_tab(idx);
+                    }
+                }
                 return;
             }
-        }
 
-        // Tab bar clicks.
-        if my < TAB_BAR_H {
-            if is_mouse_button_pressed(MouseButton::Right) {
-                let tab_w = 120.0;
-                let idx = (mx / tab_w) as usize;
-                if idx < self.tabs.len() {
-                    self.tab_menu = Some((idx, mx, my));
-                    self.repaint_all(); // menu box covers pane content
+            // Palette click closes.
+            if self.palette.is_some() && is_mouse_button_pressed(MouseButton::Left) {
+                self.palette = None;
+                self.repaint_all(); // palette box covered pane content
+                return;
+            }
+
+            let content = self.content_rect();
+            if my > content.y + content.h {
+                return; // status bar
+            }
+
+            let rects = self.active_pane_rects();
+            // Floating panes are hit-tested FIRST (topmost; later floats draw
+            // above earlier ones). Tree panes only get the click if no float
+            // covers it.
+            let float_hit = {
+                let tab = self.current_tab();
+                tab.floating
+                    .iter()
+                    .rev()
+                    .filter(|f| !f.hidden) // hidden floats are bg panes
+                    .find(|f| f.rect.contains(mx, my))
+                    .map(|f| (f.pane, f.rect))
+            };
+            let hit = if let Some(h) = float_hit {
+                Some(h)
+            } else {
+                rects
+                    .iter()
+                    .find(|(_, r)| r.contains(mx, my))
+                    .map(|(id, r)| (*id, *r))
+            };
+            let Some((pane_id, pane_rect)) = hit else {
+                return;
+            };
+            // Click focuses the pane (hover alone must not steal focus).
+            if is_mouse_button_pressed(MouseButton::Left) || is_mouse_button_pressed(MouseButton::Right) {
+                if self.current_tab().active != pane_id {
+                    self.current_tab_mut().active = pane_id;
+                    self.repaint_all(); // cursor moved to another pane
                 }
             }
-            if is_mouse_button_pressed(MouseButton::Left) {
-                let tab_w = 120.0;
-                let idx = (mx / tab_w) as usize;
-                if idx < self.tabs.len() {
-                    self.goto_tab(idx);
-                }
+            if is_mouse_button_pressed(MouseButton::Left)
+                || is_mouse_button_pressed(MouseButton::Right)
+                || is_mouse_button_pressed(MouseButton::Middle)
+            {
+                self.mouse_pane = Some((self.active_tab, pane_id));
             }
-            return;
-        }
 
-        // Palette click closes.
-        if self.palette.is_some() && is_mouse_button_pressed(MouseButton::Left) {
-            self.palette = None;
-            self.repaint_all(); // palette box covered pane content
-            return;
-        }
-
-        let content = self.content_rect();
-        if my > content.y + content.h {
-            return; // status bar
-        }
-
-        let rects = self.active_pane_rects();
-        // Floating panes are hit-tested FIRST (topmost; later floats draw
-        // above earlier ones). Tree panes only get the click if no float
-        // covers it.
-        let float_hit = {
-            let tab = self.current_tab();
-            tab.floating
-                .iter()
-                .rev()
-                .filter(|f| !f.hidden) // hidden floats are bg panes
-                .find(|f| f.rect.contains(mx, my))
-                .map(|f| (f.pane, f.rect))
+            (pane_id, pane_rect)
         };
-        let hit = if let Some(h) = float_hit {
-            Some(h)
-        } else {
-            rects
-                .iter()
-                .find(|(_, r)| r.contains(mx, my))
-                .map(|(id, r)| (*id, *r))
-        };
-        let Some((pane_id, pane_rect)) = hit else {
-            return;
-        };
-        // Click focuses the pane (hover alone must not steal focus).
-        if is_mouse_button_pressed(MouseButton::Left) || is_mouse_button_pressed(MouseButton::Right) {
-            if self.current_tab().active != pane_id {
-                self.current_tab_mut().active = pane_id;
-                self.repaint_all(); // cursor moved to another pane
-            }
-        }
-        self.mouse_pane = Some((self.active_tab, pane_id));
 
         let mods = keymap::current_mods();
         let any_pressed = is_mouse_button_down(MouseButton::Left)
@@ -2812,6 +2845,10 @@ impl App {
                 },
                 mods,
             );
+        }
+
+        if !any_pressed {
+            self.mouse_pane = None;
         }
     }
 

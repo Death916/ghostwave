@@ -599,11 +599,12 @@ impl TermPane {
                 // gesture keeps left_click_count > 0 after release (for
                 // double-click timing), so gating on click_count alone makes
                 // any hover after a click extend the selection.
-                if moved
+                let in_autoscroll = ev.y < padding || ev.y > rect.h - padding;
+                if (moved || in_autoscroll)
                     && ev.button_down == Some(mouse::Button::Left)
                     && self.selection.is_selecting(&self.term)?
                 {
-                    self.selection.on_drag(
+                    let scrolled = self.selection.on_drag(
                         &mut self.term,
                         ev.x,
                         ev.y,
@@ -612,6 +613,10 @@ impl TermPane {
                         padding,
                         mods,
                     )?;
+                    if scrolled {
+                        self.scroll_active = true;
+                    }
+                    self.last_mouse = (ev.x, ev.y);
                     self.force_repaint = true;
                     return Ok(());
                 }
@@ -1259,6 +1264,7 @@ struct SelectionState<'alloc> {
     release_event: ReleaseEvent<'alloc>,
     drag_event: DragEvent<'alloc>,
     start_time: Instant,
+    last_autoscroll: Option<Instant>,
 }
 
 impl SelectionState<'_> {
@@ -1271,6 +1277,7 @@ impl SelectionState<'_> {
             release_event: ReleaseEvent::new()?,
             drag_event: DragEvent::new()?,
             start_time: Instant::now(),
+            last_autoscroll: None,
         })
     }
 
@@ -1282,8 +1289,10 @@ impl SelectionState<'_> {
     /// i.e. surface-space) to a viewport cell. Padding is the grid inset.
     fn point(&self, x: f32, y: f32, rect: Rect, cell: CellDims, padding: f32, cols: u16, rows: u16) -> Point {
         let _ = rect;
-        let px = ((x - padding) / cell.w as f32).clamp(0.0, cols as f32) as u16;
-        let py = ((y - padding) / cell.h as f32).clamp(0.0, rows as f32) as u32;
+        let max_col = cols.saturating_sub(1);
+        let max_row = rows.saturating_sub(1);
+        let px = ((x - padding) / cell.w as f32).clamp(0.0, max_col as f32) as u16;
+        let py = ((y - padding) / cell.h as f32).clamp(0.0, max_row as f32) as u32;
         Point::Viewport(PointCoordinate { x: px, y: py })
     }
 
@@ -1296,6 +1305,7 @@ impl SelectionState<'_> {
         cell: CellDims,
         padding: f32,
     ) -> Result<()> {
+        self.last_autoscroll = None;
         let point = self.point(x, y, rect, cell, padding, terminal.cols()?, terminal.rows()?);
         let grid_ref = terminal.grid_ref(point)?;
         let selection = self
@@ -1317,6 +1327,7 @@ impl SelectionState<'_> {
         cell: CellDims,
         padding: f32,
     ) -> Result<()> {
+        self.last_autoscroll = None;
         let point = self.point(x, y, rect, cell, padding, terminal.cols()?, terminal.rows()?);
         let grid_ref = terminal.grid_ref(point).ok();
         self.release_event.apply(&mut self.gesture, terminal, grid_ref)?;
@@ -1332,7 +1343,31 @@ impl SelectionState<'_> {
         cell: CellDims,
         padding: f32,
         mods: Mods,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let mut scrolled = false;
+        let top_boundary = padding;
+        let bottom_boundary = rect.h - padding;
+
+        if y < top_boundary {
+            if self.last_autoscroll.map_or(true, |t| t.elapsed() >= Duration::from_millis(35)) {
+                let dist = (top_boundary - y).max(0.0);
+                let lines = ((dist / cell.h as f32).ceil() as isize).clamp(1, 5);
+                terminal.scroll_viewport(ScrollViewport::Delta(-lines));
+                self.last_autoscroll = Some(Instant::now());
+                scrolled = true;
+            }
+        } else if y > bottom_boundary {
+            if self.last_autoscroll.map_or(true, |t| t.elapsed() >= Duration::from_millis(35)) {
+                let dist = (y - bottom_boundary).max(0.0);
+                let lines = ((dist / cell.h as f32).ceil() as isize).clamp(1, 5);
+                terminal.scroll_viewport(ScrollViewport::Delta(lines));
+                self.last_autoscroll = Some(Instant::now());
+                scrolled = true;
+            }
+        } else {
+            self.last_autoscroll = None;
+        }
+
         let point = self.point(x, y, rect, cell, padding, terminal.cols()?, terminal.rows()?);
         let grid_ref = terminal.grid_ref(point)?;
         let geometry = Geometry {
@@ -1349,7 +1384,7 @@ impl SelectionState<'_> {
             .set_position(x.into(), y.into())?
             .apply(&mut self.gesture, terminal, grid_ref, geometry)?;
         terminal.set_selection(selection.as_ref())?;
-        Ok(())
+        Ok(scrolled)
     }
 }
 
@@ -1538,5 +1573,62 @@ mod tests {
         assert!(file_hit.is_some());
         let (file, _, _) = file_hit.unwrap();
         assert_eq!(file, "src/main.rs:12:4");
+    }
+
+    #[test]
+    fn selection_drag_autoscrolls_viewport() {
+        let cell = CellDims { w: 10, h: 20, baseline: 15.0 };
+        let mut pane = TermPane::new(
+            40,
+            10,
+            cell,
+            None,
+            &[],
+            None,
+            100,
+            1024 * 1024,
+            false,
+            None,
+        )
+        .unwrap();
+
+        for i in 0..30 {
+            pane.term.vt_write(format!("line {}\r\n", i).as_bytes());
+        }
+
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 200.0 };
+        let padding = 5.0;
+
+        pane.handle_mouse(
+            rect,
+            cell,
+            padding,
+            MouseEv {
+                kind: MouseEvKind::Press(libghostty_vt::mouse::Button::Left),
+                x: 50.0,
+                y: 100.0,
+                any_pressed: true,
+                button_down: Some(libghostty_vt::mouse::Button::Left),
+            },
+            Mods::empty(),
+        )
+        .unwrap();
+
+        pane.handle_mouse(
+            rect,
+            cell,
+            padding,
+            MouseEv {
+                kind: MouseEvKind::Motion,
+                x: 50.0,
+                y: -30.0,
+                any_pressed: true,
+                button_down: Some(libghostty_vt::mouse::Button::Left),
+            },
+            Mods::empty(),
+        )
+        .unwrap();
+
+        assert!(pane.scroll_active, "drag above pane top should activate scroll/autoscroll");
     }
 }
