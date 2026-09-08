@@ -21,7 +21,7 @@ use libghostty_vt::{
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     style::RgbColor,
     terminal::{
-        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Point,
+        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
         PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
         SizeReportSize,
     },
@@ -584,6 +584,14 @@ impl TermPane {
             MouseEvKind::Release(btn) => {
                 if btn == mouse::Button::Left && self.selection.is_selecting(&self.term)? {
                     self.selection.on_release(&self.term, ev.x, ev.y, rect, cell, padding)?;
+                    let opts = FormatOptions::new().with_trim(true).with_unwrap(true);
+                    if let Ok(Some(bytes)) = self.term.format_selection_alloc(None, opts) {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        if !text.is_empty() {
+                            clipboard::write_primary_text(&text);
+                            clipboard::write_text(&text);
+                        }
+                    }
                     self.force_repaint = true;
                     return Ok(());
                 }
@@ -677,10 +685,10 @@ impl TermPane {
 
     // ---- selection / clipboard ------------------------------------------
 
-    /// Copy the active selection, or the whole viewport if none.
+    /// Copy the active selection.
     pub fn copy_selection(&mut self) -> Result<bool> {
-        // Active selection (FormatOptions::new uses the terminal's current selection).
-        if let Some(bytes) = self.term.format_selection_alloc(None, FormatOptions::new())? {
+        let opts = FormatOptions::new().with_trim(true).with_unwrap(true);
+        if let Some(bytes) = self.term.format_selection_alloc(None, opts)? {
             let text = String::from_utf8_lossy(&bytes).into_owned();
             if !text.is_empty() {
                 self.term.set_selection(None)?;
@@ -688,26 +696,43 @@ impl TermPane {
                 return Ok(clipboard::write_text(&text));
             }
         }
-        // No selection: copy the visible screen.
-        if let Some(sel) = self.term.select_all()? {
-            let opts = FormatOptions::new().with_selection(&sel);
-            if let Some(bytes) = self.term.format_selection_alloc(None, opts)? {
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                return Ok(clipboard::write_text(&text));
-            }
-        }
         Ok(false)
     }
 
+    pub fn paste_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let is_bracketed = self.term.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
+        let mut data = text.as_bytes().to_vec();
+        let mut buf = vec![0u8; data.len() * 2 + 64];
+        match libghostty_vt::paste::encode(&mut data, is_bracketed, &mut buf) {
+            Ok(len) => {
+                self.write_input(&buf[..len]);
+            }
+            Err(libghostty_vt::error::Error::OutOfSpace { required }) => {
+                buf.resize(required, 0);
+                if let Ok(len) = libghostty_vt::paste::encode(&mut data, is_bracketed, &mut buf) {
+                    self.write_input(&buf[..len]);
+                } else {
+                    self.write_input(text.as_bytes());
+                }
+            }
+            Err(_) => {
+                self.write_input(text.as_bytes());
+            }
+        }
+    }
+
     pub fn paste_clipboard(&mut self) {
-        if let Some(text) = clipboard::read_text() {
-            self.write_input(text.as_bytes());
+        if let Some(text) = clipboard::read_text().or_else(clipboard::read_primary_text) {
+            self.paste_text(&text);
         }
     }
 
     pub fn paste_primary(&mut self) {
         if let Some(text) = clipboard::read_primary_text().or_else(clipboard::read_text) {
-            self.write_input(text.as_bytes());
+            self.paste_text(&text);
         }
     }
 
