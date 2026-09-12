@@ -6,7 +6,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::net::{UnixListener, UnixStream},
     },
     path::Path,
@@ -74,7 +74,7 @@ fn accept_loop(listener: UnixListener, name: &str, log_cap: u64, first_attach_se
         };
         if ready.contains(&1) {
             match listener.accept() {
-                Ok((mut stream, _)) => {
+                Ok((stream, _)) => {
                     if ever_attached && client_tx.lock().unwrap().is_some() {
                         let _ = write_all_blocking(
                             stream.as_raw_fd(),
@@ -143,8 +143,12 @@ fn handle_client(
     tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
 ) {
     set_nonblock(stream.as_raw_fd());
-    // Blocking dup for writes to the pty (client thread only).
-    let pty_write = unsafe { nix::libc::dup(pty_fd) }.max(0);
+    // Blocking dup for writes to the pty (client thread only; auto-closes on drop).
+    let pty_write_raw = unsafe { nix::libc::dup(pty_fd) };
+    if pty_write_raw < 0 {
+        return;
+    }
+    let pty_write = unsafe { OwnedFd::from_raw_fd(pty_write_raw) };
 
     // 1. SIZE line, WAITED for. The original code read nonblocking and
     //    bailed on EAGAIN — if the client's handshake hadn't landed yet,
@@ -183,7 +187,7 @@ fn handle_client(
         let mut it = rest.trim().split(' ');
         if let (Some(c), Some(r)) = (it.next(), it.next()) {
             if let (Ok(c), Ok(r)) = (c.parse::<u16>(), r.parse::<u16>()) {
-                set_term_size(pty_write, c, r);
+                set_term_size(pty_write.as_raw_fd(), c, r);
             }
         }
     } else {
@@ -268,7 +272,7 @@ fn handle_client(
                                         let mut it = s.split(' ');
                                         if let (Some(c), Some(r)) = (it.next(), it.next()) {
                                             if let (Ok(c), Ok(r)) = (c.parse::<u16>(), r.parse::<u16>()) {
-                                                set_term_size(pty_write, c, r);
+                                                set_term_size(pty_write.as_raw_fd(), c, r);
                                             }
                                         }
                                     }
@@ -286,7 +290,7 @@ fn handle_client(
                     }
                     // Flush to the pty (blocking fd: backpressure is fine).
                     if !pty_out.is_empty() {
-                        let _ = write_all_blocking(pty_write, &pty_out);
+                        let _ = write_all_blocking(pty_write.as_raw_fd(), &pty_out);
                         pty_out.clear();
                     }
                 }

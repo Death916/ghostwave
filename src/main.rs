@@ -66,15 +66,18 @@ fn key_has_text(code: KeyCode) -> bool {
     )
 }
 
-fn handle_input(app: &mut App) {
+fn handle_input(app: &mut App) -> bool {
+    let mut had_input = false;
     // Queue of platform text chars (includes auto-repeat for text keys).
     let mut chars: VecDeque<char> = VecDeque::new();
     while let Some(c) = get_char_pressed() {
         chars.push_back(c);
+        had_input = true;
     }
 
     for &code in ALL_KEYS {
         if is_key_pressed(code) {
+            had_input = true;
             // Attach the first queued char to the key event (if this key
             // normally produces text). The char is consumed either way.
             let text = if key_has_text(code) { chars.pop_front() } else { None };
@@ -83,12 +86,14 @@ fn handle_input(app: &mut App) {
                 app.clear_repeat(code);
             }
         } else if is_key_down(code) && !key_has_text(code) {
+            had_input = true;
             // Synthetic repeat for non-text keys (arrows, backspace, ...).
             if let Some(kp) = keymap::from_macroquad(code, None) {
                 app.handle_repeat(code, kp);
             }
         }
         if is_key_released(code) {
+            had_input = true;
             if let Some(kp) = keymap::from_macroquad(code, None) {
                 app.handle_key_release(kp);
             }
@@ -99,9 +104,12 @@ fn handle_input(app: &mut App) {
     // Leftover chars (unicode / IME) that didn't map to a tracked key.
     while let Some(c) = chars.pop_front() {
         if !c.is_control() {
+            had_input = true;
             app.handle_char(c);
         }
     }
+
+    had_input
 }
 
 fn color_theme(rgb: crate::theme::Rgb) -> Color {
@@ -654,6 +662,9 @@ async fn main() -> Result<()> {
     let font_stack = fonts::FontStack::new(include_bytes!("../assets/JetBrainsMono-Medium.ttf"), font.clone())?;
     let mut app = App::new(config, font, font_stack)?;
 
+    let mut last_mouse_pos = mouse_position();
+    let mut last_activity = std::time::Instant::now();
+
     loop {
         let frame_start = std::time::Instant::now();
         app.update();
@@ -661,8 +672,33 @@ async fn main() -> Result<()> {
         // Recompute pane grids when the window/layout changes (no-op otherwise).
         app.layout_all();
 
-        handle_input(&mut app);
+        let had_input = handle_input(&mut app);
         app.handle_mouse();
+
+        let mouse_pos = mouse_position();
+        let (wheel_x, wheel_y) = mouse_wheel();
+        let mouse_active = (mouse_pos.0 - last_mouse_pos.0).abs() > 0.5
+            || (mouse_pos.1 - last_mouse_pos.1).abs() > 0.5
+            || is_mouse_button_down(MouseButton::Left)
+            || is_mouse_button_down(MouseButton::Right)
+            || is_mouse_button_down(MouseButton::Middle)
+            || wheel_x != 0.0
+            || wheel_y != 0.0;
+        if mouse_active {
+            last_mouse_pos = mouse_pos;
+        }
+
+        let has_visual_pane = app.current_tab().panes.iter().any(|p| matches!(p, Pane::Visual(_)));
+        let is_active = app.pty_activity
+            || had_input
+            || mouse_active
+            || has_visual_pane
+            || app.toast.is_some()
+            || app.wave_energy > 0.15;
+
+        if is_active {
+            last_activity = std::time::Instant::now();
+        }
 
         render(&mut app);
 
@@ -673,12 +709,21 @@ async fn main() -> Result<()> {
             std::process::exit(0);
         }
 
-        // Frame pacing: sleep only when idle to target 120 FPS power efficiency (0% idle CPU).
+        // Frame pacing:
         // During PTY flood activity (app.pty_activity == true), sleep is 0 for maximum throughput.
-        const IDLE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(8_333);
+        // During user interaction or active animations, pace at 120 FPS (~8.33ms).
+        // When idle (no input/pty/animations), throttle down to 30 FPS (~33.33ms) to save GPU/CPU.
+        const ACTIVE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(8_333);
+        const IDLE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(33_333);
+        let target_frame_time = if last_activity.elapsed() < std::time::Duration::from_millis(500) {
+            ACTIVE_FRAME_TIME
+        } else {
+            IDLE_FRAME_TIME
+        };
+
         let elapsed = frame_start.elapsed();
-        if !app.pty_activity && elapsed < IDLE_FRAME_TIME {
-            std::thread::sleep(IDLE_FRAME_TIME - elapsed);
+        if !app.pty_activity && elapsed < target_frame_time {
+            std::thread::sleep(target_frame_time - elapsed);
         }
 
         next_frame().await

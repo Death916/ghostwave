@@ -21,7 +21,7 @@ use libghostty_vt::{
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     style::RgbColor,
     terminal::{
-        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Point,
+        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
         PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
         SizeReportSize,
     },
@@ -131,6 +131,8 @@ pub struct TermPane {
     pub log: Option<crate::session::AsyncPaneLog>,
     /// Optional cursor visual style override (from config).
     pub cursor_style: Option<libghostty_vt::render::CursorVisualStyle>,
+    /// GPU texture cache for Kitty graphics images (image_id -> (Texture2D, width, height, data_len)).
+    kitty_textures: std::collections::HashMap<u32, (macroquad::prelude::Texture2D, u32, u32, usize)>,
 }
 
 impl TermPane {
@@ -152,10 +154,21 @@ impl TermPane {
             ..Default::default()
         });
 
+        // Ghostty's VT engine measures max_scrollback in BYTES, not lines.
+        // Convert line count (< 1,000,000) to bytes (~1024 bytes/line, min 16MB),
+        // or pass through directly if already specified in bytes.
+        let max_scrollback = if scrollback == 0 {
+            0
+        } else if scrollback < 1_000_000 {
+            (scrollback * 1024).max(16 * 1024 * 1024)
+        } else {
+            scrollback
+        };
+
         let mut term = Terminal::new(TerminalOptions {
             cols,
             rows,
-            max_scrollback: scrollback,
+            max_scrollback,
         })?;
 
         // A remote pane may be created disconnected (restore) — no child
@@ -258,7 +271,7 @@ impl TermPane {
             })?
             .on_clipboard_write(|_term, clip| {
                 for content in clip.contents() {
-                    if content.mime.contains("text") || content.mime == "application/x-uripboard" {
+                    if content.mime.contains("text") || content.mime == "application/x-uri-list" {
                         clipboard::write_text(content.data);
                         break;
                     }
@@ -313,6 +326,7 @@ impl TermPane {
             log_name,
             log,
             cursor_style: None,
+            kitty_textures: std::collections::HashMap::new(),
         })
         .map(|mut pane| {
             if spawn {
@@ -468,11 +482,12 @@ impl TermPane {
         self.pty = Some(pty);
         self.child = Some(child);
         if let Some(p) = self.pty.as_ref() {
-            let old = std::mem::replace(&mut *self.shared.effect_fd.lock().unwrap(), -1);
+            let new_fd = p.dup_raw().unwrap_or(-1);
+            let old = std::mem::replace(&mut *self.shared.effect_fd.lock().unwrap(), new_fd);
             if old >= 0 {
                 unsafe { nix::libc::close(old) };
             }
-            *self.shared.effect_fd.lock().unwrap() = p.dup_raw().unwrap_or(-1);
+            self.effect_fd = new_fd;
         }
         self.exited = None;
         self.last_exit_code = None;
@@ -584,6 +599,13 @@ impl TermPane {
             MouseEvKind::Release(btn) => {
                 if btn == mouse::Button::Left && self.selection.is_selecting(&self.term)? {
                     self.selection.on_release(&self.term, ev.x, ev.y, rect, cell, padding)?;
+                    let opts = FormatOptions::new().with_trim(true).with_unwrap(true);
+                    if let Ok(Some(bytes)) = self.term.format_selection_alloc(None, opts) {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        if !text.is_empty() {
+                            clipboard::write_primary_text(&text);
+                        }
+                    }
                     self.force_repaint = true;
                     return Ok(());
                 }
@@ -599,11 +621,12 @@ impl TermPane {
                 // gesture keeps left_click_count > 0 after release (for
                 // double-click timing), so gating on click_count alone makes
                 // any hover after a click extend the selection.
-                if moved
+                let in_autoscroll = ev.y < padding || ev.y > rect.h - padding;
+                if (moved || in_autoscroll)
                     && ev.button_down == Some(mouse::Button::Left)
                     && self.selection.is_selecting(&self.term)?
                 {
-                    self.selection.on_drag(
+                    let scrolled = self.selection.on_drag(
                         &mut self.term,
                         ev.x,
                         ev.y,
@@ -612,6 +635,10 @@ impl TermPane {
                         padding,
                         mods,
                     )?;
+                    if scrolled {
+                        self.scroll_active = true;
+                    }
+                    self.last_mouse = (ev.x, ev.y);
                     self.force_repaint = true;
                     return Ok(());
                 }
@@ -654,8 +681,20 @@ impl TermPane {
     }
 
     pub fn scroll_page(&mut self, pages: i32) {
-        let n = (self.rows as i32 * pages).max(1);
+        let delta = self.rows as i32 * pages;
+        let n = if pages < 0 {
+            delta.min(-1)
+        } else if pages > 0 {
+            delta.max(1)
+        } else {
+            0
+        };
         self.scroll(n);
+    }
+
+    pub fn scroll_half_page(&mut self, pages: i32) {
+        let half = (self.rows as i32 / 2).max(1);
+        self.scroll(half * pages);
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -672,10 +711,10 @@ impl TermPane {
 
     // ---- selection / clipboard ------------------------------------------
 
-    /// Copy the active selection, or the whole viewport if none.
+    /// Copy the active selection.
     pub fn copy_selection(&mut self) -> Result<bool> {
-        // Active selection (FormatOptions::new uses the terminal's current selection).
-        if let Some(bytes) = self.term.format_selection_alloc(None, FormatOptions::new())? {
+        let opts = FormatOptions::new().with_trim(true).with_unwrap(true);
+        if let Some(bytes) = self.term.format_selection_alloc(None, opts)? {
             let text = String::from_utf8_lossy(&bytes).into_owned();
             if !text.is_empty() {
                 self.term.set_selection(None)?;
@@ -683,26 +722,43 @@ impl TermPane {
                 return Ok(clipboard::write_text(&text));
             }
         }
-        // No selection: copy the visible screen.
-        if let Some(sel) = self.term.select_all()? {
-            let opts = FormatOptions::new().with_selection(&sel);
-            if let Some(bytes) = self.term.format_selection_alloc(None, opts)? {
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                return Ok(clipboard::write_text(&text));
-            }
-        }
         Ok(false)
     }
 
+    pub fn paste_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let is_bracketed = self.term.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
+        let mut data = text.as_bytes().to_vec();
+        let mut buf = vec![0u8; data.len() * 2 + 64];
+        match libghostty_vt::paste::encode(&mut data, is_bracketed, &mut buf) {
+            Ok(len) => {
+                self.write_input(&buf[..len]);
+            }
+            Err(libghostty_vt::error::Error::OutOfSpace { required }) => {
+                buf.resize(required, 0);
+                if let Ok(len) = libghostty_vt::paste::encode(&mut data, is_bracketed, &mut buf) {
+                    self.write_input(&buf[..len]);
+                } else {
+                    self.write_input(text.as_bytes());
+                }
+            }
+            Err(_) => {
+                self.write_input(text.as_bytes());
+            }
+        }
+    }
+
     pub fn paste_clipboard(&mut self) {
-        if let Some(text) = clipboard::read_text() {
-            self.write_input(text.as_bytes());
+        if let Some(text) = clipboard::read_text().or_else(clipboard::read_primary_text) {
+            self.paste_text(&text);
         }
     }
 
     pub fn paste_primary(&mut self) {
         if let Some(text) = clipboard::read_primary_text().or_else(clipboard::read_text) {
-            self.write_input(text.as_bytes());
+            self.paste_text(&text);
         }
     }
 
@@ -993,9 +1049,15 @@ impl TermPane {
 
         // Kitty graphics images
         if let Ok(graphics) = self.term.kitty_graphics() {
+            // Prune textures if cache grows beyond a reasonable size
+            if self.kitty_textures.len() > 64 {
+                self.kitty_textures.retain(|id, _| graphics.image(*id).is_some());
+            }
+
             Self::render_kitty_images(
                 &self.term,
                 &mut self.placement_it,
+                &mut self.kitty_textures,
                 &graphics,
                 Layer::BelowBg,
                 rect,
@@ -1005,6 +1067,7 @@ impl TermPane {
             Self::render_kitty_images(
                 &self.term,
                 &mut self.placement_it,
+                &mut self.kitty_textures,
                 &graphics,
                 Layer::BelowText,
                 rect,
@@ -1014,6 +1077,7 @@ impl TermPane {
             Self::render_kitty_images(
                 &self.term,
                 &mut self.placement_it,
+                &mut self.kitty_textures,
                 &graphics,
                 Layer::AboveText,
                 rect,
@@ -1072,6 +1136,7 @@ impl TermPane {
     fn render_kitty_images(
         term: &Terminal<'static, 'static>,
         placement_it: &mut PlacementIterator<'static>,
+        kitty_textures: &mut std::collections::HashMap<u32, (macroquad::prelude::Texture2D, u32, u32, usize)>,
         graphics: &Graphics<'_>,
         layer: Layer,
         rect: crate::layout::Rect,
@@ -1112,9 +1177,24 @@ impl TermPane {
             let x_offset = placement.x_offset()? as f32;
             let y_offset = placement.y_offset()? as f32;
 
-            let tex = Texture2D::from_rgba8(image_width as u16, image_height as u16, data);
+            let entry = match kitty_textures.get_mut(&image_id) {
+                Some(cached) if cached.1 == image_width && cached.2 == image_height && cached.3 == data.len() => {
+                    cached.0.clone()
+                }
+                Some(cached) => {
+                    let tex = Texture2D::from_rgba8(image_width as u16, image_height as u16, data);
+                    *cached = (tex.clone(), image_width, image_height, data.len());
+                    tex
+                }
+                None => {
+                    let tex = Texture2D::from_rgba8(image_width as u16, image_height as u16, data);
+                    kitty_textures.insert(image_id, (tex.clone(), image_width, image_height, data.len()));
+                    tex
+                }
+            };
+
             draw_texture_ex(
-                &tex,
+                &entry,
                 rect.x + padding + info.viewport_col as f32 * cell.w as f32 + x_offset,
                 rect.y + padding + info.viewport_row as f32 * cell.h as f32 + y_offset,
                 WHITE,
@@ -1150,21 +1230,30 @@ impl TermPane {
             if cur_row == row_idx {
                 let mut cell_it = self.cell_it.update(row).ok()?;
                 let mut row_text = String::with_capacity(128);
+                let mut char_to_col: Vec<u16> = Vec::with_capacity(128);
+                let mut col = 0u16;
                 let mut buf = String::with_capacity(8);
 
                 while let Some(c) = cell_it.next() {
                     let graphemes = c.graphemes_len().unwrap_or(0);
                     if graphemes == 0 {
                         row_text.push(' ');
+                        char_to_col.push(col);
                     } else {
                         buf.clear();
                         if c.graphemes_utf8(&mut buf).is_ok() {
                             buf.retain(|ch| !matches!(ch, '\u{FE00}'..='\u{FE0F}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'));
-                            row_text.push_str(if buf.is_empty() { " " } else { &buf });
+                            let s = if buf.is_empty() { " " } else { &buf };
+                            for ch in s.chars() {
+                                row_text.push(ch);
+                                char_to_col.push(col);
+                            }
                         } else {
                             row_text.push(' ');
+                            char_to_col.push(col);
                         }
                     }
+                    col += 1;
                 }
 
                 // Scan row_text for URLs or file paths
@@ -1182,9 +1271,10 @@ impl TermPane {
                         let is_path = clean.contains('/') || (clean.contains('.') && !clean.ends_with('.'));
 
                         if (is_url || is_path) && clean.len() >= 3 {
-                            let end_idx = token_start + clean.len();
-                            let start_col = token_start as u16;
-                            let end_col = end_idx as u16;
+                            let char_start = row_text[..token_start].chars().count();
+                            let char_end = row_text[..token_start + clean.len()].chars().count();
+                            let start_col = char_to_col.get(char_start).copied().unwrap_or(0);
+                            let end_col = char_to_col.get(char_end.saturating_sub(1)).map(|&c| c + 1).unwrap_or(col);
                             if col_idx >= start_col && col_idx < end_col {
                                 return Some((clean.to_string(), start_col, end_col));
                             }
@@ -1205,9 +1295,13 @@ impl TermPane {
 impl Drop for TermPane {
     fn drop(&mut self) {
         // Close the effect fd so no writes go to a dead pty.
-        unsafe {
-            nix::libc::close(self.effect_fd);
+        let old = std::mem::replace(&mut *self.shared.effect_fd.lock().unwrap(), -1);
+        if old >= 0 {
+            unsafe {
+                nix::libc::close(old);
+            }
         }
+        self.effect_fd = -1;
     }
 }
 
@@ -1259,6 +1353,7 @@ struct SelectionState<'alloc> {
     release_event: ReleaseEvent<'alloc>,
     drag_event: DragEvent<'alloc>,
     start_time: Instant,
+    last_autoscroll: Option<Instant>,
 }
 
 impl SelectionState<'_> {
@@ -1271,6 +1366,7 @@ impl SelectionState<'_> {
             release_event: ReleaseEvent::new()?,
             drag_event: DragEvent::new()?,
             start_time: Instant::now(),
+            last_autoscroll: None,
         })
     }
 
@@ -1282,8 +1378,10 @@ impl SelectionState<'_> {
     /// i.e. surface-space) to a viewport cell. Padding is the grid inset.
     fn point(&self, x: f32, y: f32, rect: Rect, cell: CellDims, padding: f32, cols: u16, rows: u16) -> Point {
         let _ = rect;
-        let px = ((x - padding) / cell.w as f32).clamp(0.0, cols as f32) as u16;
-        let py = ((y - padding) / cell.h as f32).clamp(0.0, rows as f32) as u32;
+        let max_col = cols.saturating_sub(1);
+        let max_row = rows.saturating_sub(1);
+        let px = ((x - padding) / cell.w as f32).clamp(0.0, max_col as f32) as u16;
+        let py = ((y - padding) / cell.h as f32).clamp(0.0, max_row as f32) as u32;
         Point::Viewport(PointCoordinate { x: px, y: py })
     }
 
@@ -1296,6 +1394,7 @@ impl SelectionState<'_> {
         cell: CellDims,
         padding: f32,
     ) -> Result<()> {
+        self.last_autoscroll = None;
         let point = self.point(x, y, rect, cell, padding, terminal.cols()?, terminal.rows()?);
         let grid_ref = terminal.grid_ref(point)?;
         let selection = self
@@ -1317,6 +1416,7 @@ impl SelectionState<'_> {
         cell: CellDims,
         padding: f32,
     ) -> Result<()> {
+        self.last_autoscroll = None;
         let point = self.point(x, y, rect, cell, padding, terminal.cols()?, terminal.rows()?);
         let grid_ref = terminal.grid_ref(point).ok();
         self.release_event.apply(&mut self.gesture, terminal, grid_ref)?;
@@ -1332,7 +1432,31 @@ impl SelectionState<'_> {
         cell: CellDims,
         padding: f32,
         mods: Mods,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let mut scrolled = false;
+        let top_boundary = padding;
+        let bottom_boundary = rect.h - padding;
+
+        if y < top_boundary {
+            if self.last_autoscroll.map_or(true, |t| t.elapsed() >= Duration::from_millis(35)) {
+                let dist = (top_boundary - y).max(0.0);
+                let lines = ((dist / cell.h as f32).ceil() as isize).clamp(1, 5);
+                terminal.scroll_viewport(ScrollViewport::Delta(-lines));
+                self.last_autoscroll = Some(Instant::now());
+                scrolled = true;
+            }
+        } else if y > bottom_boundary {
+            if self.last_autoscroll.map_or(true, |t| t.elapsed() >= Duration::from_millis(35)) {
+                let dist = (y - bottom_boundary).max(0.0);
+                let lines = ((dist / cell.h as f32).ceil() as isize).clamp(1, 5);
+                terminal.scroll_viewport(ScrollViewport::Delta(lines));
+                self.last_autoscroll = Some(Instant::now());
+                scrolled = true;
+            }
+        } else {
+            self.last_autoscroll = None;
+        }
+
         let point = self.point(x, y, rect, cell, padding, terminal.cols()?, terminal.rows()?);
         let grid_ref = terminal.grid_ref(point)?;
         let geometry = Geometry {
@@ -1349,7 +1473,7 @@ impl SelectionState<'_> {
             .set_position(x.into(), y.into())?
             .apply(&mut self.gesture, terminal, grid_ref, geometry)?;
         terminal.set_selection(selection.as_ref())?;
-        Ok(())
+        Ok(scrolled)
     }
 }
 
@@ -1538,5 +1662,139 @@ mod tests {
         assert!(file_hit.is_some());
         let (file, _, _) = file_hit.unwrap();
         assert_eq!(file, "src/main.rs:12:4");
+    }
+
+    #[test]
+    fn selection_drag_autoscrolls_viewport() {
+        let cell = CellDims { w: 10, h: 20, baseline: 15.0 };
+        let mut pane = TermPane::new(
+            40,
+            10,
+            cell,
+            None,
+            &[],
+            None,
+            100,
+            1024 * 1024,
+            false,
+            None,
+        )
+        .unwrap();
+
+        for i in 0..30 {
+            pane.term.vt_write(format!("line {}\r\n", i).as_bytes());
+        }
+
+        let rect = Rect { x: 0.0, y: 0.0, w: 400.0, h: 200.0 };
+        let padding = 5.0;
+
+        pane.handle_mouse(
+            rect,
+            cell,
+            padding,
+            MouseEv {
+                kind: MouseEvKind::Press(libghostty_vt::mouse::Button::Left),
+                x: 50.0,
+                y: 100.0,
+                any_pressed: true,
+                button_down: Some(libghostty_vt::mouse::Button::Left),
+            },
+            Mods::empty(),
+        )
+        .unwrap();
+
+        pane.handle_mouse(
+            rect,
+            cell,
+            padding,
+            MouseEv {
+                kind: MouseEvKind::Motion,
+                x: 50.0,
+                y: -30.0,
+                any_pressed: true,
+                button_down: Some(libghostty_vt::mouse::Button::Left),
+            },
+            Mods::empty(),
+        )
+        .unwrap();
+
+        assert!(pane.scroll_active, "drag above pane top should activate scroll/autoscroll");
+    }
+
+    #[test]
+    fn scroll_page_and_half_page_scroll_correct_direction() {
+        let cell = CellDims { w: 10, h: 26, baseline: 20.0 };
+        let mut pane = TermPane::new(
+            80,
+            24,
+            cell,
+            None,
+            &[],
+            None,
+            10_000,
+            1024 * 1024,
+            false,
+            None,
+        )
+        .unwrap();
+
+        // Populate with lines so scrollback exists
+        for i in 0..100 {
+            let line = format!("line {}\r\n", i);
+            let _ = pane.term.vt_write(line.as_bytes());
+        }
+
+        let sb_before = pane.term.scrollbar().unwrap();
+        // Viewport should be at the bottom initially
+        assert_eq!(sb_before.offset, sb_before.total - sb_before.len);
+
+        // Page up should scroll upward (offset decreases)
+        pane.scroll_page(-1);
+        let sb_after_page_up = pane.term.scrollbar().unwrap();
+        assert!(
+            sb_after_page_up.offset < sb_before.offset,
+            "page up must decrease scrollbar offset (scrolled upward)"
+        );
+
+        // Half page down should scroll downward (offset increases)
+        let offset_before_half = sb_after_page_up.offset;
+        pane.scroll_half_page(1);
+        let sb_after_half_down = pane.term.scrollbar().unwrap();
+        assert!(
+            sb_after_half_down.offset > offset_before_half,
+            "half page down must increase scrollbar offset (scrolled downward)"
+        );
+    }
+
+    #[test]
+    fn scrollback_line_count_converts_to_bytes_and_retains_history() {
+        let cell = CellDims { w: 10, h: 26, baseline: 20.0 };
+        // 10,000 lines should convert to at least 10MB byte budget
+        let mut pane = TermPane::new(
+            80,
+            24,
+            cell,
+            None,
+            &[],
+            None,
+            10_000,
+            32 * 1024 * 1024,
+            false,
+            None,
+        )
+        .unwrap();
+
+        // Write 2,000 lines (which previously exceeded the 10KB cap)
+        for i in 0..2000 {
+            let line = format!("line number {:04} with extra text payload\r\n", i);
+            let _ = pane.term.vt_write(line.as_bytes());
+        }
+
+        let sb = pane.term.scrollbar().unwrap();
+        assert!(
+            sb.total >= 2000,
+            "scrollbar total rows should retain all 2000 lines, got {}",
+            sb.total
+        );
     }
 }

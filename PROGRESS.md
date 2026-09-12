@@ -12,6 +12,40 @@ Binary name: `ghostwave`
 
 ## STATUS: main terminal features solid — render/mouse/keybinds fixed, parity work in progress
 
+### Audit fix pass — scrollback byte budget, kitty texture cache, search columns, pty reap, ghostd fd hygiene
+- **SCROLLBACK (BYTE BUDGET)**: libghostty-vt measures `max_scrollback` in
+  **bytes**, but `Config.scrollback` is a line count — history was silently
+  capped at a few KB. `TermPane::new` now converts lines → bytes
+  (`lines * 1024`, min 16 MB); values ≥ 1,000,000 are passed through as bytes.
+- **KITTY GRAPHICS TEXTURE CACHE**: decoded image textures are cached by
+  `image_id` (invalidated when width/height/data-len change, pruned past 64
+  entries) instead of re-uploading one `Texture2D` per image per frame.
+- **SEARCH COLUMN MAPPING**: matching is now char-based with a per-char column
+  map; the old code indexed a per-cell column table with a text offset, so
+  multibyte / multi-grapheme cells highlighted the wrong columns. Whole-word
+  now uses `is_alphanumeric() || '_'`.
+- **SCROLL DIRECTION**: `scroll_page` computed `rows * pages` with `.max(1)`,
+  which could flip/zero the direction; fixed, and `scroll_half_page` added —
+  `Ctrl+u` / `Ctrl+d` now scroll half a page instead of a full page.
+- **PTY REAP**: `poll_reap` only reaped `Child::Exited`; it now reaps `Active`
+  children too and stores the real `WaitStatus`.
+- **GHOSTD FD HYGIENE**: the `dup`'d pty write fd is now an `OwnedFd` (it was
+  never closed — one leaked fd per client attach) and `dup` failure is handled.
+- **APP**: new `Action::Backspace` edits the search query / rename buffer
+  (previously a `"backspace"` toast); `Mode::Locked` no longer swallows
+  pane-mode entry binds; overlay active-pane index clamped to
+  `panes.len() - 1`; visualizer frame time clamped to 1–100 ms and the wave
+  decay/speed made time-based.
+- **AI PANE**: `max_scroll` tracked so `scroll_lines` keeps its position when
+  pinned to the bottom (used to snap to 0); prompt no longer pushed twice into
+  the request history.
+- **CLIPBOARD MIME**: OSC clipboard read now recognizes
+  `application/x-uri-list` (typo'd `x-uripboard`); middle-click primary
+  selection no longer also overwrites the regular clipboard.
+- **TESTS**: 8 new — ai pane send/scroll, layout nested-split collapse, app
+  layout remap + locked-mode passthrough, pty reap exit code, term scroll
+  direction and scrollback byte conversion.
+
 ### 0.1.4 — Polish & Test Audit (test/test-audit-0.1.4)
 - **KITTY GRAPHICS SCISSOR & CLIPPING**:
   - Implemented `set_scissor` / `reset_scissor` in `src/main.rs` with `macroquad::window::screen_dpi_scale()` and OpenGL vertical axis inversion (`sh - (y + h)`), ensuring Kitty graphics and terminal contents clip to pane boundaries.

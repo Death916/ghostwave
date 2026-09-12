@@ -32,6 +32,8 @@ serde_json = "1"
 toml = "0.8"
 # AI assistant pane (blocking HTTP in a thread)
 ureq = "2.10"
+# Native cross-platform clipboard (Wayland + X11 in-process)
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 [profile.dev]
 opt-level = 1

@@ -2,20 +2,20 @@
 //! chat completions endpoint. Requests run on a worker thread so the UI
 //! never blocks; responses arrive over a channel.
 
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
 
 use macroquad::prelude::*;
 
 use crate::config::AiConfig;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Role {
     User,
     Assistant,
     System,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Msg {
     pub role: Role,
     pub text: String,
@@ -27,6 +27,7 @@ pub struct AiPane {
     pub input: String,
     pub busy: bool,
     pub scroll: usize,
+    pub max_scroll: usize,
     pub error: Option<String>,
     rx: Option<Receiver<Result<String, String>>>,
     config: AiConfig,
@@ -39,6 +40,7 @@ impl AiPane {
             input: String::new(),
             busy: false,
             scroll: 0,
+            max_scroll: 0,
             error: None,
             rx: None,
             config,
@@ -59,7 +61,7 @@ impl AiPane {
         self.rx = Some(rx);
 
         let config = self.config.clone();
-        let mut history: Vec<(String, String)> = self
+        let history: Vec<(String, String)> = self
             .msgs
             .iter()
             .map(|m| {
@@ -71,7 +73,6 @@ impl AiPane {
                 (role.to_string(), m.text.clone())
             })
             .collect();
-        history.push(("user".into(), prompt));
 
         std::thread::spawn(move || {
             let result = request_chat(&config, &history);
@@ -154,10 +155,12 @@ impl AiPane {
 
         let total_lines = wrapped.len();
         let visible_lines = (content_h / line_h) as usize;
+        let max_scroll = total_lines.saturating_sub(visible_lines);
+        self.max_scroll = max_scroll;
         let scroll = if self.scroll == usize::MAX {
-            total_lines.saturating_sub(visible_lines)
+            max_scroll
         } else {
-            self.scroll.min(total_lines.saturating_sub(visible_lines))
+            self.scroll.min(max_scroll)
         };
 
         let mut y = rect.y + header_h;
@@ -200,10 +203,17 @@ impl AiPane {
     }
 
     pub fn scroll_lines(&mut self, delta: i32) {
-        if self.scroll == usize::MAX {
-            self.scroll = 0;
-        }
-        self.scroll = (self.scroll as i32 + delta).max(0) as usize;
+        let base = if self.scroll == usize::MAX {
+            self.max_scroll
+        } else {
+            self.scroll
+        };
+        let new_scroll = (base as i32 + delta).max(0) as usize;
+        self.scroll = if new_scroll >= self.max_scroll {
+            usize::MAX
+        } else {
+            new_scroll
+        };
     }
 }
 
@@ -240,3 +250,44 @@ fn request_chat(config: &AiConfig, history: &[(String, String)]) -> Result<Strin
         .ok_or_else(|| format!("AI: unexpected response shape: {}", &text[..text.len().min(200)]))?;
     Ok(content.trim().to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_pane_send_does_not_duplicate_prompt() {
+        let config = AiConfig {
+            base_url: "http://localhost".into(),
+            model: "test".into(),
+            api_key_env: "TEST_KEY".into(),
+            system_prompt: "sys".into(),
+        };
+        let mut pane = AiPane::new(config);
+        pane.input = "hello world".into();
+        pane.send();
+
+        // msgs should only have 1 system message and 1 user message
+        assert_eq!(pane.msgs.len(), 2);
+        assert_eq!(pane.msgs[0].role, Role::System);
+        assert_eq!(pane.msgs[1].role, Role::User);
+        assert_eq!(pane.msgs[1].text, "hello world");
+    }
+
+    #[test]
+    fn ai_pane_scroll_lines_preserves_position_from_bottom() {
+        let config = AiConfig::default();
+        let mut pane = AiPane::new(config);
+        pane.max_scroll = 50;
+        pane.scroll = usize::MAX; // At bottom
+
+        // Scrolling up by 3 lines should be at max_scroll - 3 = 47, NOT 0
+        pane.scroll_lines(-3);
+        assert_eq!(pane.scroll, 47);
+
+        // Scrolling back down by 3 lines should re-pin to usize::MAX
+        pane.scroll_lines(3);
+        assert_eq!(pane.scroll, usize::MAX);
+    }
+}
+
