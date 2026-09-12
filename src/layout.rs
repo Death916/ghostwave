@@ -221,15 +221,13 @@ pub fn close_at(root: &mut Node, path: &[u8]) -> Option<usize> {
     };
 
     if removed.is_some() {
-        // Collapse the parent split if the surviving child is leaf-like.
+        // Collapse the parent split with the surviving child.
         let parent = root.at_mut(parent_path);
         if let Node::Split { a, b, .. } = parent {
             let survivor = if side == 0 { b } else { a };
-            if survivor.is_leaf_like() {
-                let replacement =
-                    std::mem::replace(survivor, Box::new(Node::Leaf { pane: usize::MAX }));
-                *parent = *replacement;
-            }
+            let replacement =
+                std::mem::replace(survivor, Box::new(Node::Leaf { pane: usize::MAX }));
+            *parent = *replacement;
         }
     }
     removed
@@ -699,4 +697,35 @@ mod tests {
         assert!(layout(&root, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }).is_empty());
         assert!(path_to_pane(&root, usize::MAX).is_none());
     }
+
+    #[test]
+    fn close_at_nested_split_collapses_parent() {
+        // Split(Leaf(0), Split(Leaf(1), Leaf(2)))
+        let mut root = Node::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            a: Box::new(leaf(0)),
+            b: Box::new(Node::Split {
+                dir: SplitDir::Vertical,
+                ratio: 0.5,
+                a: Box::new(leaf(1)),
+                b: Box::new(leaf(2)),
+            }),
+        };
+
+        // Close pane 0 (path [0])
+        let removed = close_at(&mut root, &[0]);
+        assert_eq!(removed, Some(0));
+
+        // Root should have collapsed to the surviving Split(Leaf(1), Leaf(2))
+        match root {
+            Node::Split { dir, a, b, .. } => {
+                assert_eq!(dir, SplitDir::Vertical);
+                assert!(matches!(*a, Node::Leaf { pane: 1 }));
+                assert!(matches!(*b, Node::Leaf { pane: 2 }));
+            }
+            _ => panic!("root should have collapsed into the surviving split"),
+        }
+    }
 }
+

@@ -105,53 +105,70 @@ impl SearchState {
         if self.query.is_empty() {
             return Ok(());
         }
-        let q = if self.case_sensitive {
-            self.query.clone()
-        } else {
-            self.query.to_lowercase()
-        };
+        let q_chars: Vec<char> = self.query.chars().collect();
+        if q_chars.is_empty() {
+            return Ok(());
+        }
 
         let mut row_idx: u32 = 0;
-        let mut text = String::with_capacity(64);
+        let mut cell_text = String::with_capacity(16);
         let mut cell_it = libghostty_vt::render::CellIterator::new()?;
 
         while let Some(row) = row_it.next() {
             let mut col = 0u16;
-            text.clear();
-            let mut cols_of: Vec<(u16, u16)> = Vec::new(); // (start_col, end_col) per char
+            let mut chars: Vec<(char, u16)> = Vec::with_capacity(128);
             let mut it = cell_it.update(row)?;
             while let Some(cell) = it.next() {
-                let start = text.len();
-                cell.graphemes_utf8(&mut text)?;
-                let end = text.len();
-                if end > start {
-                    cols_of.push((col, col + 1));
+                cell_text.clear();
+                cell.graphemes_utf8(&mut cell_text)?;
+                for c in cell_text.chars() {
+                    chars.push((c, col));
                 }
                 col += 1;
             }
 
-            let hay = if self.case_sensitive {
-                text.clone()
-            } else {
-                text.to_lowercase()
-            };
-            let mut from = 0usize;
-            while let Some(rel) = hay[from..].find(&q) {
-                let abs = from + rel;
-                let end_abs = abs + q.len();
-                if !self.whole_word || is_word_boundary(&text, abs, end_abs) {
-                    let start_col = cols_of.get(abs).map(|(s, _)| *s).unwrap_or(0);
-                    let end_col = cols_of
-                        .get(end_abs.saturating_sub(1))
-                        .map(|(_, e)| *e)
-                        .unwrap_or(col);
-                    self.matches.push(Match {
-                        row: row_idx,
-                        col_start: start_col,
-                        col_end: end_col.max(start_col + 1),
-                    });
+            if chars.len() >= q_chars.len() {
+                let mut i = 0;
+                while i + q_chars.len() <= chars.len() {
+                    let matches = chars[i..i + q_chars.len()]
+                        .iter()
+                        .zip(&q_chars)
+                        .all(|(&(c, _), &qc)| {
+                            if self.case_sensitive {
+                                c == qc
+                            } else {
+                                c == qc || c.to_lowercase().eq(qc.to_lowercase())
+                            }
+                        });
+
+                    if matches {
+                        let is_word = if self.whole_word {
+                            let before = if i > 0 { Some(chars[i - 1].0) } else { None };
+                            let after = if i + q_chars.len() < chars.len() {
+                                Some(chars[i + q_chars.len()].0)
+                            } else {
+                                None
+                            };
+                            let word = |c: Option<char>| c.map_or(false, |ch| ch.is_alphanumeric() || ch == '_');
+                            !word(before) && !word(after)
+                        } else {
+                            true
+                        };
+
+                        if is_word {
+                            let start_col = chars[i].1;
+                            let end_col = chars[i + q_chars.len() - 1].1 + 1;
+                            self.matches.push(Match {
+                                row: row_idx,
+                                col_start: start_col,
+                                col_end: end_col.max(start_col + 1),
+                            });
+                            i += q_chars.len();
+                            continue;
+                        }
+                    }
+                    i += 1;
                 }
-                from = end_abs.max(abs + 1);
             }
             row_idx += 1;
         }

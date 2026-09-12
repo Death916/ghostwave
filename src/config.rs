@@ -10,7 +10,7 @@ pub struct Config {
     pub font_size: f32,
     /// Built-in theme name, see theme.rs
     pub theme: String,
-    /// Terminal scrollback lines per pane.
+    /// Terminal scrollback lines per pane (or bytes if >= 1,000,000).
     pub scrollback: usize,
     /// Shell to spawn (defaults to $SHELL).
     pub shell: Option<String>,

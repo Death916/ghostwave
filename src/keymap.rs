@@ -141,6 +141,7 @@ pub enum Action {
     ToggleSyncPanes,
     ToggleScratchpad,
     Ghostwave,
+    Backspace,
     Toast(&'static str),
 }
 
@@ -319,7 +320,7 @@ pub fn handle(mode: Mode, kp: &KeyPress) -> Dispatch {
             return Dispatch::Action(Action::ConfirmRename);
         }
         if kp.key == Key::Backspace {
-            return Dispatch::Action(Action::Toast("backspace"));
+            return Dispatch::Action(Action::Backspace);
         }
         if let Some(c) = kp.text {
             return Dispatch::Char(c);
@@ -336,7 +337,7 @@ pub fn handle(mode: Mode, kp: &KeyPress) -> Dispatch {
             return Dispatch::Action(Action::ConfirmSearch);
         }
         if kp.key == Key::Backspace {
-            return Dispatch::Action(Action::Toast("backspace"));
+            return Dispatch::Action(Action::Backspace);
         }
         if let Some(c) = kp.text {
             return Dispatch::Char(c);
@@ -762,7 +763,7 @@ mod tests {
         assert!(matches!(handle(Mode::RenameTab, &kp_char(Key::A, no_mod(), 'a')), Dispatch::Char('a')));
         assert!(matches!(handle(Mode::RenameTab, &kp(Key::Enter, no_mod())), Dispatch::Action(Action::ConfirmRename)));
         assert!(matches!(handle(Mode::RenameTab, &kp(Key::Escape, no_mod())), Dispatch::Action(Action::ExitMode)));
-        assert!(matches!(handle(Mode::RenameTab, &kp(Key::Backspace, no_mod())), Dispatch::Action(Action::Toast(_))));
+        assert!(matches!(handle(Mode::RenameTab, &kp(Key::Backspace, no_mod())), Dispatch::Action(Action::Backspace)));
         // non-char, non-special is Ignore
         assert!(matches!(handle(Mode::RenameTab, &kp(Key::F1, no_mod())), Dispatch::Ignore));
     }
@@ -772,6 +773,7 @@ mod tests {
         assert!(matches!(handle(Mode::EnterSearch, &kp_char(Key::A, no_mod(), 'x')), Dispatch::Char('x')));
         assert!(matches!(handle(Mode::EnterSearch, &kp(Key::Enter, no_mod())), Dispatch::Action(Action::ConfirmSearch)));
         assert!(matches!(handle(Mode::EnterSearch, &kp(Key::Escape, no_mod())), Dispatch::Action(Action::ExitMode)));
+        assert!(matches!(handle(Mode::EnterSearch, &kp(Key::Backspace, no_mod())), Dispatch::Action(Action::Backspace)));
     }
 
     #[test]

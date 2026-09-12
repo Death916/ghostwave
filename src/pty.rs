@@ -219,22 +219,36 @@ impl Child {
         }
     }
 
-    /// WNOHANG reap; transitions Exited -> Reaped. Returns the child's exit
+    /// WNOHANG reap; transitions Active/Exited -> Reaped. Returns the child's exit
     /// code (128+signal for signal deaths) once it has actually exited.
     /// Call each frame.
     pub fn poll_reap(&mut self) -> Option<i32> {
-        if let Child::Exited(pid) = *self {
-            if let Ok(wp) = wait::waitpid(pid, Some(wait::WaitPidFlag::WNOHANG)) {
-                let code = match wp {
-                    wait::WaitStatus::Exited(_, c) => Some(c),
-                    wait::WaitStatus::Signaled(_, sig, _) => Some(128 + sig as i32),
-                    _ => None,
-                };
-                *self = Child::Reaped(wp);
-                return code;
+        let pid = match *self {
+            Child::Active(pid) | Child::Exited(pid) => pid,
+            Child::Reaped(_) => return None,
+        };
+
+        match wait::waitpid(pid, Some(wait::WaitPidFlag::WNOHANG)) {
+            Ok(wait::WaitStatus::Exited(_, c)) => {
+                *self = Child::Reaped(wait::WaitStatus::Exited(pid, c));
+                Some(c)
             }
+            Ok(wait::WaitStatus::Signaled(_, sig, _)) => {
+                let code = 128 + sig as i32;
+                *self = Child::Reaped(wait::WaitStatus::Signaled(pid, sig, false));
+                Some(code)
+            }
+            Ok(wait::WaitStatus::StillAlive) => None,
+            Ok(wp) => {
+                *self = Child::Reaped(wp);
+                None
+            }
+            Err(Errno::ECHILD) => {
+                *self = Child::Reaped(wait::WaitStatus::Exited(pid, 0));
+                None
+            }
+            Err(_) => None,
         }
-        None
     }
 }
 
@@ -257,4 +271,43 @@ impl Drop for Child {
 pub enum PtyError {
     EndOfStream,
     OtherError(nix::errno::Errno),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_poll_reap_captures_exit_code() {
+        let size = WinSize {
+            cols: 80,
+            rows: 24,
+            xpixel: 800,
+            ypixel: 600,
+        };
+        let (pty, mut child) = Pty::new(size, Some("/bin/sh"), &["-c", "exit 42"], None)
+            .expect("spawn shell should succeed");
+
+        let rx = pty.spawn_reader().expect("reader thread should spawn");
+        // Drain until EOF
+        while let Ok(msg) = rx.recv() {
+            if matches!(msg, PtyMsg::Eof) {
+                break;
+            }
+        }
+
+        // Poll reap until code is Some(42)
+        let start = std::time::Instant::now();
+        let mut exit_code = None;
+        while start.elapsed() < std::time::Duration::from_secs(3) {
+            if let Some(code) = child.poll_reap() {
+                exit_code = Some(code);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(exit_code, Some(42), "poll_reap should return exit code 42");
+        assert!(matches!(child, Child::Reaped(_)), "child should transition to Reaped");
+    }
 }

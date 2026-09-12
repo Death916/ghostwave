@@ -486,12 +486,12 @@ impl App {
             }
             Action::HalfPageUp => {
                 if let Some(t) = self.active_term_mut() {
-                    t.scroll_page(-1);
+                    t.scroll_half_page(-1);
                 }
             }
             Action::HalfPageDown => {
                 if let Some(t) = self.active_term_mut() {
-                    t.scroll_page(1);
+                    t.scroll_half_page(1);
                 }
             }
             Action::ScrollToBottom => {
@@ -638,6 +638,21 @@ impl App {
             }
             Action::ToggleScratchpad => self.toggle_scratchpad(),
             Action::Ghostwave => self.open_visualizer(),
+            Action::Backspace => match self.mode {
+                Mode::EnterSearch => {
+                    if let Some(t) = self.active_term_mut() {
+                        let mut q = t.search.query.clone();
+                        q.pop();
+                        t.search.set_query(q);
+                    }
+                    self.repaint_all();
+                }
+                Mode::RenameTab | Mode::RenamePane | Mode::RenameSession => {
+                    self.rename_buf.pop();
+                    self.repaint_all();
+                }
+                _ => {}
+            },
             Action::Toast(msg) => self.toast(msg),
             Action::ExitMode => {
                 self.mode = Mode::Normal;
@@ -1847,7 +1862,7 @@ impl App {
             },
             Node::Stack { panes, active } => Node::Stack {
                 panes: panes.iter().map(|p| *map.get(p).unwrap_or(&0)).collect(),
-                active: *map.get(active).unwrap_or(&0),
+                active: (*active).min(panes.len().saturating_sub(1)),
             },
         }
     }
@@ -2325,10 +2340,12 @@ impl App {
             return;
         }
 
-        // Mode entry binds.
-        if let Some(new_mode) = keymap::entry_bind(k, m) {
-            self.mode = if self.mode == new_mode { Mode::Normal } else { new_mode };
-            return;
+        // Mode entry binds (skipped in Locked mode so passthrough works).
+        if self.mode != Mode::Locked {
+            if let Some(new_mode) = keymap::entry_bind(k, m) {
+                self.mode = if self.mode == new_mode { Mode::Normal } else { new_mode };
+                return;
+            }
         }
 
         match keymap::handle(self.mode, &kp) {
@@ -2881,18 +2898,22 @@ impl App {
             self.pty_activity |= drain_tab_panes(&mut live.tabs);
         }
 
+        // Elapsed time clamped to avoid large jumps across pauses / window minimizes
+        let dt = macroquad::time::get_frame_time().clamp(0.001, 0.1);
+
         // Living reactive sine-wave animation update:
         if self.config.visual_wave {
             if self.pty_activity {
                 self.wave_energy = (self.wave_energy + 0.12).min(2.5);
             }
-            self.wave_energy = (self.wave_energy * 0.94).max(0.1);
+            let decay = (-3.713 * dt).exp();
+            self.wave_energy = (self.wave_energy * decay).max(0.1);
             let speed_mult = if self.wave_energy > 0.15 {
                 1.0 + self.wave_energy * 1.5
             } else {
                 0.35
             };
-            self.wave_phase += 0.04 * self.config.wave_speed * speed_mult;
+            self.wave_phase += 2.4 * dt * self.config.wave_speed * speed_mult;
             if self.wave_phase > std::f32::consts::TAU * 100.0 {
                 self.wave_phase -= std::f32::consts::TAU * 100.0;
             }
@@ -2902,7 +2923,7 @@ impl App {
         for tab in &mut self.tabs {
             for pane in &mut tab.panes {
                 if let Pane::Visual(v) = pane {
-                    v.update(0.016);
+                    v.update(dt);
                 }
             }
         }
@@ -3181,4 +3202,53 @@ fn upload_ghostd(host: &str) -> bool {
         }
     }
     child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::Node;
+    use std::collections::HashMap;
+
+    #[test]
+    fn remap_layout_preserves_stack_active_index() {
+        let stack = Node::Stack {
+            panes: vec![10, 20],
+            active: 1, // active points to panes[1] == 20
+        };
+        let mut map = HashMap::new();
+        // Suppose old pane 10 -> new pane 0, and old pane 20 -> new pane 1.
+        // Also map 1 -> 99 to simulate the bug if active (1) were looked up as a pane ID.
+        map.insert(10, 0);
+        map.insert(20, 1);
+        map.insert(1, 99);
+
+        let remapped = App::remap_layout(&stack, &map);
+        match remapped {
+            Node::Stack { panes, active } => {
+                assert_eq!(panes, vec![0, 1]);
+                assert_eq!(active, 1, "active index should remain 1 and not be remapped as a pane ID");
+                assert_eq!(panes[active], 1);
+            }
+            _ => panic!("expected Node::Stack"),
+        }
+    }
+
+    #[test]
+    fn locked_mode_prevents_mode_entry_binds() {
+        use libghostty_vt::key::{Key, Mods};
+        let kp = crate::keymap::KeyPress {
+            key: Key::P,
+            mods: Mods::CTRL,
+            text: None,
+        };
+        // Verify entry_bind matches Pane
+        assert_eq!(crate::keymap::entry_bind(kp.key, kp.mods), Some(Mode::Pane));
+
+        // When locked, keymap::handle produces Pass instead of Pane mode action
+        assert!(matches!(
+            crate::keymap::handle(Mode::Locked, &kp),
+            crate::keymap::Dispatch::Pass
+        ));
+    }
 }
