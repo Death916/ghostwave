@@ -709,32 +709,31 @@ async fn main() -> Result<()> {
             std::process::exit(0);
         }
 
-        // Frame pacing:
-        // - PTY flood (app.pty_activity) → no sleep at all, maximum throughput.
-        // - Input / mouse / animations / toasts / visual panes → 120 FPS (~8.33ms).
-        // - Nothing has changed for a second → 8 FPS (~125ms).
-        //
-        // The idle tier matters far more than it looks: macroquad/miniquad has no
-        // way to skip a present, and the EGL backbuffer is not retained on Wayland
-        // (no buffer age), so every iteration redraws the whole window. An idle
-        // app therefore costs (fps x full-window redraw) of GPU time plus a
-        // full-screen recomposite in the compositor for every presented frame.
-        // Measured on this box with the app idle: 30 FPS = 14-30% of the GPU
-        // engine (scaling with window area) and 50-63% system gpu_busy vs 1-3%
-        // with the process stopped. Cutting idle presents 30 -> 8 FPS removes
-        // ~3.7x of both, and the cost is only that the first keystroke after
-        // idling waits up to one idle frame.
-        const ACTIVE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(8_333);
+        // Frame pacing. Every iteration presents a full-window redraw (macroquad
+        // has no way to skip a present and the EGL backbuffer is not retained on
+        // Wayland), so the loop rate IS the GPU cost — our redraw plus one
+        // full-screen compositor recomposite per presented frame. Measured on
+        // this box: 30 FPS idle was 14-30% of the GPU engine, 8 FPS idle is 1-2%.
+        // - PTY output in flight (streaming pane, typed echo) → 120 FPS ceiling.
+        //   This used to be uncapped (no sleep at all while output drained), which
+        //   is what made typing expensive: a keystroke's echo drove hundreds of
+        //   full-window presents per second.
+        // - Input / mouse / animation / toast / visual pane → 60 FPS.
+        // - Nothing changed for a second → 8 FPS.
+        const OUTPUT_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(8_333);
+        const ACTIVE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(16_667);
         const IDLE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(125_000);
         const ACTIVE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1_000);
-        let target_frame_time = if last_activity.elapsed() < ACTIVE_WINDOW {
+        let target_frame_time = if app.pty_activity {
+            OUTPUT_FRAME_TIME
+        } else if last_activity.elapsed() < ACTIVE_WINDOW {
             ACTIVE_FRAME_TIME
         } else {
             IDLE_FRAME_TIME
         };
 
         let elapsed = frame_start.elapsed();
-        if !app.pty_activity && elapsed < target_frame_time {
+        if elapsed < target_frame_time {
             std::thread::sleep(target_frame_time - elapsed);
         }
 

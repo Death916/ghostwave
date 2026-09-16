@@ -48,6 +48,27 @@ earlier, so the pacing commit IS in the running binary):
   rendering, blitted once per presented frame — removes per-frame glyph/FFI cost
   rather than the present rate, so it complements this tier instead of replacing it.
 
+### Idle GPU, part 3 (same branch) — output ceiling + 60 FPS active tier
+- **Idle tier VERIFIED on the user's own instance**: idle GPU 1-2% (was 50-63%
+  system `gpu_busy_percent`, 14-30% app engine time at the same window).
+- **Typing was still ~15%**: a keystroke's echo arrived as pty output, and the
+  output path was UNCAPPED (no sleep at all while data drained), so a one-cell
+  change drove hundreds of full-window presents per second.
+- **Change**: `OUTPUT_FRAME_TIME` 8.333ms (120 FPS ceiling while output drains,
+  was uncapped), `ACTIVE_FRAME_TIME` 16.667ms (60 FPS, was 120), idle unchanged
+  at 125ms. The pacing now always sleeps to its target — the special-cased
+  "no sleep during pty activity" branch is gone.
+- **NOT verified by the agent: the flood number.** The 1.43s
+  `time seq 1 2000000` result was measured with the uncapped output path; with a
+  120 FPS ceiling the drain rate is now loop-rate bound. If the re-run regresses,
+  revert ONLY the output ceiling and keep the 60 FPS tier.
+- Agent-side attempts to automate that benchmark (fixture session in /tmp/gwbench
+  with a pane running `seq 1 2000000; echo MARKER-DONE`) proved unreliable: the
+  app's async pane-log flush is cut short when the last pane exits (marker never
+  lands in the log), and launching replicas needs the project shell's
+  `LD_LIBRARY_PATH` or miniquad panics with "Wayland backend failed". Left to the
+  user's own in-terminal test.
+
 ### Audit fix pass — scrollback byte budget, kitty texture cache, search columns, pty reap, ghostd fd hygiene
 - **SCROLLBACK (BYTE BUDGET)**: libghostty-vt measures `max_scrollback` in
   **bytes**, but `Config.scrollback` is a line count — history was silently
