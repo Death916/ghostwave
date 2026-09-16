@@ -709,20 +709,31 @@ async fn main() -> Result<()> {
             std::process::exit(0);
         }
 
-        // Frame pacing:
-        // During PTY flood activity (app.pty_activity == true), sleep is 0 for maximum throughput.
-        // During user interaction or active animations, pace at 120 FPS (~8.33ms).
-        // When idle (no input/pty/animations), throttle down to 30 FPS (~33.33ms) to save GPU/CPU.
-        const ACTIVE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(8_333);
-        const IDLE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(33_333);
-        let target_frame_time = if last_activity.elapsed() < std::time::Duration::from_millis(500) {
+        // Frame pacing. Every iteration presents a full-window redraw (macroquad
+        // has no way to skip a present and the EGL backbuffer is not retained on
+        // Wayland), so the loop rate IS the GPU cost — our redraw plus one
+        // full-screen compositor recomposite per presented frame. Measured on
+        // this box: 30 FPS idle was 14-30% of the GPU engine, 8 FPS idle is 1-2%.
+        // - PTY output in flight (streaming pane, typed echo) → 120 FPS ceiling.
+        //   This used to be uncapped (no sleep at all while output drained), which
+        //   is what made typing expensive: a keystroke's echo drove hundreds of
+        //   full-window presents per second.
+        // - Input / mouse / animation / toast / visual pane → 60 FPS.
+        // - Nothing changed for a second → 8 FPS.
+        const OUTPUT_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(8_333);
+        const ACTIVE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(16_667);
+        const IDLE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(125_000);
+        const ACTIVE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1_000);
+        let target_frame_time = if app.pty_activity {
+            OUTPUT_FRAME_TIME
+        } else if last_activity.elapsed() < ACTIVE_WINDOW {
             ACTIVE_FRAME_TIME
         } else {
             IDLE_FRAME_TIME
         };
 
         let elapsed = frame_start.elapsed();
-        if !app.pty_activity && elapsed < target_frame_time {
+        if elapsed < target_frame_time {
             std::thread::sleep(target_frame_time - elapsed);
         }
 

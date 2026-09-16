@@ -12,6 +12,63 @@ Binary name: `ghostwave`
 
 ## STATUS: main terminal features solid — render/mouse/keybinds fixed, parity work in progress
 
+### Idle GPU, part 2 (branch `perf/idle-gpu-2`) — idle frame tier 30 → 8 FPS
+User: "gpu usage is pretty high even when idle still" after the earlier adaptive
+pacing fix (6b26de4). Re-measured from scratch on the live instance (started a day
+earlier, so the pacing commit IS in the running binary):
+- **Pacing works** — replicas built from the real session state (isolated
+  `XDG_DATA_HOME`, so the user's sessions were never touched) presented 27-30
+  frames/s idle (counted wayland `sendmsg` under strace); the live app matched a
+  30 FPS replica on `/proc/PID/io` wchar (1447 vs 1442 B/s ⇒ same present rate).
+  Not stuck at 120 FPS, not flood mode, not a visualizer pane (screenshot: 3 text
+  panes), not content density (the live screen had FEWER painted pixels than a
+  replica replaying its own logs).
+- **What it costs**: app's own DRM engine time 14% at 1133x1382 and 30% at
+  2280x1382 (scales with window AREA ⇒ full-window redraw bound); system
+  `gpu_busy_percent` 50-63% idle vs 1-3% with the process SIGSTOPed.
+- **Root cause**: macroquad/miniquad cannot skip a present, and the EGL backbuffer
+  is not retained on Wayland (no buffer age), so the whole window is redrawn every
+  iteration. Idle cost = fps x full redraw, plus a full-screen compositor
+  recomposite for every presented frame. Ghostty (vendored source: `Surface.zig`
+  renderer_thread + mailbox/wakeup) draws only when something changed → 0 idle
+  presents; we can't match that without a swap-skipping path in miniquad.
+- **FIX**: idle tier in the `main()` pacing — 120 FPS while active (1s window),
+  8 FPS (125ms) once nothing has changed; the pty-flood no-sleep path is
+  unchanged. Measured on the same 3-pane fixture/window: presents 27-30/s → 8/s
+  (wayland `sendmsg` count under strace), app engine time 3-4% → <0.5%, CPU
+  17% → 6%; system `gpu_busy_percent` with a second 8 FPS client running
+  alongside the long-running instance: ~40% → 22-30% (the compositor share is the
+  bigger half). Cost: the first keystroke after idling can wait up to one idle
+  frame (125ms).
+  NOTE: an earlier probe of the live app's rate via `/proc/PID/io` wchar was
+  invalid — that stream is dominated by the 2-second session-JSON save
+  (~1.4 KB/s), so it did not measure frames. The controlled replicas are the
+  only trustworthy rate numbers.
+- **DEFERRED (phase 2)**: app-owned offscreen `render_target` + dirty-row
+  rendering, blitted once per presented frame — removes per-frame glyph/FFI cost
+  rather than the present rate, so it complements this tier instead of replacing it.
+
+### Idle GPU, part 3 (same branch) — output ceiling + 60 FPS active tier
+- **Idle tier VERIFIED on the user's own instance**: idle GPU 1-2% (was 50-63%
+  system `gpu_busy_percent`, 14-30% app engine time at the same window).
+- **Typing was still ~15%**: a keystroke's echo arrived as pty output, and the
+  output path was UNCAPPED (no sleep at all while data drained), so a one-cell
+  change drove hundreds of full-window presents per second.
+- **Change**: `OUTPUT_FRAME_TIME` 8.333ms (120 FPS ceiling while output drains,
+  was uncapped), `ACTIVE_FRAME_TIME` 16.667ms (60 FPS, was 120), idle unchanged
+  at 125ms. The pacing now always sleeps to its target — the special-cased
+  "no sleep during pty activity" branch is gone.
+- **NOT verified by the agent: the flood number.** The 1.43s
+  `time seq 1 2000000` result was measured with the uncapped output path; with a
+  120 FPS ceiling the drain rate is now loop-rate bound. If the re-run regresses,
+  revert ONLY the output ceiling and keep the 60 FPS tier.
+- Agent-side attempts to automate that benchmark (fixture session in /tmp/gwbench
+  with a pane running `seq 1 2000000; echo MARKER-DONE`) proved unreliable: the
+  app's async pane-log flush is cut short when the last pane exits (marker never
+  lands in the log), and launching replicas needs the project shell's
+  `LD_LIBRARY_PATH` or miniquad panics with "Wayland backend failed". Left to the
+  user's own in-terminal test.
+
 ### Audit fix pass — scrollback byte budget, kitty texture cache, search columns, pty reap, ghostd fd hygiene
 - **SCROLLBACK (BYTE BUDGET)**: libghostty-vt measures `max_scrollback` in
   **bytes**, but `Config.scrollback` is a line count — history was silently
