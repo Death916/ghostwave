@@ -710,12 +710,24 @@ async fn main() -> Result<()> {
         }
 
         // Frame pacing:
-        // During PTY flood activity (app.pty_activity == true), sleep is 0 for maximum throughput.
-        // During user interaction or active animations, pace at 120 FPS (~8.33ms).
-        // When idle (no input/pty/animations), throttle down to 30 FPS (~33.33ms) to save GPU/CPU.
+        // - PTY flood (app.pty_activity) → no sleep at all, maximum throughput.
+        // - Input / mouse / animations / toasts / visual panes → 120 FPS (~8.33ms).
+        // - Nothing has changed for a second → 8 FPS (~125ms).
+        //
+        // The idle tier matters far more than it looks: macroquad/miniquad has no
+        // way to skip a present, and the EGL backbuffer is not retained on Wayland
+        // (no buffer age), so every iteration redraws the whole window. An idle
+        // app therefore costs (fps x full-window redraw) of GPU time plus a
+        // full-screen recomposite in the compositor for every presented frame.
+        // Measured on this box with the app idle: 30 FPS = 14-30% of the GPU
+        // engine (scaling with window area) and 50-63% system gpu_busy vs 1-3%
+        // with the process stopped. Cutting idle presents 30 -> 8 FPS removes
+        // ~3.7x of both, and the cost is only that the first keystroke after
+        // idling waits up to one idle frame.
         const ACTIVE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(8_333);
-        const IDLE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(33_333);
-        let target_frame_time = if last_activity.elapsed() < std::time::Duration::from_millis(500) {
+        const IDLE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(125_000);
+        const ACTIVE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1_000);
+        let target_frame_time = if last_activity.elapsed() < ACTIVE_WINDOW {
             ACTIVE_FRAME_TIME
         } else {
             IDLE_FRAME_TIME
