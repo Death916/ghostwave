@@ -759,14 +759,28 @@ their actions with "not implemented yet" toasts. This is the plan for connecting
 
 ### Slice order (each slice ends with tests green)
 
-1. Parent seams: `Message` variants (`Palette`, `Search`, `Ai { id, msg }`, `Preview { id, action }`),
-   `AppState` fields (`scratchpad`, `palette: Option<..>`, `search: Option<..>`), `input.rs` routing
-   for `OpenCommandBar` / `OpenSearch` / `ToggleScratchpad`, and the overlay layers in `view`.
-2. Content panes: the `PaneEntry`/`ContentPane` refactor, cell rendering in `panes_grid`, and the
-   palette/keymap entry points (`NewAi`, the visualizer, `Ctrl+Click` → preview).
-3. Selection: the core range accessor, highlight painting in `pane_canvas`, copy on the existing
-   action, and `selection.rs` resolved (deleted or reduced).
-4. Chrome widgets swap, floats polish, then the parity table walk in a real window.
+1. **Parent seams — landed** (`267b0a5`): `Message::{Palette, Search}`, the three `AppState` fields,
+   `input.rs` routing for `OpenCommandBar` / `OpenSearch` / `Search*` / `ToggleScratchpad`, overlay
+   layers in `view`, and overlay key routing that swallows keys while an overlay is open (KeyUp
+   gated the same way). 104 tests. Gaps are listed in `PROGRESS.md`: no scroll-to-match, the
+   palette's `text_input` is never focused, `SearchToggleWrap` is cosmetic, floats are state-only.
+2. **Content panes**: the `PaneEntry`/`ContentPane` refactor, cell rendering in `panes_grid`, the
+   three entry points, and key routing to a focused content pane.
+3. **Selection — smaller than planned**: no core change is needed (decision 2). What is left is
+   painting the highlight in `pane_canvas` from `RowIteration::selection()` once per row, and
+   deleting the redundant `selection.rs`. Copy already works (`Ctrl+Shift+C` → `Action::Copy` →
+   `copy_selection()`).
+4. **Chrome widgets swap** (the last M5b item), floats actually painted, then the parity table walk.
+
+### Pending real-window verification
+
+Things no test can decide, to walk in one sitting once the build is free:
+
+- the palette's 0.65-alpha backdrop over the grid, and whether the chrome's text pass survives it;
+- typing into the palette, and `Enter` submitting the highlighted entry;
+- the search overlay's appearance and its query reaching the pane's own match state;
+- the F12 scratchpad toggling state that nothing paints yet (it should be invisible, not broken);
+- after slice 2: a content cell rendering in the grid, its title bar, and closing it.
 
 ## 20. M5b, M5c & M6 modules: what was added (2026-09-17)
 
