@@ -100,9 +100,6 @@ pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
             Some(bytes) => bytes,
             None => continue,
         };
-        // The same file can appear under several fc-list paths, and a
-        // byte-identical face costs ~30 MiB per duplicate collection while
-        // adding nothing.
         if out.iter().any(|(_, seen): &(String, Vec<u8>)| seen == &bytes) {
             continue;
         }
@@ -137,7 +134,7 @@ fn score_family(family: &str) -> i32 {
         return -1000;
     }
     if f.starts_with("jetbrainsmono nerd font mono") {
-        110 // same design as primary + nerd glyphs: identical metrics
+        110
     } else if has("jetbrainsmono") && has("nerd") && has("mono") {
         105
     } else if has("dejavu sans mono") {
@@ -230,14 +227,13 @@ fn parse_fc_list(text: &str) -> Vec<(String, String)> {
         };
         let path = path.trim();
         let rest = rest.split_once(":style=").map(|(f, _)| f).unwrap_or(rest);
-        // A line may also carry a bare `": <style>"` suffix.
         let family = rest.split(':').next().unwrap_or("").trim();
         let family = normalise_family(family.split(',').next().unwrap_or(""));
         if path.is_empty() || family.is_empty() {
             continue;
         }
         if !seen.insert(path.to_string()) {
-            continue; // fc-list repeats a file once per style
+            continue;
         }
         out.push((path.to_string(), family));
     }

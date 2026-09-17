@@ -295,7 +295,6 @@ impl<Message> canvas::Program<Message> for WaveProgram {
         let envelope = |progress: f32| (progress * std::f32::consts::PI).sin();
         let x_at = |progress: f32| progress * wave_w;
 
-        // Harmonic 1 (primary ribbon)
         let h1_alpha0 = 0.20 + 0.50 * (self.params.energy / 2.0).min(1.0);
         let mut prev = {
             let x = x_at(0.0);
@@ -331,7 +330,6 @@ impl<Message> canvas::Program<Message> for WaveProgram {
             prev = next;
         }
 
-        // Harmonic 2 (counter-phase glow)
         let h2_alpha0 = 0.12 + 0.30 * (self.params.energy / 2.0).min(1.0);
         let amp_h2 = max_amp * 0.65;
         let mut prev = {

@@ -13,7 +13,7 @@ use ghostwave::layout::SplitDir;
 use iced::{Point, Rectangle, Size};
 
 use crate::app::{AppState, GridPane};
-use crate::pane::{Pane, PaneId, SharedPane};
+use crate::pane::{Pane, PaneEntry, PaneId, SharedPane};
 
 /// Default width ratio for scratchpad overlay (80% of window width).
 pub const DEFAULT_SCRATCHPAD_WIDTH_RATIO: f32 = 0.80;
@@ -274,8 +274,8 @@ impl ScratchpadState {
         }
         let mut max_w: f32 = 0.0;
         let mut max_h: f32 = 0.0;
-        for pane in app.current().panes.iter().flatten() {
-            if let Ok(guard) = pane.lock() {
+        for handle in app.current().term_handles() {
+            if let Ok(guard) = handle.lock() {
                 if let Some(b) = guard.last_bounds {
                     max_w = max_w.max(b.x + b.width);
                     max_h = max_h.max(b.y + b.height);
@@ -355,7 +355,7 @@ impl ScratchpadState {
                 let shared: SharedPane = Arc::new(Mutex::new(pane));
                 let tab = &mut app.tabs[app.active_tab];
                 let idx = tab.panes.len();
-                tab.panes.push(Some(shared));
+                tab.panes.push(Some(PaneEntry::Term(shared)));
                 tab.active = idx;
                 self.scratchpad_pane = Some(id);
                 self.to_float(id, rect, None);
@@ -629,7 +629,6 @@ mod tests {
         state.to_float(pane, rect, None);
         state.scratchpad_pane = Some(pane);
 
-        // Initially hidden flag corresponds to closed state
         let opened = state.toggle_state();
         assert!(opened);
         assert!(state.is_open());
@@ -650,7 +649,6 @@ mod tests {
     fn test_floating_rect_clamping_within_window_bounds() {
         let win = Size::new(800.0, 600.0);
 
-        // Negative offsets clamped to 0
         let neg_rect = Rectangle {
             x: -120.0,
             y: -50.0,
@@ -663,7 +661,6 @@ mod tests {
         assert_eq!(clamped_neg.width, 300.0);
         assert_eq!(clamped_neg.height, 200.0);
 
-        // Positive overflow clamped to window bounds
         let overflow_rect = Rectangle {
             x: 700.0,
             y: 500.0,
@@ -676,7 +673,6 @@ mod tests {
         assert_eq!(clamped_overflow.width, 300.0);
         assert_eq!(clamped_overflow.height, 200.0);
 
-        // Dimensions below minimum limits
         let small_rect = Rectangle {
             x: 100.0,
             y: 100.0,
@@ -687,7 +683,6 @@ mod tests {
         assert!(clamped_small.width >= MIN_FLOAT_WIDTH);
         assert!(clamped_small.height >= MIN_FLOAT_HEIGHT);
 
-        // Content area clamping respecting tab and status bars
         let content_rect = Rectangle {
             x: 0.0,
             y: 0.0,
@@ -717,25 +712,20 @@ mod tests {
         assert!(!state.find_float(p1).unwrap().hidden);
         assert!(!state.find_float(p2).unwrap().hidden);
 
-        // Toggle hide p1
         assert_eq!(state.toggle_hide(p1), Some(true));
         assert!(state.find_float(p1).unwrap().hidden);
         assert!(!state.find_float(p2).unwrap().hidden);
 
-        // Toggle hide p1 back
         assert_eq!(state.toggle_hide(p1), Some(false));
         assert!(!state.find_float(p1).unwrap().hidden);
 
-        // Hide p1 and cycle floats to reveal it
         state.toggle_hide(p1);
         assert!(state.find_float(p1).unwrap().hidden);
 
         let focused = state.cycle_floats();
         assert!(focused.is_some());
-        // Both floats are now revealed or active
         assert!(!state.find_float(p1).unwrap().hidden || !state.find_float(p2).unwrap().hidden);
 
-        // Direct reveal
         state.toggle_hide(p1);
         assert!(state.find_float(p1).unwrap().hidden);
         assert!(state.reveal(p1));
@@ -752,7 +742,6 @@ mod tests {
             height: 300.0,
         };
 
-        // Root origin tracking
         let p1 = PaneId(101);
         state.to_float(p1, rect, Some(FloatOrigin::Root));
         assert!(state.is_floating(p1));
@@ -760,7 +749,6 @@ mod tests {
         assert!(matches!(origin1, Some(FloatOrigin::Root)));
         assert!(!state.is_floating(p1));
 
-        // Split origin tracking
         let p2 = PaneId(102);
         let split_origin = FloatOrigin::Split {
             parent: vec![0, 1],
@@ -774,7 +762,6 @@ mod tests {
         assert!(float_origins_eq(&origin2.unwrap(), &split_origin));
         assert!(!state.is_floating(p2));
 
-        // Stack origin tracking
         let p3 = PaneId(103);
         let stack_origin = FloatOrigin::Stack {
             path: vec![1, 0, 1],
@@ -784,7 +771,6 @@ mod tests {
         assert!(origin3.is_some());
         assert!(float_origins_eq(&origin3.unwrap(), &stack_origin));
 
-        // Embedding unknown pane returns None
         assert!(state.embed(PaneId(999)).is_none());
     }
 
@@ -855,13 +841,11 @@ mod tests {
         assert_eq!(f.rect.x, 150.0);
         assert_eq!(f.rect.y, 130.0);
 
-        // Move past bounds
         state.move_float(pane, 2000.0, 2000.0, win);
         let f = state.find_float(pane).unwrap();
         assert_eq!(f.rect.x, 700.0);
         assert_eq!(f.rect.y, 600.0);
 
-        // Resize float
         state.resize_float(pane, 50.0, 50.0, win);
         let f = state.find_float(pane).unwrap();
         assert!(f.rect.width <= win.width);

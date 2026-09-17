@@ -29,11 +29,6 @@ pub fn keypress(
 
     let key_code = code_to_key(code)?;
 
-    // The platform's text wins, but only when it is exactly one printable
-    // character; a control character (Ctrl+C hands over `\u{3}`) or a composed
-    // sequence is dropped rather than truncated, and the encoder reconstructs
-    // the intended sequence from the key + mods. Only when iced reported no
-    // text at all do we fall back to the logical character of the key.
     let text = match text {
         Some(text) => single_printable_char(text),
         None => logical_char(key),
@@ -211,7 +206,6 @@ fn code_to_key(code: C) -> Option<Key> {
         C::KeyX => Key::X,
         C::KeyY => Key::Y,
         C::KeyZ => Key::Z,
-        // Modifier-only keys: tracked through `Mods`, never sent as key events.
         C::AltLeft
         | C::AltRight
         | C::ControlLeft
@@ -242,7 +236,6 @@ fn code_to_key(code: C) -> Option<Key> {
         | C::NumpadHash
         | C::NumpadStar => return None,
 
-        // `Code` is `#[non_exhaustive]`: a code a future iced adds lands here.
         _ => return None,
     })
 }

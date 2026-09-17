@@ -734,19 +734,16 @@ mod tests {
         assert_eq!(s.query, "error");
         assert_eq!(s.match_index, 0);
 
-        // Setting a match index then changing the query resets it
         s.total_matches = 10;
         s.match_index = 4;
         s.set_query("warn");
         assert_eq!(s.query, "warn");
         assert_eq!(s.match_index, 0);
 
-        // Setting identical query does NOT reset match_index
         s.match_index = 2;
         s.set_query("warn");
         assert_eq!(s.match_index, 2);
 
-        // Updating via message
         s.update(SearchMessage::QueryChanged("info".to_string()));
         assert_eq!(s.query, "info");
         assert_eq!(s.match_index, 0);
@@ -766,7 +763,6 @@ mod tests {
         s.update(SearchMessage::ToggleRegex);
         assert!(s.regex);
 
-        // Also test case_sensitive toggle
         assert!(!s.case_sensitive);
         s.toggle_case_sensitive();
         assert!(s.case_sensitive);
@@ -794,7 +790,6 @@ mod tests {
         s.match_index = 14;
         assert_eq!(s.match_count_label(), "15/15");
 
-        // Out of bounds match_index clamped cleanly
         s.match_index = 20;
         assert_eq!(s.match_count_label(), "15/15");
 
@@ -805,20 +800,17 @@ mod tests {
     #[test]
     fn navigation_logic() {
         let mut s = SearchState::new();
-        // Navigation with 0 matches is a no-op and does not panic
         s.next_match();
         assert_eq!(s.match_index, 0);
         s.prev_match();
         assert_eq!(s.match_index, 0);
 
-        // Navigation with 1 match stays on 0
         s.total_matches = 1;
         s.next_match();
         assert_eq!(s.match_index, 0);
         s.prev_match();
         assert_eq!(s.match_index, 0);
 
-        // Navigation with 3 matches (0, 1, 2)
         s.total_matches = 3;
         s.match_index = 0;
 
@@ -836,7 +828,6 @@ mod tests {
         s.prev_match();
         assert_eq!(s.match_index, 0);
 
-        // Test navigation via messages
         s.update(SearchMessage::NextMatch);
         assert_eq!(s.match_index, 1);
         s.update(SearchMessage::PrevMatch);
@@ -854,14 +845,12 @@ mod tests {
             case_sensitive: true,
         };
 
-        // Sync to term
         overlay_state.sync_to_term_search(&mut term_search);
         assert!(term_search.active);
         assert_eq!(term_search.query, "fn main");
         assert!(term_search.case_sensitive);
         assert!(term_search.dirty);
 
-        // Simulate terminal discovering 2 matches
         term_search.matches = vec![
             Match {
                 row: 10,
@@ -876,13 +865,11 @@ mod tests {
         ];
         term_search.current = 1;
 
-        // Sync from term
         overlay_state.sync_from_term_search(&term_search);
         assert_eq!(overlay_state.total_matches, 2);
         assert_eq!(overlay_state.match_index, 1);
         assert_eq!(overlay_state.match_count_label(), "2/2");
 
-        // Clear closes search
         overlay_state.clear();
         overlay_state.sync_to_term_search(&mut term_search);
         assert!(!term_search.active);
@@ -891,49 +878,41 @@ mod tests {
 
     #[test]
     fn keyboard_shortcut_routing() {
-        // Esc -> Close
         assert_eq!(
             handle_key(&Key::Named(Named::Escape), Modifiers::default()),
             Some(SearchMessage::Close)
         );
 
-        // Enter -> Next
         assert_eq!(
             handle_key(&Key::Named(Named::Enter), Modifiers::default()),
             Some(SearchMessage::NextMatch)
         );
 
-        // Shift+Enter -> Prev
         assert_eq!(
             handle_key(&Key::Named(Named::Enter), Modifiers::SHIFT),
             Some(SearchMessage::PrevMatch)
         );
 
-        // ArrowDown -> Next
         assert_eq!(
             handle_key(&Key::Named(Named::ArrowDown), Modifiers::default()),
             Some(SearchMessage::NextMatch)
         );
 
-        // ArrowUp -> Prev
         assert_eq!(
             handle_key(&Key::Named(Named::ArrowUp), Modifiers::default()),
             Some(SearchMessage::PrevMatch)
         );
 
-        // Alt+c -> ToggleCaseSensitive
         assert_eq!(
             handle_key(&Key::Character("c".into()), Modifiers::ALT),
             Some(SearchMessage::ToggleCaseSensitive)
         );
 
-        // Ctrl+r -> ToggleRegex
         assert_eq!(
             handle_key(&Key::Character("r".into()), Modifiers::CTRL),
             Some(SearchMessage::ToggleRegex)
         );
 
-        // Unrelated key -> None
         assert_eq!(
             handle_key(&Key::Named(Named::Space), Modifiers::default()),
             None

@@ -105,7 +105,6 @@ pub fn paint(
     let (w, h) = (window.width, window.height);
     let sh = STATUS_BAR_H;
 
-    // Painted back to front, so the toast ends up topmost.
     paint_tab_bar(frame, w, font, theme, state);
 
     let geom = StatusGeom::new(state);
@@ -140,7 +139,6 @@ fn paint_tab_bar(
             rgb(chip),
         );
 
-        // A blank name falls back to `Tab {i + 1}`.
         let content = if label.is_empty() {
             format!("Tab {}", i + 1)
         } else {
@@ -205,7 +203,6 @@ fn paint_status_bar(
 
     frame.fill_rectangle(Point::new(0.0, top), Size::new(w, sh), rgb(theme.status_bg));
 
-    // Mode label: text is `" {MODE} "`, spaces both sides.
     frame.fill_rectangle(
         Point::new(0.0, top),
         Size::new(geom.mode_w, sh),
@@ -229,7 +226,6 @@ fn paint_status_bar(
         font,
     );
 
-    // Theme name, right-aligned: the caller passes the string to display.
     draw_text(
         frame,
         format!(" {} ", state.theme_name),
@@ -239,7 +235,6 @@ fn paint_status_bar(
         font,
     );
 
-    // Sync chip, drawn only when the active tab syncs its panes; no border.
     if geom.sync {
         let sx = w - geom.theme_w - geom.sync_w - 4.0;
         frame.fill_rectangle(
@@ -280,20 +275,14 @@ fn paint_wave(
     }
 
     let wave_w = end_x - start_x;
-    // The status bar's vertical centre.
     let center_y = h - sh / 2.0;
     let max_amp = (sh * 0.35 * wave.amplitude).clamp(2.0, 10.0);
-    // `dt` walks the samples from `start_x` to `end_x` inclusive.
     let num_points = (wave_w / WAVE_STEP).max(10.0) as usize;
     let dt = 1.0 / num_points as f32;
 
-    // 0 at both ends, 1 in the middle. It scales the alpha as well as the
-    // offset, so each segment carries its own alpha and is stroked as its own
-    // short path.
     let envelope = |progress: f32| (progress * std::f32::consts::PI).sin();
     let x_at = |progress: f32| start_x + progress * wave_w;
 
-    // H1 — primary ribbon.
     let h1_alpha0 = 0.20 + 0.50 * (wave.energy / 2.0).min(1.0);
     let mut prev = {
         let x = x_at(0.0);
@@ -328,7 +317,6 @@ fn paint_wave(
         prev = next;
     }
 
-    // H2 — counter-phase glow.
     let h2_alpha0 = 0.12 + 0.30 * (wave.energy / 2.0).min(1.0);
     let amp_h2 = max_amp * 0.65;
     let mut prev = {
@@ -381,7 +369,6 @@ fn stroke_segment(frame: &mut Frame, from: Point, to: Point, width: f32, color: 
 fn paint_toast(frame: &mut Frame, h: f32, sh: f32, font: Font, theme: &GhostTheme, msg: &str) {
     let label = format!(" {msg} ");
     let lw = text_width(&label, STATUS_PX) + TOAST_PAD;
-    // The text baseline sits a fixed 12 px above the status bar.
     let box_y = h - sh - TOAST_H - TOAST_BOTTOM_GAP;
 
     frame.fill_rectangle(
@@ -424,8 +411,6 @@ pub fn paint_rename_prompt(
         Size::new(lw, RENAME_H),
         rgb(theme.palette_bg),
     );
-    // `stroke_rectangle` centres the stroke on the boundary, so the 1 px lines
-    // reach half a pixel past each corner.
     frame.stroke_rectangle(
         Point::new(bx, box_y),
         Size::new(lw, RENAME_H),
@@ -454,8 +439,6 @@ fn draw_text(frame: &mut Frame, content: String, pos: Point, px: f32, color: Col
         font,
         align_x: alignment::Horizontal::Left.into(),
         align_y: alignment::Vertical::Top,
-        // Advanced, not Basic: Basic disables font fallback, which would tofu
-        // any glyph the primary face lacks.
         shaping: text::Shaping::Advanced,
         ..CanvasText::default()
     });

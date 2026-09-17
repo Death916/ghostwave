@@ -38,7 +38,6 @@ pub fn stream(slot: &TickSlot) -> Pin<Box<dyn Stream<Item = Message> + Send>> {
         .spawn(move || loop {
             std::thread::sleep(period);
             if tx.unbounded_send(Message::Tick).is_err() {
-                // Subscription dropped: stop.
                 return;
             }
         });

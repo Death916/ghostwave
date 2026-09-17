@@ -17,7 +17,7 @@ use ghostwave::theme::{self, Theme};
 use iced::Size;
 use iced::widget::pane_grid::{self, Axis, Split};
 
-use crate::pane::{Pane, PaneId, SharedPane};
+use crate::pane::{ContentPane, Pane, PaneEntry, PaneId, SharedPane};
 use crate::panes_grid;
 
 /// Ratios a resize keeps a split within, the same limits the canvas pane layer
@@ -76,7 +76,7 @@ impl GridPane {
 pub struct Tab {
     pub name: String,
     /// Index = pane index. `None` = closed (tombstone, index never reused).
-    pub panes: Vec<Option<SharedPane>>,
+    pub panes: Vec<Option<PaneEntry>>,
     /// The tab's layout: one cell per pane or stack.
     pub grid: pane_grid::State<GridPane>,
     /// Index into `panes` of the focused pane, which the grid holds.
@@ -86,11 +86,11 @@ pub struct Tab {
 }
 
 impl Tab {
-    fn new(name: String, id: PaneId, pane: SharedPane) -> Self {
+    fn new(name: String, entry: PaneEntry) -> Self {
         Self {
             name,
-            panes: vec![Some(pane)],
-            grid: pane_grid::State::new(GridPane::single(id)).0,
+            grid: pane_grid::State::new(GridPane::single(entry.id())).0,
+            panes: vec![Some(entry)],
             active: 0,
             sync_panes: false,
         }
@@ -112,30 +112,63 @@ impl Tab {
         generated
     }
 
-    pub fn pane(&self, id: usize) -> Option<&SharedPane> {
-        self.panes.get(id).and_then(|p| p.as_ref())
+    /// The pane at `index`, whatever kind it is.
+    pub fn entry(&self, index: usize) -> Option<&PaneEntry> {
+        self.panes.get(index)?.as_ref()
     }
 
-    /// The handle of the pane with identity `id`, wherever the grid holds it.
+    /// The pane at `index`, whatever kind it is.
+    pub fn entry_mut(&mut self, index: usize) -> Option<&mut PaneEntry> {
+        self.panes.get_mut(index)?.as_mut()
+    }
+
+    /// The content pane at `index`; `None` for a terminal or a tombstone.
+    pub fn content(&self, index: usize) -> Option<&ContentPane> {
+        self.entry(index)?.content()
+    }
+
+    /// The content pane at `index`; `None` for a terminal or a tombstone.
+    pub fn content_mut(&mut self, index: usize) -> Option<&mut ContentPane> {
+        self.entry_mut(index)?.content_mut()
+    }
+
+    /// The terminal at `index` — the accessor every terminal-only path reads.
+    /// `None` for a content pane, which has no pty and no VT.
+    pub fn pane(&self, id: usize) -> Option<&SharedPane> {
+        self.entry(id)?.term()
+    }
+
+    /// Every live terminal in the tab, in index order; content panes are not in
+    /// it.
+    pub fn term_handles(&self) -> Vec<SharedPane> {
+        self.panes
+            .iter()
+            .flatten()
+            .filter_map(PaneEntry::term)
+            .cloned()
+            .collect()
+    }
+
+    /// The handle of the terminal with identity `id`, wherever the grid holds it.
     pub fn shared(&self, id: PaneId) -> Option<SharedPane> {
         self.panes
             .iter()
             .flatten()
-            .find(|pane| pane.lock().unwrap().id == id)
+            .find(|entry| entry.id() == id)
+            .and_then(PaneEntry::term)
             .cloned()
     }
 
     /// The index (into `panes`) of the pane with identity `id`.
     pub fn index_of(&self, id: PaneId) -> Option<usize> {
-        self.panes.iter().position(|pane| {
-            pane.as_ref()
-                .is_some_and(|pane| pane.lock().unwrap().id == id)
-        })
+        self.panes
+            .iter()
+            .position(|entry| entry.as_ref().is_some_and(|entry| entry.id() == id))
     }
 
     /// The grid cell holding the pane at `index`.
     pub fn handle(&self, index: usize) -> Option<pane_grid::Pane> {
-        let id = self.panes.get(index)?.as_ref()?.lock().unwrap().id;
+        let id = self.entry(index)?.id();
         self.grid
             .iter()
             .find(|(_, cell)| cell.contains(id))
@@ -165,40 +198,38 @@ impl Tab {
     }
 
     /// Appends a pane and focuses it; its index is the position it takes.
-    fn push_pane(&mut self, pane: SharedPane) -> usize {
+    fn push_entry(&mut self, entry: PaneEntry) -> usize {
         let index = self.panes.len();
-        self.panes.push(Some(pane));
+        self.panes.push(Some(entry));
         self.active = index;
         index
     }
 
     /// Makes a pane the tab's only cell, for a tab left without a live one.
-    fn repopulate(&mut self, id: PaneId, pane: SharedPane) -> usize {
+    fn repopulate(&mut self, id: PaneId, entry: PaneEntry) -> usize {
         self.grid = pane_grid::State::new(GridPane::single(id)).0;
-        self.push_pane(pane)
+        self.push_entry(entry)
     }
 
     /// Adds a pane beside the focused one, in its own cell, and focuses it.
     ///
     /// The new cell takes the `b` side of the split, which is the side the
     /// direction names: right of a horizontal split, below a vertical one.
-    fn add_split(&mut self, dir: SplitDir, id: PaneId, pane: SharedPane) -> usize {
+    fn add_split(&mut self, dir: SplitDir, id: PaneId, entry: PaneEntry) -> usize {
         let Some(target) = self.focused() else {
-            return self.repopulate(id, pane);
+            return self.repopulate(id, entry);
         };
         let split = self
             .grid
             .split(panes_grid::axis(dir), target, GridPane::single(id));
         if split.is_none() {
-            // The focused cell is no longer in the layout: the tab starts over
-            // with the new pane alone, as an empty one does.
-            return self.repopulate(id, pane);
+            return self.repopulate(id, entry);
         }
-        self.push_pane(pane)
+        self.push_entry(entry)
     }
 
     /// Adds a pane to the focused cell's stack and focuses it.
-    fn add_stacked(&mut self, id: PaneId, pane: SharedPane) -> usize {
+    fn add_stacked(&mut self, id: PaneId, pane: PaneEntry) -> usize {
         let Some(target) = self.focused() else {
             return self.repopulate(id, pane);
         };
@@ -207,7 +238,7 @@ impl Tab {
         };
         cell.panes.push(id);
         cell.active = cell.panes.len() - 1;
-        self.push_pane(pane)
+        self.push_entry(pane)
     }
 
     /// Drops the focused pane from its cell's stack, if it is in one.
@@ -258,7 +289,7 @@ impl Tab {
     /// A tab whose only cell is closed here keeps that cell without a pane, the
     /// same way the layout crate's tree keeps its empty sentinel: the tab stays
     /// until something is split into it.
-    fn take_focused(&mut self) -> Option<(PaneId, SharedPane)> {
+    fn take_focused(&mut self) -> Option<(PaneId, PaneEntry)> {
         if let Some((gone, next)) = self.pop_focused_stack() {
             if let Some(id) = next {
                 self.focus_id(id);
@@ -371,8 +402,8 @@ impl AppState {
             last_tick: std::time::Instant::now(),
             window,
         };
-        let (id, pane) = state.spawn_pane()?;
-        state.tabs.push(Tab::new("Tab 1".to_string(), id, pane));
+        let (_, pane) = state.spawn_pane()?;
+        state.tabs.push(Tab::new("Tab 1".to_string(), PaneEntry::Term(pane)));
         state.relayout();
 
         if let Ok(count) = std::env::var("GHOST_ICED_PANES").map(|v| v.parse::<usize>().unwrap_or(1))
@@ -395,11 +426,13 @@ impl AppState {
     }
 
     /// Refreshes dynamic process and directory titles across all panes in all tabs.
+    ///
+    /// Terminals only: a content pane has no process and no working directory.
     pub fn refresh_titles(&mut self) {
         if self.config.dynamic_title != crate::config::DynamicTitleMode::Off {
             for tab in &self.tabs {
-                for pane_opt in &tab.panes {
-                    if let Some(pane) = pane_opt {
+                for entry in tab.panes.iter().flatten() {
+                    if let Some(pane) = entry.term() {
                         pane.lock().unwrap().update_title(
                             self.config.dynamic_title,
                             self.config.pane_title_format,
@@ -447,7 +480,6 @@ impl AppState {
             self.wave_energy = (self.wave_energy + 0.12).min(2.5);
             self.pty_activity = false;
         }
-        // Decay, floored at 0.1: the wave never stops while visual_wave is on.
         self.wave_energy = (self.wave_energy * (-3.713_f32 * dt).exp()).max(0.1);
 
         let speed_mult = if self.wave_energy > 0.15 {
@@ -462,23 +494,28 @@ impl AppState {
         }
 
         if let Some((_, at)) = &self.toast {
-            // Toast lifetime: 2.5 s.
             if at.elapsed().as_secs_f32() >= 2.5 {
                 self.toast = None;
             }
         }
 
+        self.tick_content(dt);
         self.refresh_titles();
     }
 
-    /// `Fast` while a toast or an energized wave is on screen, `Slow` for an idle
-    /// wave or dynamic title polling, otherwise `Off`.
+    /// `Fast` while a toast, an energized wave or a live visualizer is on
+    /// screen, `Slow` for an idle wave, dynamic title polling or an AI reply in
+    /// flight, otherwise `Off`.
     pub fn tick_rate(&self) -> TickRate {
         if self.toast.is_some() || (self.config.visual_wave && self.wave_energy > 0.15) {
             TickRate::Fast
+        } else if self.has_visualizer() {
+            TickRate::Fast
         } else if self.config.visual_wave {
             TickRate::Slow
-        } else if self.config.dynamic_title != crate::config::DynamicTitleMode::Off {
+        } else if self.config.dynamic_title != crate::config::DynamicTitleMode::Off
+            || self.ai_pending()
+        {
             TickRate::Slow
         } else {
             TickRate::Off
@@ -498,12 +535,14 @@ impl AppState {
         }
     }
 
-    /// Sizes every pane's terminal from its recorded bounds; a no-op when unchanged.
+    /// Sizes every terminal from its recorded bounds; a no-op when unchanged.
+    ///
+    /// A content pane has no VT grid and is not resized.
     pub fn relayout(&mut self) {
         let cell = self.cell;
         let pad = self.config.padding;
-        for pane in self.current().panes.iter().flatten() {
-            let mut guard = pane.lock().unwrap();
+        for handle in self.current().term_handles() {
+            let mut guard = handle.lock().unwrap();
             if let Some(bounds) = guard.last_bounds {
                 let (cols, rows) =
                     panes_grid::bounds_to_cols_rows(bounds.width, bounds.height, cell, pad);
@@ -535,22 +574,94 @@ impl AppState {
             }
             pane_grid::DragEvent::Canceled { .. } => {}
             pane_grid::DragEvent::Dropped { pane, target } => {
-                // The cell's payload is what moves, so the drop re-arranges cells
-                // in the grid; a payload's panes keep their identity throughout.
                 self.tabs[tab_idx].grid.drop(pane, target);
                 self.relayout();
             }
         }
     }
 
+    /// The focused pane's terminal; `None` when the focused pane is a content
+    /// pane. Every terminal-only action reads this.
     pub fn active_pane(&self) -> Option<SharedPane> {
         let tab = self.current();
         tab.pane(tab.active).cloned()
     }
 
+    /// The focused pane, whatever kind it is.
+    pub fn focused_entry(&self) -> Option<&PaneEntry> {
+        let tab = self.current();
+        tab.entry(tab.active)
+    }
+
+    /// The focused pane, whatever kind it is.
+    pub fn focused_entry_mut(&mut self) -> Option<&mut PaneEntry> {
+        let tab = &mut self.tabs[self.active_tab];
+        tab.entry_mut(tab.active)
+    }
+
+    /// The content pane with identity `id`, wherever it currently lives.
+    pub fn content_by_id(&self, id: PaneId) -> Option<&ContentPane> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .flatten()
+            .find(|entry| entry.id() == id)
+            .and_then(PaneEntry::content)
+    }
+
+    /// The content pane with identity `id`, wherever it currently lives.
+    pub fn content_by_id_mut(&mut self, id: PaneId) -> Option<&mut ContentPane> {
+        self.tabs
+            .iter_mut()
+            .flat_map(|tab| tab.panes.iter_mut())
+            .flatten()
+            .find(|entry| entry.id() == id)
+            .and_then(PaneEntry::content_mut)
+    }
+
+    /// Whether any live content pane is an AI chat with a request in flight,
+    /// whose reply the tick has to drain.
+    pub fn ai_pending(&self) -> bool {
+        self.content_panes()
+            .any(|content| content.as_ai().is_some_and(|ai| ai.busy))
+    }
+
+    /// Whether a visualizer pane is live, which animates and so needs frames.
+    pub fn has_visualizer(&self) -> bool {
+        self.content_panes()
+            .any(|content| content.as_visualizer().is_some())
+    }
+
+    /// Every live content pane, in tab-then-index order.
+    fn content_panes(&self) -> impl Iterator<Item = &ContentPane> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .flatten()
+            .filter_map(PaneEntry::content)
+    }
+
+    /// Advances the content panes that wait on something other than input: the
+    /// AI pane drains its worker's reply, the visualizer its own clock.
+    pub fn tick_content(&mut self, dt: f32) {
+        for tab in self.tabs.iter_mut() {
+            for entry in tab.panes.iter_mut().flatten() {
+                let Some(content) = entry.content_mut() else {
+                    continue;
+                };
+                match content {
+                    ContentPane::Ai { pane, .. } => pane.poll(),
+                    ContentPane::Visualizer { pane, .. } => pane.tick(dt),
+                    ContentPane::Preview { .. } => {}
+                }
+            }
+        }
+    }
+
+    /// Focuses the pane at tab-local index `id`, terminal or content.
     pub fn focus(&mut self, id: usize) {
         let idx = self.active_tab;
-        if self.tabs[idx].pane(id).is_some() {
+        if self.tabs[idx].entry(id).is_some() {
             self.tabs[idx].active = id;
         }
     }
@@ -598,7 +709,7 @@ impl AppState {
     pub fn split(&mut self, dir: SplitDir) -> Result<usize> {
         let (id, pane) = self.spawn_pane()?;
         let tab = &mut self.tabs[self.active_tab];
-        let index = tab.add_split(dir, id, pane);
+        let index = tab.add_split(dir, id, PaneEntry::Term(pane));
         self.apply_terminal_colors();
         self.relayout();
         Ok(index)
@@ -609,10 +720,22 @@ impl AppState {
     pub fn split_stacked(&mut self) -> Result<usize> {
         let (id, pane) = self.spawn_pane()?;
         let tab = &mut self.tabs[self.active_tab];
-        let index = tab.add_stacked(id, pane);
+        let index = tab.add_stacked(id, PaneEntry::Term(pane));
         self.apply_terminal_colors();
         self.relayout();
         Ok(index)
+    }
+
+    /// Adds a content pane beside the focused one, in its own cell, and focuses
+    /// it.
+    ///
+    /// A content pane has no pty and no VT, so nothing is sized and no terminal
+    /// colours are applied; the grid carries it exactly as it carries a
+    /// terminal, keyed by the id the content pane took from the same counter.
+    pub fn add_content(&mut self, dir: SplitDir, content: ContentPane) -> usize {
+        let id = content.id();
+        let tab = &mut self.tabs[self.active_tab];
+        tab.add_split(dir, id, PaneEntry::Content(Box::new(content)))
     }
 
     /// Closes the focused pane; the last pane in a tab is never closed.
@@ -636,7 +759,7 @@ impl AppState {
 
     /// Opens a fresh tab and focuses it.
     pub fn new_tab(&mut self) {
-        let (id, pane) = match self.spawn_pane() {
+        let (_, pane) = match self.spawn_pane() {
             Ok(pane) => pane,
             Err(e) => {
                 eprintln!("ghostwave: failed to spawn shell: {e}");
@@ -645,7 +768,7 @@ impl AppState {
         };
         self.last_tab = Some(self.active_tab);
         let name = format!("Tab {}", self.tabs.len() + 1);
-        self.tabs.push(Tab::new(name, id, pane));
+        self.tabs.push(Tab::new(name, PaneEntry::Term(pane)));
         self.active_tab = self.tabs.len() - 1;
         self.relayout();
     }
@@ -654,8 +777,6 @@ impl AppState {
     /// fresh pane instead.
     pub fn close_tab(&mut self) {
         if self.tabs.len() > 1 {
-            // Surviving tabs shift down; pane output is tagged by identity, so it
-            // still routes.
             self.tabs.remove(self.active_tab);
             if self.active_tab >= self.tabs.len() {
                 self.active_tab = self.tabs.len() - 1;
@@ -671,9 +792,8 @@ impl AppState {
             }
         };
         let tab = &mut self.tabs[self.active_tab];
-        // Dropping the last Arc of each pane closes its pty child.
         tab.panes.clear();
-        tab.panes.push(Some(pane));
+        tab.panes.push(Some(PaneEntry::Term(pane)));
         tab.grid = pane_grid::State::new(GridPane::single(id)).0;
         tab.active = 0;
         self.relayout();
@@ -808,11 +928,11 @@ impl AppState {
     pub fn break_pane(&mut self) {
         let old_tab = self.active_tab;
         let taken = self.tabs[old_tab].take_focused();
-        let Some((id, pane)) = taken else { return };
+        let Some((_, entry)) = taken else { return };
 
         self.last_tab = Some(old_tab);
         let name = format!("Tab {}", self.tabs.len() + 1);
-        self.tabs.push(Tab::new(name, id, pane));
+        self.tabs.push(Tab::new(name, entry));
         self.active_tab = self.tabs.len() - 1;
         self.relayout();
     }
@@ -822,8 +942,8 @@ impl AppState {
     pub fn apply_theme(&mut self, name: &str) {
         let theme = theme::by_name(name);
         for tab in self.tabs.iter_mut() {
-            for pane in tab.panes.iter_mut().flatten() {
-                pane.lock().unwrap().apply_theme(&theme);
+            for handle in tab.term_handles() {
+                handle.lock().unwrap().apply_theme(&theme);
             }
         }
         self.theme = theme;
@@ -831,11 +951,11 @@ impl AppState {
         self.toast(format!("theme: {name}"));
     }
 
-    /// Re-applies the current theme colors across all live panes.
+    /// Re-applies the current theme colors across all live terminals.
     pub fn apply_terminal_colors(&self) {
         for tab in &self.tabs {
-            for pane in tab.panes.iter().flatten() {
-                pane.lock().unwrap().apply_theme(&self.theme);
+            for handle in tab.term_handles() {
+                handle.lock().unwrap().apply_theme(&self.theme);
             }
         }
     }

@@ -970,3 +970,35 @@ Honest gaps at this point — these are not claims of working features:
 - The preview / AI / visualizer panes still raise their honest toasts; they need the content-pane
   refactor (slice 2).
 
+### 2026-09-17 (later still): integrating the new modules — slice 2, content panes
+
+A grid cell can now hold something that is not a terminal.
+
+- **`PaneEntry = Term(SharedPane) | Content(ContentPane)`** with
+  `ContentPane = Preview | Ai | Visualizer`; `Tab.panes` holds entries, and content panes take their
+  id from the same `PaneId` counter, so the grid payload and pty routing are unchanged.
+- **Every terminal-only path matches on `Term`**: pty subscriptions, key send, resize/`set_grid`,
+  dynamic titles, mouse tracking, the sync broadcast, and pty routing by id.
+- **Entry points**: the palette's "New AI Chat" and "Ghostwave (Screensaver Visualizer)", and
+  `Ctrl+Click` on a path (`Action::OpenFile`) for the preview — each splits the focused cell.
+  `ClosePane` closes a content cell with no pty involved.
+- **Keys go to a focused content pane** and never to a pty: preview — `j`/`k`, arrows,
+  `PgUp`/`PgDn` (20 lines), `+`/`-`/`=`/`_` zoom, `0` reset; AI — text reaches its prompt, `Enter`
+  submits; visualizer — `c` cycles the colour mode.
+- **AI replies are polled on the tick** (`AppState::tick_content`), because a std `mpsc::Receiver`
+  is neither `Hash` nor `Sync` and cannot back an iced subscription; `tick_rate()` returns `Slow`
+  while a request is pending and `Fast` while a visualizer is live.
+- 111/111 tests (7 new: an AI content cell and no new terminal, a preview entry's kind, a
+  visualizer entry, terminal-only paths skipping content, closing a content cell, preview keys,
+  typing into a focused AI pane).
+
+Honest gaps at this point:
+
+- The preview's page step is a hardcoded 20 lines; nothing in the plan fixes that number.
+- The AI prompt's own `text_input` messages are deliberately dropped (`Message::Noop`) so the key
+  path is the single writer and a character cannot be applied twice when the field has focus — the
+  cost is that pasting into that field does nothing.
+- Floats and the F12 scratchpad are still state-only: nothing paints them.
+- None of slice 2 has been seen in a real window yet (content cells, their title bars, the palette's
+  backdrop over the grid), so nothing here is claimed as visually verified.
+

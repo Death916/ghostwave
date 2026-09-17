@@ -80,28 +80,28 @@ impl ColorMode {
     pub fn colors(&self) -> (Color, Color, Color, Color) {
         match self {
             Self::GhostNeon => (
-                Color::from_rgba(0.0, 0.95, 1.0, 0.85),   // Electric Cyan
-                Color::from_rgba(1.0, 0.15, 0.75, 0.80),  // Hot Magenta
-                Color::from_rgba(0.45, 0.10, 0.60, 0.40), // Deep Violet
-                Color::from_rgba(0.2, 1.0, 0.9, 0.9),    // Cyan particle
+                Color::from_rgba(0.0, 0.95, 1.0, 0.85),
+                Color::from_rgba(1.0, 0.15, 0.75, 0.80),
+                Color::from_rgba(0.45, 0.10, 0.60, 0.40),
+                Color::from_rgba(0.2, 1.0, 0.9, 0.9),
             ),
             Self::MatrixGreen => (
-                Color::from_rgba(0.2, 1.0, 0.35, 0.85),  // Bright Matrix Green
-                Color::from_rgba(0.05, 0.65, 0.25, 0.75), // Dark Emerald
-                Color::from_rgba(0.02, 0.25, 0.08, 0.40), // Forest Green
-                Color::from_rgba(0.7, 1.0, 0.7, 0.95),   // Phosphor White-Green
+                Color::from_rgba(0.2, 1.0, 0.35, 0.85),
+                Color::from_rgba(0.05, 0.65, 0.25, 0.75),
+                Color::from_rgba(0.02, 0.25, 0.08, 0.40),
+                Color::from_rgba(0.7, 1.0, 0.7, 0.95),
             ),
             Self::SolarAmber => (
-                Color::from_rgba(1.0, 0.70, 0.10, 0.85),  // Golden Amber
-                Color::from_rgba(1.0, 0.25, 0.15, 0.75),  // Sunset Orange
-                Color::from_rgba(0.50, 0.10, 0.05, 0.40), // Deep Crimson
-                Color::from_rgba(1.0, 0.95, 0.40, 0.9),  // Radiant Yellow
+                Color::from_rgba(1.0, 0.70, 0.10, 0.85),
+                Color::from_rgba(1.0, 0.25, 0.15, 0.75),
+                Color::from_rgba(0.50, 0.10, 0.05, 0.40),
+                Color::from_rgba(1.0, 0.95, 0.40, 0.9),
             ),
             Self::AbyssIce => (
-                Color::from_rgba(0.1, 0.8, 1.0, 0.85),   // Ice Blue
-                Color::from_rgba(0.2, 0.35, 0.95, 0.75),  // Deep Sapphire
-                Color::from_rgba(0.05, 0.1, 0.35, 0.40),  // Midnight Navy
-                Color::from_rgba(0.7, 0.9, 1.0, 0.9),    // Glacial White
+                Color::from_rgba(0.1, 0.8, 1.0, 0.85),
+                Color::from_rgba(0.2, 0.35, 0.95, 0.75),
+                Color::from_rgba(0.05, 0.1, 0.35, 0.40),
+                Color::from_rgba(0.7, 0.9, 1.0, 0.9),
             ),
         }
     }
@@ -377,11 +377,9 @@ impl<Message> canvas::Program<Message> for VisualizerPane {
         let (c_prim, c_sec, c_glow, c_part) = mode.colors();
         let horizon = horizon_y(h);
 
-        // 1. Dark atmospheric background fill
         let bg = self.bg_color.unwrap_or(DEFAULT_BG_COLOR);
         frame.fill_rectangle(Point::ORIGIN, bounds.size(), bg);
 
-        // 2. Horizon atmospheric glow dome
         let dome_h = h * 0.45;
         let dome_top = (horizon - dome_h).max(0.0);
         frame.fill_rectangle(
@@ -390,7 +388,6 @@ impl<Message> canvas::Program<Message> for VisualizerPane {
             Color::from_rgba(c_glow.r, c_glow.g, c_glow.b, 0.18),
         );
 
-        // 3. Cyber matrix particle rain (sky region above horizon)
         for p in &self.particles {
             let px = p.x * w;
             let py = p.y * horizon;
@@ -411,7 +408,6 @@ impl<Message> canvas::Program<Message> for VisualizerPane {
             }
         }
 
-        // 4. Spectral mountain wireframe peaks (at horizon)
         let ridge_path = Path::new(|b| {
             b.move_to(Point::new(0.0, horizon));
             for i in 1..=MOUNTAIN_POINTS {
@@ -444,7 +440,6 @@ impl<Message> canvas::Program<Message> for VisualizerPane {
                 .with_width(1.0),
         );
 
-        // 5. Horizon divider neon line
         let horizon_line = Path::new(|b| {
             b.move_to(Point::new(0.0, horizon));
             b.line_to(Point::new(w, horizon));
@@ -454,11 +449,9 @@ impl<Message> canvas::Program<Message> for VisualizerPane {
             Stroke::default().with_color(c_prim).with_width(2.0),
         );
 
-        // 6. 3D perspective rolling synthwave grid (bottom half)
         let grid_h = h - horizon;
         let speed = grid_scroll_phase(self.time, speed_mult);
 
-        // Transverse horizontal scrolling depth lines
         for i in 0..NUM_Z_LINES {
             let z_raw = (i as f32 + speed) / NUM_Z_LINES as f32;
             let z = project_z(z_raw);
@@ -477,7 +470,6 @@ impl<Message> canvas::Program<Message> for VisualizerPane {
             );
         }
 
-        // Longitudinal perspective lines converging to center horizon
         let center_x = w * 0.5;
         let long_path = Path::new(|b| {
             for i in 0..=NUM_X_LINES {
@@ -494,7 +486,6 @@ impl<Message> canvas::Program<Message> for VisualizerPane {
                 .with_width(1.2),
         );
 
-        // 7. HUD header banner
         let hud_title = format!("◈ GHOSTWAVE VISUALIZER // {} ◈", mode.name());
         let hud_help = "[Space: Color Mode | +/-: Speed | Ctrl+w: Close]";
 

@@ -206,8 +206,6 @@ pub(crate) fn paint_pane(
     font: Font,
     theme: &GhostTheme,
 ) {
-    // Disjoint field borrows: `MutexGuard` derefs through a trait, so borrowing
-    // `term` and `scratch` at once only works after destructuring.
     let Pane {
         term, scratch, ..
     } = pane;
@@ -271,8 +269,6 @@ pub(crate) fn paint_pane(
                 }
             }
 
-            // A cell with no explicit bg, or one that is the terminal default,
-            // needs no rectangle — the pane background already covers it.
             if let Ok(Some(bg_c)) = c.bg_color() {
                 let c_bg = to_color(bg_c);
                 if c_bg != default_bg {
@@ -286,7 +282,6 @@ pub(crate) fn paint_pane(
                 && let Ok(style) = c.style()
             {
                 if style.inverse {
-                    // Inverse swaps the cell's own colours.
                     let new_bg = fg;
                     fg = cell_bg.unwrap_or(default_bg);
                     cell_bg = if new_bg == default_bg {
@@ -303,11 +298,6 @@ pub(crate) fn paint_pane(
                 frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), c_bg);
             }
 
-            // Text: extend the current run when colour and baseline match,
-            // otherwise flush and start a new one. A cell without a glyph (a
-            // wide character's continuation, an empty cell) BREAKS the run: the
-            // glyphs after it sit at their own grid column, not at
-            // `run start + advance`.
             let baseline_y = y + cell.baseline;
             let extends = match &run {
                 Some(r) => has_glyphs && r.color == fg && r.baseline_y == baseline_y,
@@ -353,7 +343,6 @@ pub(crate) fn paint_pane(
         y += ch;
     }
 
-    // Cursor: honour the style the terminal reports (DECSCUSR), block by default.
     if snapshot.cursor_visible().unwrap_or(false)
         && let Ok(Some(vp)) = snapshot.cursor_viewport()
     {
@@ -371,7 +360,6 @@ pub(crate) fn paint_pane(
             CursorVisualStyle::Underline => {
                 frame.fill_rectangle(Point::new(cx, cy + ch - 1.0), Size::new(cw, 1.0), cursor_color)
             }
-            // Block, BlockHollow and any future variant: solid block.
             _ => frame.fill_rectangle(Point::new(cx, cy), Size::new(cw, ch), cursor_color),
         }
     }
@@ -402,9 +390,6 @@ fn draw_run(frame: &mut Frame, run: &TextRun, font_px: f32, font: Font) {
         font,
         align_x: alignment::Horizontal::Left.into(),
         align_y: alignment::Vertical::Top,
-        // Advanced, not Basic: `Basic` shapes with no font fallback, so every
-        // glyph missing from the primary face — prompt glyphs, braille,
-        // private-use icons — would be tofu.
         shaping: text::Shaping::Advanced,
         ..CanvasText::default()
     });

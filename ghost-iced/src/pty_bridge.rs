@@ -55,7 +55,6 @@ pub fn spawn(id: crate::pane::PaneId, rx: mpsc::Receiver<PtyMsg>) -> PtyRxSlot {
                 match rx.recv() {
                     Ok(PtyMsg::Data(data)) => {
                         buf.extend_from_slice(&data);
-                        // Coalesce what is already queued behind it.
                         let mut eof: Option<String> = None;
                         while buf.len() < COALESCE_CAP {
                             match rx.try_recv() {

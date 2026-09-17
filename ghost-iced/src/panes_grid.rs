@@ -14,6 +14,11 @@
 //! Terminal content stays the canvas layer's: one [`PaneCanvas`] per pane paints
 //! that pane at its own bounds with the shared painter.
 //!
+//! A cell whose pane is not a terminal ([`ContentPane`]) paints that pane's own
+//! widget in place of the canvas, clipped to the cell: a preview, an AI chat or
+//! the visualizer. Such a cell gets no [`PaneCanvas`] and no mouse reporting, and
+//! its label band names its kind.
+//!
 //! A cell holds a list of panes ([`GridPane`]): several of them are a
 //! zellij-style stack, of which the active member is drawn and typed into.
 //! Floating panes are out of scope.
@@ -34,7 +39,7 @@ use crate::Message;
 use crate::app::{AppState, GridPane, Tab};
 use crate::fonts;
 use crate::keys;
-use crate::pane::{PaneId, SharedPane};
+use crate::pane::{ContentPane, PaneEntry, PaneId, SharedPane};
 use crate::pane_canvas::{self, CanvasState, ChromeData, TerminalCanvas};
 
 /// Gutter between neighbouring cells, in px.
@@ -110,7 +115,6 @@ pub fn dir_of(axis: Axis) -> SplitDir {
 /// canvas layered above it.
 pub fn view<'a>(
     state: &'a AppState,
-    panes: Vec<(usize, SharedPane)>,
     mouse_tracking: Vec<usize>,
     chrome: ChromeData,
 ) -> Element<'a, Message> {
@@ -121,7 +125,7 @@ pub fn view<'a>(
     .width(Fill)
     .height(Fill);
 
-    let layer = container(grid(state, panes, mouse_tracking))
+    let layer = container(grid(state, mouse_tracking))
         .padding(Padding {
             top: TAB_BAR_H,
             right: 0.0,
@@ -133,8 +137,6 @@ pub fn view<'a>(
             ..container::Style::default()
         });
 
-    // The chrome layer is last so it draws over the grid: a canvas inside a
-    // `Stack` loses its text pass when it sits underneath an opaque sibling.
     iced::widget::Stack::with_children(vec![layer.into(), chrome_layer.into()])
         .width(Fill)
         .height(Fill)
@@ -142,13 +144,9 @@ pub fn view<'a>(
 }
 
 /// Builds the pane grid from the tab's own state: one pane per cell, each the
-/// cell's active pane drawn by its own canvas under a title bar, and framed by
-/// its own container border.
-fn grid<'a>(
-    state: &'a AppState,
-    panes: Vec<(usize, SharedPane)>,
-    mouse_tracking: Vec<usize>,
-) -> PaneGrid<'a, Message> {
+/// cell's active pane — a terminal drawn by its own canvas, or a content pane's
+/// own widget — under a title bar, and framed by its own container border.
+fn grid<'a>(state: &'a AppState, mouse_tracking: Vec<usize>) -> PaneGrid<'a, Message> {
     let tab = state.current();
     let tab_index = state.active_tab;
     let frames = state.show_frames;
@@ -160,19 +158,9 @@ fn grid<'a>(
     let replace_title = state.config.dynamic_title != crate::config::DynamicTitleMode::Off;
 
     PaneGrid::new(&tab.grid, move |_cell, payload: &GridPane, _maximized| {
-        // The cell's payload names panes by identity; the pane layer works with
-        // the index the tab addresses them by.
         let index = payload.active_id().and_then(|id| tab.index_of(id));
-        let handle = index.and_then(|index| {
-            panes
-                .iter()
-                .find(|(pane, _)| *pane == index)
-                .map(|(_, handle)| handle.clone())
-        });
+        let entry = index.and_then(|index| tab.entry(index));
         let focused = index == Some(active);
-        // `Content` has no padding of its own, so the frame width is part of the
-        // canvas inset: without it the opaque canvas covers the pane's own
-        // border and only the gutters show it.
         let frame_w = if !frames {
             0.0
         } else if focused {
@@ -185,12 +173,12 @@ fn grid<'a>(
         } else {
             theme.frame
         };
-        let body: Element<'a, Message> = match handle.clone() {
-            Some(handle) => container(
+        let body: Element<'a, Message> = match entry {
+            Some(PaneEntry::Term(handle)) => container(
                 Canvas::new(PaneCanvas {
                     tab: tab_index,
                     pane: index.unwrap_or_default(),
-                    handle,
+                    handle: handle.clone(),
                     cell,
                     font_px,
                     padding,
@@ -202,25 +190,27 @@ fn grid<'a>(
             )
             .padding(inset + frame_w)
             .into(),
+            Some(PaneEntry::Content(content)) => content_body(content, inset + frame_w, theme),
             None => text("").into(),
         };
         let mut content = Content::new(body);
         if frames {
-            // The pane's 1-based position in the tab.
             let position = index.map(|index| index + 1).unwrap_or(1);
             let stack_info = if payload.panes.len() > 1 {
                 Some((payload.active, payload.panes.len()))
             } else {
                 None
             };
-            let label = handle
-                .as_ref()
-                .map(|handle| pane_canvas::cell_label(handle, position, stack_info, replace_title))
-                .unwrap_or_default();
+            let label = match entry {
+                Some(PaneEntry::Term(handle)) => {
+                    pane_canvas::cell_label(handle, position, stack_info, replace_title)
+                }
+                Some(PaneEntry::Content(content)) => content.label(),
+                None => String::new(),
+            };
             content = content.title_bar(TitleBar::new(label_band(&label, frame_color, font, theme)));
         }
         content.style(move |_theme| container::Style {
-            // Also the pane's own margin, so the frame stroke reads as one.
             background: Some(pane_canvas::rgb(theme.bg).into()),
             border: Border {
                 color: pane_canvas::rgb(frame_color),
@@ -236,8 +226,6 @@ fn grid<'a>(
         let index = click_to_pane_index(&tab.grid, tab, pane).unwrap_or(tab.active);
         Message::FocusPane(index)
     })
-    // The grab area of a split is the gutter itself, which is dead space: panes
-    // keep every click inside their terminal area.
     .on_resize(0.0, |event| Message::GridResize {
         split: event.split,
         ratio: event.ratio,
@@ -246,6 +234,32 @@ fn grid<'a>(
     .style(move |_theme| grid_style(&theme))
     .width(Fill)
     .height(Fill)
+}
+
+/// A content pane's own widget tree, inset inside its cell's frame and clipped
+/// to it.
+///
+/// The pane is not a terminal, so it brings its own widget instead of a
+/// [`PaneCanvas`]: the preview's line and image views, the AI chat's cards, or
+/// the visualizer's canvas program.
+fn content_body<'a>(content: &'a ContentPane, inset: f32, theme: GhostTheme) -> Element<'a, Message> {
+    let body: Element<'a, Message> = match content {
+        ContentPane::Preview { pane, .. } => pane.view::<Message>(&theme),
+        ContentPane::Ai { id, pane } => {
+            let id = *id;
+            pane.view(&Theme::Dark).map(move |msg| match msg {
+                crate::ai::AiMessage::InputChanged(_) => Message::Noop,
+                msg => Message::Ai { id, msg },
+            })
+        }
+        ContentPane::Visualizer { pane, .. } => Canvas::new(pane).width(Fill).height(Fill).into(),
+    };
+    container(body)
+        .width(Fill)
+        .height(Fill)
+        .padding(inset)
+        .clip(true)
+        .into()
 }
 
 /// The pane's label as a filled band, the canvas layer's chip turned into a title
@@ -360,8 +374,6 @@ impl canvas::Program<Message> for PaneCanvas {
                     state,
                 )))
             }
-            // Motion is the hot path: iced reports every pixel, so it only goes
-            // to a pane that is tracking the mouse or has a button down.
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 if !state.any_pressed() && !self.tracking {
                     return None;
@@ -376,10 +388,6 @@ impl canvas::Program<Message> for PaneCanvas {
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let point = cursor.position_over(bounds)?;
-                // libghostty takes the wheel as a positive-up delta and decides
-                // for itself whether that is application mouse reporting or a
-                // viewport scroll. When winit delivers pixel deltas, normalize by
-                // the cell height so single discrete notches never truncate to 0.
                 let line_step = (self.cell.h as f32).max(1.0);
                 let dy = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => *y,
@@ -414,8 +422,6 @@ impl canvas::Program<Message> for PaneCanvas {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        // The frame covers this pane only: iced clips the canvas's geometry to
-        // its own layer, so the pane rect is the whole frame.
         let mut frame = Frame::new(renderer, bounds.size());
         let mut guard = self.handle.lock().unwrap();
 
@@ -483,21 +489,14 @@ mod tests {
         };
         let padding = 6.0;
 
-        // Standard integer sizing:
-        // width = 800 - 12 = 788; 788 / 8 = 98.5 -> 98
-        // height = 600 - 12 = 588; 588 / 16 = 36.75 -> 36
         let (cols, rows) = bounds_to_cols_rows(800.0, 600.0, cell, padding);
         assert_eq!(cols, 98);
         assert_eq!(rows, 36);
 
-        // Fractional bounds from ratio-based splits:
-        // width = 556.80005 - 12 = 544.80005; 544.80005 / 8 = 68.100006 -> 68
-        // height = 384.25003 - 12 = 372.25003; 372.25003 / 16 = 23.265627 -> 23
         let (cols, rows) = bounds_to_cols_rows(556.80005, 384.25003, cell, padding);
         assert_eq!(cols, 68);
         assert_eq!(rows, 23);
 
-        // Too-small and degenerate cases clamp to at least 1x1:
         assert_eq!(bounds_to_cols_rows(0.0, 0.0, cell, padding), (1, 1));
         assert_eq!(bounds_to_cols_rows(10.0, 10.0, cell, padding), (1, 1));
         assert_eq!(bounds_to_cols_rows(-100.0, -50.0, cell, padding), (1, 1));
@@ -509,7 +508,6 @@ mod tests {
     fn stack_label_string_formatting() {
         use crate::pane_canvas::format_pane_label;
 
-        // With replace = false (legacy / static pane prefix)
         assert_eq!(format_pane_label("", 1, "", None, false), "pane 1");
         assert_eq!(
             format_pane_label("term", 2, "fish", None, false),
@@ -532,7 +530,6 @@ mod tests {
             "pane 1 [3/3]"
         );
 
-        // With replace = true (dynamic process titles replace pane name)
         assert_eq!(format_pane_label("", 1, "", None, true), "pane 1");
         assert_eq!(
             format_pane_label("term", 2, "fish", None, true),
@@ -554,7 +551,6 @@ mod tests {
 
     #[test]
     fn click_to_pane_index_mapping() {
-        // Single cell grid
         let (mut grid, root) = pane_grid::State::new(GridPane::single(PaneId(10)));
         let index_map = |id: PaneId| match id.0 {
             10 => Some(0),
@@ -565,7 +561,6 @@ mod tests {
 
         assert_eq!(cell_active_pane_index(&grid, root, index_map), Some(0));
 
-        // Split grid: root on left (10), new cell on right (20)
         let (right, _split) = grid
             .split(Axis::Vertical, root, GridPane::single(PaneId(20)))
             .expect("split succeeds");
@@ -573,14 +568,12 @@ mod tests {
         assert_eq!(cell_active_pane_index(&grid, root, index_map), Some(0));
         assert_eq!(cell_active_pane_index(&grid, right, index_map), Some(1));
 
-        // Stack cell: root holds a stack [10, 30], active = 1 (PaneId 30)
         let cell = grid.get_mut(root).expect("root exists");
         cell.panes.push(PaneId(30));
         cell.active = 1;
 
         assert_eq!(cell_active_pane_index(&grid, root, index_map), Some(2));
 
-        // Cycle stack back to active = 0 (PaneId 10)
         let cell = grid.get_mut(root).expect("root exists");
         cell.active = 0;
         assert_eq!(cell_active_pane_index(&grid, root, index_map), Some(0));

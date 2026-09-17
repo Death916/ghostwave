@@ -35,7 +35,7 @@ mod tick;
 pub mod visualizer;
 
 use app::AppState;
-use pane::SharedPane;
+use pane::PaneEntry;
 use pane_canvas::ChromeData;
 
 /// Cell metrics are measured from it and the canvas draws text with it.
@@ -105,6 +105,16 @@ pub enum Message {
     Palette(palette::PaletteMessage),
     /// A message from the scrollback search overlay.
     Search(search_overlay::SearchMessage),
+    /// A message from an AI chat pane's own widgets: its prompt input, its send
+    /// button, its clear button.
+    Ai {
+        /// The pane's own identity, not its position.
+        id: pane::PaneId,
+        msg: ai::AiMessage,
+    },
+    /// A message no handler acts on: for a widget that must emit one but whose value
+    /// is owned elsewhere.
+    Noop,
 }
 
 struct App {
@@ -130,8 +140,11 @@ impl App {
     }
 
     fn title(&self) -> String {
+        let tab = self.state.current();
+        if let Some(content) = tab.entry(tab.active).and_then(PaneEntry::content) {
+            return format!("{} — ghostwave", content.label());
+        }
         if self.state.config.dynamic_title != crate::config::DynamicTitleMode::Off {
-            let tab = self.state.current();
             if let Some(pane) = tab.pane(tab.active) {
                 let guard = pane.lock().unwrap();
                 let title = guard.cached_title();
@@ -148,7 +161,6 @@ impl App {
             Message::Output { id, data } => {
                 if let Some(pane) = self.state.pane_by_id(id) {
                     pane.lock().unwrap().ingest(&data);
-                    // Output in flight energizes the wave on the next tick.
                     self.state.pty_activity = true;
                 }
             }
@@ -205,11 +217,7 @@ impl App {
                 text,
                 repeat,
             } => {
-                // Remembered for the mouse path: iced's mouse events carry no
-                // modifiers.
                 keys::note_modifiers(modifiers);
-                // An open overlay owns the keyboard; nothing below this point
-                // reaches a pane while one of them is up.
                 if !self.overlay_key(&key, modifiers, text.as_deref()) {
                     if let Some(kp) = keys::keypress(&key, physical, modifiers, text.as_deref()) {
                         if repeat {
@@ -226,20 +234,14 @@ impl App {
                 modifiers,
             } => {
                 keys::note_modifiers(modifiers);
-                // A release belongs to the press the overlay consumed, so it does
-                // not leak into the shell either.
                 if !self.overlay_open() {
                     if let Some(kp) = keys::keypress(&key, physical, modifiers, None) {
                         input::key_release(&mut self.state, kp);
                     }
                 }
             }
-            // The pane-grid layer's own interactions: the grid keeps whatever
-            // ratio a split drag ends on, and a drop re-arranges its cells.
             Message::GridResize { split, ratio } => self.state.grid_resize(split, ratio),
             Message::GridDrag(event) => self.state.grid_drag(event),
-            // While an overlay is open it owns the keyboard, so its own messages are
-            // the only path into it.
             Message::Palette(message) => {
                 if let Some(palette) = self.state.palette.as_mut() {
                     match palette.update(message) {
@@ -252,10 +254,6 @@ impl App {
                     }
                 }
             }
-            // The search overlay owns the query and the pane's search engine
-            // together: the module's own adapter keeps both in step — a query or
-            // case change re-arms the core search, next/prev steps it, and Close
-            // stops it.
             Message::Search(message) => {
                 let closing = matches!(message, search_overlay::SearchMessage::Close);
                 let pane = self.state.active_pane();
@@ -267,9 +265,17 @@ impl App {
                     self.state.search = None;
                 }
             }
+            Message::Ai { id, msg } => {
+                if let Some(content) = self.state.content_by_id_mut(id) {
+                    if let Some(ai) = content.as_ai_mut() {
+                        ai.update(msg);
+                        ai.poll();
+                    }
+                }
+            }
+            Message::Noop => {}
         }
         if self.state.quit {
-            // `Ctrl+q` / `Action::Quit`.
             return iced::exit();
         }
         Task::none()
@@ -316,7 +322,6 @@ impl App {
             .as_mut()
             .and_then(|palette| palette.handle_iced_key(key, &modifiers));
         match action {
-            // The same two exits the `Message::Palette` arm takes.
             Some(palette::PaletteAction::Execute(action)) => {
                 self.state.palette = None;
                 input::execute(&mut self.state, action);
@@ -354,7 +359,6 @@ impl App {
             Some(search_overlay::SearchMessage::ToggleCaseSensitive) => {
                 input::execute(&mut self.state, Action::SearchToggleCase)
             }
-            // Regex has no keymap action of its own, so it is the overlay's.
             Some(search_overlay::SearchMessage::ToggleRegex) => {
                 if let Some(search) = self.state.search.as_mut() {
                     search.toggle_regex();
@@ -373,18 +377,15 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         let tab = self.state.current();
-        let panes: Vec<(usize, SharedPane)> = tab
+        let mouse_tracking: Vec<usize> = tab
             .panes
             .iter()
             .enumerate()
-            .filter_map(|(id, pane)| pane.as_ref().map(|p| (id, p.clone())))
+            .filter_map(|(index, entry)| {
+                let handle = entry.as_ref()?.term()?;
+                handle.lock().unwrap().mouse_tracking().then_some(index)
+            })
             .collect();
-        let mouse_tracking: Vec<usize> = panes
-            .iter()
-            .filter(|(_, pane)| pane.lock().unwrap().mouse_tracking())
-            .map(|(id, _)| *id)
-            .collect();
-        // Everything the chrome needs, owned: the layers are rebuilt every view.
         let chrome = ChromeData {
             tabs: self
                 .state
@@ -395,7 +396,6 @@ impl App {
                 .collect(),
             mode_label: self.state.mode.label().to_string(),
             hints: self.state.mode.hints().to_string(),
-            // The configured theme name, not the resolved palette's.
             theme_name: self.state.config.theme.clone(),
             sync_panes: tab.sync_panes,
             wave: self.state.config.visual_wave.then_some(chrome::WaveParams {
@@ -415,14 +415,10 @@ impl App {
             },
         };
 
-        let base = panes_grid::view(&self.state, panes, mouse_tracking, chrome);
+        let base = panes_grid::view(&self.state, mouse_tracking, chrome);
         if self.state.search.is_none() && self.state.palette.is_none() {
             return base;
         }
-        // Overlays are `Stack` layers above the pane grid and its chrome, the last
-        // child painting on top. The search layer is transparent; the palette
-        // brings its own dimmed backdrop, which is the only full-window fill up
-        // here.
         let mut layers: Vec<Element<'_, Message>> = vec![base];
         if let Some(search) = self.state.search.as_ref() {
             layers.push(search_overlay::search_overlay_mapped(
@@ -446,8 +442,6 @@ impl App {
             iced::event::listen_with(key_listener),
             iced::window::resize_events().map(|(_id, size)| Message::Resized(size)),
         ];
-        // The wave and an expiring toast need an explicit tick; while nothing
-        // animates there is none.
         match self.state.tick_rate() {
             app::TickRate::Off => {}
             rate => subs.push(Subscription::run_with(
@@ -455,10 +449,9 @@ impl App {
                 tick::stream,
             )),
         }
-        // One stream per live pane; each carries its own (tab, pane) tag.
         for tab in &self.state.tabs {
-            for pane in tab.panes.iter().flatten() {
-                let slot = { pane.lock().unwrap().rx.clone() };
+            for handle in tab.term_handles() {
+                let slot = { handle.lock().unwrap().rx.clone() };
                 subs.push(Subscription::run_with(slot, pty_bridge::stream));
             }
         }
@@ -517,8 +510,6 @@ fn key_listener(
             physical: physical_key,
             modifiers,
         }),
-        // A modifier change is not a message of its own: the mouse path reads the
-        // current state from `keys`.
         iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
             keys::note_modifiers(modifiers);
             None
@@ -532,9 +523,6 @@ fn main() -> iced::Result {
         .title(App::title)
         .subscription(App::subscription)
         .window_size(START_WINDOW)
-        // iced's font system starts from an empty database plus its own Fira
-        // Sans, so every face has to be registered: the primary one (the canvas
-        // draws with it by name) plus the system fallbacks.
         .font(fonts::PRIMARY_BYTES);
     for (_family, bytes) in fonts::fallback_bytes(12) {
         app = app.font(bytes);

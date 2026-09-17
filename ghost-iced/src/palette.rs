@@ -662,7 +662,6 @@ pub fn default_items(themes: &[&str]) -> Vec<PaletteItem> {
     use ghostwave::layout::Dir;
 
     let mut items = vec![
-        // Pane management
         PaletteItem::new("New Pane (down)", "Pane", Some("Ctrl+Shift+D"), NewPaneDown),
         PaletteItem::new("New Pane (right)", "Pane", Some("Ctrl+D"), NewPaneRight),
         PaletteItem::new("New Pane (stacked)", "Pane", Some("Ctrl+P S"), NewPaneStacked),
@@ -687,14 +686,12 @@ pub fn default_items(themes: &[&str]) -> Vec<PaletteItem> {
             ToggleSyncPanes,
         ),
         PaletteItem::new("Break Pane to New Tab", "Pane", Some("Ctrl+T B"), BreakPane),
-        // Tab management
         PaletteItem::new("New Tab", "Tab", Some("Ctrl+Shift+T"), NewTab),
         PaletteItem::new("Close Tab", "Tab", Some("Ctrl+Shift+W"), CloseTab),
         PaletteItem::new("Next Tab", "Tab", Some("Ctrl+]"), NextTab),
         PaletteItem::new("Previous Tab", "Tab", Some("Ctrl+["), PrevTab),
         PaletteItem::new("Toggle Last Active Tab", "Tab", Some("Ctrl+T Tab"), ToggleLastTab),
         PaletteItem::new("Rename Tab", "Tab", Some("F2"), RenameTab),
-        // Terminal operations
         PaletteItem::new("Find in Terminal", "Terminal", Some("Ctrl+Shift+F"), OpenSearch),
         PaletteItem::new("Copy", "Terminal", Some("Ctrl+Shift+C"), Copy),
         PaletteItem::new("Paste", "Terminal", Some("Ctrl+Shift+V"), Paste),
@@ -703,11 +700,9 @@ pub fn default_items(themes: &[&str]) -> Vec<PaletteItem> {
         PaletteItem::new("Scroll Page Down", "Terminal", Some("Shift+PageDown"), PageDown),
         PaletteItem::new("Scroll to Bottom", "Terminal", Some("Shift+End"), ScrollToBottom),
         PaletteItem::new("Edit Scrollback in Editor", "Terminal", Some("Ctrl+S E"), EditScrollback),
-        // Session management
         PaletteItem::new("Session Manager", "Session", Some("Ctrl+O W"), SessionManager),
         PaletteItem::new("Detach Session", "Session", Some("Ctrl+O D"), Detach),
         PaletteItem::new("Kill Remote Session", "Session", None, KillRemoteSession),
-        // Views and tools
         PaletteItem::new("Command Palette", "View", Some("Ctrl+Shift+P"), OpenCommandBar),
         PaletteItem::new("Toggle Scratchpad Drawer", "View", Some("F12"), ToggleScratchpad),
         PaletteItem::new(
@@ -717,7 +712,6 @@ pub fn default_items(themes: &[&str]) -> Vec<PaletteItem> {
             Ghostwave,
         ),
         PaletteItem::new("New AI Chat", "View", None, NewAi),
-        // Application control
         PaletteItem::new("Quit", "App", Some("Ctrl+Q"), Quit),
         PaletteItem::new("Lock Terminal", "App", Some("Ctrl+G"), Lock),
     ];

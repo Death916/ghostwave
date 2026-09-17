@@ -2,16 +2,21 @@
 //! `canvas::Program::draw` takes `&self` while drawing mutates render state, plus
 //! libghostty's per-draw render scratch.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use ghostwave::config::AiConfig;
 use ghostwave::keymap::KeyPress;
 use ghostwave::term::{CellDims, TermPane};
 use libghostty_vt::key::{self, Mods};
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 
+use crate::ai::AiPane;
 use crate::config::{DynamicTitleMode, PaneTitleFormat};
+use crate::preview::PreviewPane;
 use crate::pty_bridge::{self, PtyRxSlot};
+use crate::visualizer::VisualizerPane;
 
 /// Crate-wide alias for results that box their error.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -365,6 +370,192 @@ impl Pane {
                 }
             }
             (None, None) => osc_title,
+        }
+    }
+}
+
+/// A tab slot's occupant: the pane a `Tab::panes` index holds.
+pub enum PaneEntry {
+    /// A pty-backed terminal pane.
+    Term(SharedPane),
+    /// A file preview, AI chat or visualizer pane, which has no pty.
+    Content(Box<ContentPane>),
+}
+
+impl PaneEntry {
+    /// This entry's identity, which the grid payload and every id-tagged
+    /// message address it by.
+    pub fn id(&self) -> PaneId {
+        match self {
+            Self::Term(pane) => pane.lock().unwrap().id,
+            Self::Content(content) => content.id(),
+        }
+    }
+
+    /// This entry's terminal handle; `None` for a content pane. Every
+    /// terminal-only path — the pty subscription, key send, resize, titles, the
+    /// mouse-tracking scan and the sync broadcast — goes through this.
+    pub fn term(&self) -> Option<&SharedPane> {
+        match self {
+            Self::Term(pane) => Some(pane),
+            Self::Content(_) => None,
+        }
+    }
+
+    /// Whether this entry is a terminal.
+    pub fn is_term(&self) -> bool {
+        matches!(self, Self::Term(_))
+    }
+
+    /// The content pane this entry holds, if it holds one.
+    pub fn content(&self) -> Option<&ContentPane> {
+        match self {
+            Self::Term(_) => None,
+            Self::Content(content) => Some(content),
+        }
+    }
+
+    /// The content pane this entry holds, if it holds one.
+    pub fn content_mut(&mut self) -> Option<&mut ContentPane> {
+        match self {
+            Self::Term(_) => None,
+            Self::Content(content) => Some(content),
+        }
+    }
+}
+
+/// A cell's non-terminal pane: its own widget and state, plus the identity the
+/// grid payload and the message routing address it by.
+///
+/// A content pane's id comes from the same counter the terminals draw on, so the
+/// grid's payload and its cells are unchanged by the kind of pane they hold.
+pub enum ContentPane {
+    /// A file or directory preview.
+    Preview {
+        /// The pane's process-wide identity.
+        id: PaneId,
+        /// The previewed target's state and widget.
+        pane: PreviewPane,
+    },
+    /// An AI assistant chat.
+    Ai {
+        /// The pane's process-wide identity.
+        id: PaneId,
+        /// The chat's state and widget.
+        pane: AiPane,
+    },
+    /// The synthwave visualizer.
+    Visualizer {
+        /// The pane's process-wide identity.
+        id: PaneId,
+        /// The visualizer's state, which is also its canvas program.
+        pane: VisualizerPane,
+    },
+}
+
+impl ContentPane {
+    /// A preview pane for `path`, loaded from disk.
+    pub fn preview(path: impl Into<PathBuf>) -> Self {
+        Self::Preview {
+            id: PaneId::next(),
+            pane: PreviewPane::open(path),
+        }
+    }
+
+    /// An AI chat pane configured from `config`.
+    pub fn ai(config: AiConfig) -> Self {
+        Self::Ai {
+            id: PaneId::next(),
+            pane: AiPane::new(config),
+        }
+    }
+
+    /// The synthwave visualizer pane.
+    pub fn visualizer() -> Self {
+        Self::Visualizer {
+            id: PaneId::next(),
+            pane: VisualizerPane::new(),
+        }
+    }
+
+    /// This pane's identity, from the counter the terminals draw on.
+    pub fn id(&self) -> PaneId {
+        match self {
+            Self::Preview { id, .. } | Self::Ai { id, .. } | Self::Visualizer { id, .. } => *id,
+        }
+    }
+
+    /// The pane's kind: `preview`, `ai` or `visualizer`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Preview { .. } => "preview",
+            Self::Ai { .. } => "ai",
+            Self::Visualizer { .. } => "visualizer",
+        }
+    }
+
+    /// The pane's label-band text: its kind, and for a preview the target's
+    /// own name.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Preview { pane, .. } => {
+                let name = pane
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| pane.path.display().to_string());
+                format!("preview {name}")
+            }
+            Self::Ai { .. } => "ai".to_string(),
+            Self::Visualizer { .. } => "ghostwave".to_string(),
+        }
+    }
+
+    /// The preview pane, when this is one.
+    pub fn as_preview(&self) -> Option<&PreviewPane> {
+        match self {
+            Self::Preview { pane, .. } => Some(pane),
+            _ => None,
+        }
+    }
+
+    /// The preview pane, when this is one.
+    pub fn as_preview_mut(&mut self) -> Option<&mut PreviewPane> {
+        match self {
+            Self::Preview { pane, .. } => Some(pane),
+            _ => None,
+        }
+    }
+
+    /// The AI chat pane, when this is one.
+    pub fn as_ai(&self) -> Option<&AiPane> {
+        match self {
+            Self::Ai { pane, .. } => Some(pane),
+            _ => None,
+        }
+    }
+
+    /// The AI chat pane, when this is one.
+    pub fn as_ai_mut(&mut self) -> Option<&mut AiPane> {
+        match self {
+            Self::Ai { pane, .. } => Some(pane),
+            _ => None,
+        }
+    }
+
+    /// The visualizer pane, when this is one.
+    pub fn as_visualizer(&self) -> Option<&VisualizerPane> {
+        match self {
+            Self::Visualizer { pane, .. } => Some(pane),
+            _ => None,
+        }
+    }
+
+    /// The visualizer pane, when this is one.
+    pub fn as_visualizer_mut(&mut self) -> Option<&mut VisualizerPane> {
+        match self {
+            Self::Visualizer { pane, .. } => Some(pane),
+            _ => None,
         }
     }
 }

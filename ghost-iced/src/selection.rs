@@ -516,22 +516,18 @@ mod tests {
     fn test_coordinate_normalization() {
         let mut model = SelectionModel::new();
 
-        // Same row, forward selection
         model.start = (2, 0);
         model.end = (5, 0);
         assert_eq!(model.normalized(), ((2, 0), (5, 0)));
 
-        // Same row, backward selection
         model.start = (5, 0);
         model.end = (2, 0);
         assert_eq!(model.normalized(), ((2, 0), (5, 0)));
 
-        // Multi-row, forward selection
         model.start = (10, 1);
         model.end = (2, 3);
         assert_eq!(model.normalized(), ((10, 1), (2, 3)));
 
-        // Multi-row, backward selection
         model.start = (2, 3);
         model.end = (10, 1);
         assert_eq!(model.normalized(), ((10, 1), (2, 3)));
@@ -548,21 +544,16 @@ mod tests {
         let cols = 80;
         let rows = 24;
 
-        // Inside padding clamps to 0
         assert_eq!(pixel_to_cell(2.0, 2.0, cell, padding, cols, rows), (0, 0));
         assert_eq!(pixel_to_cell(0.0, 0.0, cell, padding, cols, rows), (0, 0));
 
-        // Exact cell boundaries: padding + (col * 8), padding + (row * 16)
-        // At x = 4.0 + 16.0 = 20.0 (col 2), y = 4.0 + 32.0 = 36.0 (row 2)
         assert_eq!(pixel_to_cell(20.0, 36.0, cell, padding, cols, rows), (2, 2));
 
-        // Clamping beyond max boundaries
         assert_eq!(
             pixel_to_cell(10000.0, 10000.0, cell, padding, cols, rows),
             (79, 23)
         );
 
-        // Inverse calculation check
         let (px, py) = cell_to_pixel(5, 3, cell, padding);
         assert_eq!(px, 4.0 + 5.0 * 8.0);
         assert_eq!(py, 4.0 + 3.0 * 16.0);
@@ -602,28 +593,22 @@ mod tests {
         let text = "hello foo_bar 123 :: test()";
         let chars: Vec<char> = text.chars().collect();
 
-        // Expanding "hello" (indices 0..=4)
         assert_eq!(expand_word_range(&chars, 0), (0, 4));
         assert_eq!(expand_word_range(&chars, 2), (0, 4));
         assert_eq!(expand_word_range(&chars, 4), (0, 4));
 
-        // Expanding whitespace at index 5
         assert_eq!(expand_word_range(&chars, 5), (5, 5));
 
-        // Expanding "foo_bar" (indices 6..=12)
         assert_eq!(expand_word_range(&chars, 6), (6, 12));
         assert_eq!(expand_word_range(&chars, 9), (6, 12));
         assert_eq!(expand_word_range(&chars, 12), (6, 12));
 
-        // Expanding "::" (indices 18..=19)
         assert_eq!(expand_word_range(&chars, 18), (18, 19));
         assert_eq!(expand_word_range(&chars, 19), (18, 19));
 
-        // Expanding "()" (indices 25..=26)
         assert_eq!(expand_word_range(&chars, 25), (25, 26));
         assert_eq!(expand_word_range(&chars, 26), (25, 26));
 
-        // Helper string method
         assert_eq!(expand_word_boundary_str(text, 6), (6, 12));
     }
 
@@ -638,12 +623,10 @@ mod tests {
         assert!(model.active);
         assert!(model.is_dragging);
 
-        // Dragging to another line expands selection over both full lines
         model.on_drag((10, 4), 80);
         assert_eq!(model.start, (0, 2));
         assert_eq!(model.end, (79, 4));
 
-        // Dragging upwards
         model.on_drag((5, 0), 80);
         assert_eq!(model.start, (0, 0));
         assert_eq!(model.end, (79, 2));
@@ -660,7 +643,6 @@ mod tests {
         let mut model = SelectionModel::new();
         model.active = true;
 
-        // Select across rows: from "line" in row 0 to "second" in row 1
         model.start = (6, 0);
         model.end = (5, 1);
         model.mode = SelectionMode::Normal;
@@ -668,7 +650,6 @@ mod tests {
         let extracted = model.extract_text_from_lines(&lines);
         assert_eq!(extracted, "line of text\nsecond");
 
-        // Select 3 entire rows in Line mode
         model.start = (0, 0);
         model.end = (20, 2);
         model.mode = SelectionMode::Line;
@@ -682,9 +663,6 @@ mod tests {
 
     #[test]
     fn test_wide_character_handling() {
-        // Grid with wide characters and wide continuation cells
-        // Row 0: "Hi 你好 world"
-        // 'H' (w=1), 'i' (w=1), ' ' (w=1), '你' (w=2), continuation (w=0), '好' (w=2), continuation (w=0)
         let row: Vec<GridCell> = vec![
             GridCell::new('H', 1),
             GridCell::new('i', 1),
@@ -706,7 +684,6 @@ mod tests {
         let extracted = model.extract_text(&grid);
         assert_eq!(extracted, "Hi 你好 !");
 
-        // Select only the wide characters
         model.start = (3, 0);
         model.end = (6, 0);
         let wide_only = model.extract_text(&grid);
@@ -743,15 +720,12 @@ mod tests {
 
         let mut clicked = SelectionModel::new();
         clicked.on_press((3, 0), SelectionMode::Normal, 80);
-        // During drag, start == end is not considered empty
         assert!(!clicked.is_empty());
 
-        // Releasing without moving clears selection
         clicked.on_release();
         assert!(clicked.is_empty());
         assert_eq!(clicked.extract_text_from_lines(&lines), "");
 
-        // Out of bounds selection
         let mut oob = SelectionModel::new();
         oob.active = true;
         oob.start = (0, 100);
@@ -766,27 +740,21 @@ mod tests {
         model.start = (5, 1);
         model.end = (10, 3);
 
-        // Before selection
         assert!(!model.contains(4, 1));
         assert!(!model.contains(10, 0));
 
-        // Start row
         assert!(model.contains(5, 1));
         assert!(model.contains(20, 1));
 
-        // Middle row
         assert!(model.contains(0, 2));
         assert!(model.contains(50, 2));
 
-        // End row
         assert!(model.contains(0, 3));
         assert!(model.contains(10, 3));
         assert!(!model.contains(11, 3));
 
-        // After selection
         assert!(!model.contains(0, 4));
 
-        // Inactive selection
         model.clear();
         assert!(!model.contains(5, 1));
     }

@@ -764,8 +764,15 @@ their actions with "not implemented yet" toasts. This is the plan for connecting
    layers in `view`, and overlay key routing that swallows keys while an overlay is open (KeyUp
    gated the same way). 104 tests. Gaps are listed in `PROGRESS.md`: no scroll-to-match, the
    palette's `text_input` is never focused, `SearchToggleWrap` is cosmetic, floats are state-only.
-2. **Content panes**: the `PaneEntry`/`ContentPane` refactor, cell rendering in `panes_grid`, the
-   three entry points, and key routing to a focused content pane.
+2. **Content panes — landed**: `PaneEntry { Term, Content }` /
+   `ContentPane { Preview, Ai, Visualizer }`, content ids from the same `PaneId` counter (grid
+   payload untouched), terminal-only paths matching on `Term` (`term_handles()`), per-cell content
+   rendering in `panes_grid`, the three entry points, and key routing that gives a focused content
+   pane the press before the terminal path. Two behaviours worth knowing: the AI pane's own
+   `text_input` messages are dropped so the key path is the single writer (otherwise a keystroke is
+   applied twice when the field has focus — the cost is that pasting into it does nothing), and AI
+   replies are polled on the tick because a std `mpsc::Receiver` is neither `Hash` nor `Sync` and
+   cannot back an iced subscription. 111 tests.
 3. **Selection — smaller than planned**: no core change is needed (decision 2). What is left is
    painting the highlight in `pane_canvas` from `RowIteration::selection()` once per row, and
    deleting the redundant `selection.rs`. Copy already works (`Ctrl+Shift+C` → `Action::Copy` →

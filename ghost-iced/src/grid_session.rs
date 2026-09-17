@@ -69,8 +69,6 @@ fn node_of(
                 panes: cell.panes.iter().map(|pane| index_of(*pane)).collect(),
                 active: cell.active,
             },
-            // A cell whose pane is gone — a tab left without a live pane — reads
-            // back as the layout crate's empty-tree sentinel.
             None => Node::Leaf { pane: usize::MAX },
         },
         pane_grid::Node::Split {
