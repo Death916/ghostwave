@@ -11,7 +11,9 @@ use iced::{
 use libghostty_vt::key;
 
 mod app;
+pub mod ai;
 mod chrome;
+pub mod chrome_widgets;
 mod config;
 mod fonts;
 #[allow(dead_code)]
@@ -19,11 +21,17 @@ mod grid_session;
 mod input;
 mod keys;
 mod measure;
+pub mod palette;
 mod pane;
 mod pane_canvas;
 mod panes_grid;
+pub mod preview;
 mod pty_bridge;
+pub mod scratchpad;
+pub mod search_overlay;
+pub mod selection;
 mod tick;
+pub mod visualizer;
 
 use app::AppState;
 use pane::SharedPane;
@@ -36,7 +44,7 @@ const FONT_BYTES: &[u8] = include_bytes!("../../assets/JetBrainsMono-Medium.ttf"
 const START_WINDOW: Size = Size::new(1200.0, 800.0);
 
 /// Events the iced runtime delivers, plus the mouse events the canvas synthesizes.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Message {
     /// Carries pty output already coalesced by the pane's reader thread.
     Output {
@@ -117,7 +125,7 @@ impl App {
     }
 
     fn title(&self) -> String {
-        if self.state.iced_config.dynamic_title != crate::config::DynamicTitleMode::Off {
+        if self.state.config.dynamic_title != crate::config::DynamicTitleMode::Off {
             let tab = self.state.current();
             if let Some(pane) = tab.pane(tab.active) {
                 let guard = pane.lock().unwrap();

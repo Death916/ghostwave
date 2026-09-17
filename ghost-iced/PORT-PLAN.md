@@ -695,8 +695,29 @@ Modern terminal emulators dynamically reflect the currently executing foreground
 - Lives in `ghost-iced/src/config.rs` (`IcedConfig`) today, read from the same `~/.config/ghostwave/config.toml`. **The `src/**` freeze was lifted by the owner on 2026-09-17**: move these keys into the shared `Config` as additive `#[serde(default)]` fields so the macroquad build still compiles and simply ignores them, keeping one config file as the source of truth. The iced-only overlay was a workaround for the freeze, not the target design.
 
 ### Next Milestones
-- **M5a Polish & Verification**: Text baseline offset fixed (`run.baseline_y - measure::ascent(font_px)`), cell backgrounds drawn before text runs, dynamic title caching.
-- **M5b (Next Up)**: Chrome and overlays as iced widgets (`stack`, `container`, `text_input`, `pick_list`) — replacing hand-painted chrome geometry and canvas measuring.
-- **M6**: Mouse selection & clipboard integration, search mode overlay, command palette.
-- **M7**: Performance benchmarking vs macroquad reference.
+- **M5a Polish & Verification**: Text baseline offset fixed (`run.baseline_y - measure::ascent(font_px)`), cell backgrounds drawn before text runs, dynamic title caching (Landed).
+- **M5b / M5c / M6 (Landed)**:
+  - Native iced chrome widgets (`chrome_widgets.rs`), floating scratchpad manager (`scratchpad.rs`).
+  - Command palette (`palette.rs`), scrollback search overlay (`search_overlay.rs`), mouse selection & clipboard (`selection.rs`).
+  - Content panes: Synthwave 3D visualizer (`visualizer.rs`), file preview (`preview.rs`), AI assistant chat (`ai.rs`).
+- **M7**: Performance benchmarking and final packaging.
+
+## 19. M5b, M5c & M6 Landing (2026-09-17)
+
+The non-iced / macroquad front-end is no longer a consideration or constraint; iced 0.14 is the sole target.
+
+### Landed Modules in `ghost-iced/src/`:
+1. **`chrome_widgets.rs`**: Native iced 0.14 widgets for the tab bar (active/inactive styling, click-to-focus `Message::FocusTab`, inline `text_input` rename), status bar (mode pill, keybind hints, live 2-harmonic wave visualizer canvas, sync panes chip, theme badge), and floating toast overlay box.
+2. **`scratchpad.rs`**: Floating pane overlay and F12 / `Ctrl+~` scratchpad manager with geometry presets (`TopDrawer`, `Centered`), window boundary clamping, Zellij-style float cycling (`e`/`E`), and origin re-embedding.
+3. **`palette.rs`**: Modal command palette overlay with action inventory from `ghostwave::keymap::Action`, installed themes, fuzzy matching, prefix commands (`open`, `ssh`, `ds`), and keyboard navigation.
+4. **`search_overlay.rs`**: Scrollback search bar overlay with case-sensitivity (`[Aa]`) and regex (`[.*]`) toggles, match count formatting, and bidirectional terminal search synchronization.
+5. **`selection.rs`**: Terminal mouse selection gestures (`Normal`, double-click `Word`, triple-click `Line`), pixel-to-cell coordinate conversions, multi-line text extraction respecting wide characters and column gaps, and native in-process clipboard integration via `arboard`.
+6. **`visualizer.rs`**: Ghostwave synthwave screensaver & visualizer ported to an iced `canvas::Program` with rolling 3D perspective grid, undulating neon spectral mountain peaks, matrix cyber rain, and interactive palette switching (`GhostNeon`, `MatrixGreen`, `SolarAmber`, `AbyssIce`).
+7. **`preview.rs`**: File preview pane for `Text` (line numbers, monospace font), `Dir` (sorted directory listing with badges), `Binary` (16-byte hex dump and ASCII sidebar), and `Image` (interactive canvas viewer with pan/zoom and transparency checkerboard).
+8. **`ai.rs`**: AI assistant chat pane using native iced widgets (cards for User, Assistant, System, thinking indicator, prompt `text_input`, send button) backed by non-blocking background completion requests via `ureq`.
+
+### Verification:
+- `cargo test --manifest-path ghost-iced/Cargo.toml`: **102 passed, 0 failed, 0 warnings**.
+- `cargo build --release --manifest-path ghost-iced/Cargo.toml`: **Built cleanly in release mode**.
+
 

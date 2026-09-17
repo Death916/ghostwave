@@ -917,3 +917,25 @@ remote connection switcher (Ctrl+G — clashes with zellij locked).
 - **Code Standards**:
   - Pure rustdoc in source files; technical rationale documented in `PORT-PLAN.md` and `PROGRESS.md`.
   - 23/23 unit and integration tests passing warning-free.
+
+## 2026-09-17: iced front-end M5b (chrome widgets), M5c (scratchpad), and M6 (overlays & content panes)
+- **Native Chrome Widgets (`chrome_widgets.rs`)**:
+  - Tab bar: native iced chips with active/inactive styling, click-to-focus `Message::FocusTab`, and inline `text_input` tab renaming.
+  - Status bar: mode pill, keybind hint line, theme badge, sync chip, and live reactive 2-harmonic wave visualizer canvas.
+  - Floating toast notification overlay.
+- **Floating Panes & F12 Scratchpad (`scratchpad.rs`)**:
+  - Float manager with geometry presets (`TopDrawer`, `Centered`), window boundary clamping, Zellij-style float cycling (`e`/`E`), and origin re-embedding.
+- **Command Palette (`palette.rs`)**:
+  - Modal overlay with action inventory from `ghostwave::keymap::Action`, installed themes, fuzzy matching, prefix commands (`open`, `ssh`, `ds`), and keyboard navigation.
+- **Scrollback Search Overlay (`search_overlay.rs`)**:
+  - Compact search overlay widget with regex and case toggles, match counters, and bidirectional terminal search synchronization.
+- **Mouse Selection & Clipboard (`selection.rs`)**:
+  - Normal, word, and line selection gestures, coordinate translations, text extraction with wide character handling, and native Wayland/X11 clipboard operations via `arboard`.
+- **Content Panes Ported to Iced 0.14**:
+  - **Visualizer (`visualizer.rs`)**: 3D rolling perspective grid, neon spectral mountain peaks, cyber rain particles, and palette rotation (`GhostNeon`, `MatrixGreen`, `SolarAmber`, `AbyssIce`).
+  - **Preview (`preview.rs`)**: Text, directory, hex dump binary, and interactive image canvas viewer with zoom/pan.
+  - **AI Chat (`ai.rs`)**: OpenAI-compatible completion assistant with message cards, busy indicator, and non-blocking worker thread.
+- **Verification**:
+  - `ghost-iced`: 102/102 unit tests passing cleanly with 0 warnings.
+  - Release binary built cleanly (`cargo build --release --manifest-path ghost-iced/Cargo.toml`).
+

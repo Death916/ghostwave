@@ -157,7 +157,7 @@ fn grid<'a>(
     let (cell, font_px, padding) = (state.cell, state.config.font_size, state.config.padding);
     let inset = inset(frames);
     let font = fonts::primary();
-    let replace_title = state.iced_config.dynamic_title != crate::config::DynamicTitleMode::Off;
+    let replace_title = state.config.dynamic_title != crate::config::DynamicTitleMode::Off;
 
     PaneGrid::new(&tab.grid, move |_cell, payload: &GridPane, _maximized| {
         // The cell's payload names panes by identity; the pane layer works with

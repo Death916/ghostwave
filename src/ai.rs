@@ -217,7 +217,7 @@ impl AiPane {
     }
 }
 
-fn request_chat(config: &AiConfig, history: &[(String, String)]) -> Result<String, String> {
+pub fn request_chat(config: &AiConfig, history: &[(String, String)]) -> Result<String, String> {
     let key = std::env::var(&config.api_key_env).map_err(|_| {
         format!("AI: set ${} (or configure config.ai.api_key_env)", config.api_key_env)
     })?;
