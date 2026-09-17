@@ -23,8 +23,7 @@ pub const TAB_MENU_ITEM_H: f32 = 24.0;
 pub const TAB_MENU_PAD: f32 = 8.0;
 pub const TAB_MENU_ITEMS: usize = 2;
 
-pub const TAB_BAR_H: f32 = 30.0;
-pub const STATUS_BAR_H: f32 = 26.0;
+pub use crate::theme::{STATUS_BAR_H, TAB_BAR_H};
 
 /// Debug trace to stdout, ON BY DEFAULT (remote-session bring-up phase —
 /// the user runs the debug binary from a terminal and expects to see the

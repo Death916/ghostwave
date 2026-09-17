@@ -207,6 +207,9 @@ impl Tab {
     fn tombstone(&mut self, id: PaneId) {
         if let Some(index) = self.index_of(id) {
             self.panes[index] = None;
+            // The pane is gone, so its recorded spawn metadata goes too; nothing
+            // else reads it once no entry points at it.
+            crate::pane::forget_meta(id);
         }
     }
 

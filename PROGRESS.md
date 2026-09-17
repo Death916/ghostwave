@@ -1039,6 +1039,16 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   Lesson: when a framework's rendering surprises you, read the framework's own source and how its own
   widgets do the same job (iced's text editor renders its selection as rectangles; iced's canvas draws
   text above shapes) before guessing at colours, ordering or caching.
+- **Retirement, step by step.** The archive is cut and pushed: branch `macroquad-archive` (one commit on
+  top of `8c40aaf` adding `ARCHIVE.md`) and annotated tag `macroquad-final` → `8c40aaf`, verified on the
+  remote, at a commit a fresh worktree proved green (66 + 66 + 1 + 6 tests). That kills the only
+  irreversible risk in the plan. `STATUS_BAR_H`/`TAB_BAR_H` moved out of `src/app.rs` into
+  `ghostwave::theme` (the file the cut deletes), with `app.rs` re-exporting them so the macroquad build
+  still compiles and `chrome.rs` importing from the new home; and the port's `forget_meta` is now called
+  from `Tab::tombstone`, the single funnel a closed pane passes through. Owner-confirmed in the running
+  iced build: selection, search, F12, sessions, floats, **visualizer and AI pane**. Still unexercised by
+  hand before the presentation files are deleted: the preview pane, kitty graphics (inline images),
+  middle-click paste, hidden/background panes, and the remote/SSH path (deliberately last).
 - **Sessions work in the port, and the deadlock that hid them was the pane lock.** Saving read each
   pane's `program`/`args`/`cwd`/`remote`/log name back through the pane's *own* mutex — the same lock the
   pty path takes — so the first pane locked and never returned: every session test hung, and the same

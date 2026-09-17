@@ -2,7 +2,7 @@
 //! hints, theme name, sync chip, ghostwave visualizer) and toast, drawn in that
 //! order back to front after the panes so the chrome sits on top of them.
 
-use ghostwave::app::{STATUS_BAR_H, TAB_BAR_H};
+use ghostwave::theme::{STATUS_BAR_H, TAB_BAR_H};
 use ghostwave::theme::Rgb;
 use ghostwave::theme::Theme as GhostTheme;
 use iced::widget::canvas::{Frame, Path, Stroke, Text as CanvasText};
