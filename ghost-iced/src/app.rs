@@ -17,6 +17,7 @@ use ghostwave::theme::{self, Theme};
 use iced::Size;
 use iced::widget::pane_grid::{self, Axis, Split};
 
+use crate::config::IcedConfig;
 use crate::pane::{Pane, PaneId, SharedPane};
 use crate::panes_grid;
 
@@ -104,9 +105,9 @@ impl Tab {
             return self.name.clone();
         }
         if let Some(pane) = self.pane(self.active) {
-            let title = pane.lock().unwrap().term.title();
-            if !title.is_empty() {
-                return title;
+            let guard = pane.lock().unwrap();
+            if !guard.cached_title.is_empty() {
+                return guard.cached_title.clone();
             }
         }
         generated
@@ -305,6 +306,7 @@ pub struct AppState {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     pub config: Config,
+    pub iced_config: IcedConfig,
     pub theme: Theme,
     pub cell: CellDims,
     pub show_frames: bool,
@@ -343,10 +345,12 @@ pub enum TickRate {
 impl AppState {
     pub fn new(config: Config, cell: CellDims, window: Size) -> Result<Self> {
         let theme = theme::by_name(&config.theme);
+        let iced_config = IcedConfig::load();
         let mut state = Self {
             tabs: Vec::new(),
             active_tab: 0,
             config,
+            iced_config,
             theme,
             cell,
             show_frames: true,
@@ -381,7 +385,24 @@ impl AppState {
             }
         }
 
+        state.refresh_titles();
         Ok(state)
+    }
+
+    /// Refreshes dynamic process and directory titles across all panes in all tabs.
+    pub fn refresh_titles(&mut self) {
+        if self.iced_config.dynamic_title != crate::config::DynamicTitleMode::Off {
+            for tab in &self.tabs {
+                for pane_opt in &tab.panes {
+                    if let Some(pane) = pane_opt {
+                        pane.lock().unwrap().update_title(
+                            self.iced_config.dynamic_title,
+                            self.iced_config.pane_title_format,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Forks a pty pane for this front-end, themed but not yet in any tab.
@@ -441,14 +462,18 @@ impl AppState {
                 self.toast = None;
             }
         }
+
+        self.refresh_titles();
     }
 
     /// `Fast` while a toast or an energized wave is on screen, `Slow` for an idle
-    /// wave, otherwise `Off`.
+    /// wave or dynamic title polling, otherwise `Off`.
     pub fn tick_rate(&self) -> TickRate {
         if self.toast.is_some() || (self.config.visual_wave && self.wave_energy > 0.15) {
             TickRate::Fast
         } else if self.config.visual_wave {
+            TickRate::Slow
+        } else if self.iced_config.dynamic_title != crate::config::DynamicTitleMode::Off {
             TickRate::Slow
         } else {
             TickRate::Off

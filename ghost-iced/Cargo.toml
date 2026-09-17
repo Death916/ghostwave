@@ -22,6 +22,8 @@ iced = { version = "0.14", features = ["canvas"] }
 libghostty-vt = { version = "0.2.1" }
 nix = { version = "0.31", features = ["term", "fs", "signal", "process", "user", "ioctl", "poll"] }
 fontdue = "0.9"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [profile.release]
 lto = true

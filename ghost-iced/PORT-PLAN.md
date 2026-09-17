@@ -656,16 +656,34 @@ Verification while the pane layer is rebuilt: the pane operations are driven thr
 focused via `State::adjacent`/`maximized`, and that a stack's payload cycles), plus a real-window
 run for the interactions a test cannot press: click focus, drag-resize, drag-move.
 
-## 18. Dynamic Pane Titles & Process Tracking (Upcoming)
+## 18. Dynamic Pane Titles & Process Tracking
 
-Modern terminal emulators dynamically reflect the currently executing foreground command in the pane's title band (e.g., `vim`, `cargo build`, `python`), with configurable formatting and fallback hierarchy.
+Modern terminal emulators dynamically reflect the currently executing foreground command in the pane's title band (e.g., `vim`, `lazygit`, `python`), with configurable formatting and fallback hierarchy.
 
-### Mechanisms
-1. **Foreground process tracking**: Query the pane's pty foreground process group using `libc::tcgetpgrp(pty_fd)` and read the command name from `/proc/<pid>/comm` (or `/proc/<pid>/cmdline`).
-2. **OSC 0 / OSC 2 Window Title Sequences**: Capture title changes emitted by interactive shells or CLI utilities via terminal escape sequences.
-3. **Fallback hierarchy**: Running process command → OSC title → current directory (`pwd`) → fallback label (`pane N`).
+### Implementation Architecture
+1. **Foreground process tracking**:
+   - Query the pane's pty foreground process group using `nix::unistd::tcgetpgrp(pty_fd)` and read the command name from `/proc/<pid>/comm`.
+   - Rationale: If the foreground process group equals the login shell's own PID, `foreground_process()` yields `None` so the active prompt, directory, or OSC title is displayed rather than the bare shell binary name (e.g. `fish`).
+2. **Path condensation**:
+   - Rationale: Condenses paths starting with `$HOME` into `~/...` (exact match becomes `~`, subdirectories become `~/path`) for concise display in title bands.
+3. **Perf & View Purity**:
+   - `display_title()` / syscall inspection (`tcgetpgrp`, `/proc` reads) is strictly decoupled from the `view(&self)` render path (`Tab::label`, `cell_label`, `App::title`).
+   - Title evaluation is performed on the tick (via `AppState::tick`, running at the 8 FPS idle tier or energized wave speed) and cached in `Pane::cached_title`.
+   - `view(&self)` only reads `cached_title()`, guaranteeing zero syscalls and zero allocations during frame rendering.
+4. **Pane & Window Title Replacement**:
+   - When dynamic titles are active, the dynamic title replaces `pane N` entirely (e.g. `lazygit` or `lazygit [1/2]` when stacked). If the title is empty or dynamic titles are disabled, formatting cleanly falls back to `pane N`.
+   - The window title suffix (`{title} — ghostwave`) is tied to the same configuration knob; when `dynamic_title = "off"`, it remains `"ghostwave (iced)"`.
+5. **Wheel Scroll Normalization**:
+   - Pixel scroll deltas delivered by winit/Wayland/libinput are divided by `(cell.h as f32).max(1.0)` rather than a hardcoded constant, ensuring continuous wheel increments match font cell line steps without truncation.
 
-### Configuration Options
-- `dynamic_title = true` (default: `true`).
-- `pane_title_format`: `"process"` | `"pwd"` | `"both"` (e.g., `pane 1 — vim [~/code]` vs `pane 1 — ~/code`).
+### Configuration Options (`~/.config/ghostwave/config.toml`)
+- `dynamic_title`: `"process"` (default), `"osc"` / `"osc_only"`, or `"off"` (boolean `true`/`false` also accepted).
+- `pane_title_format`: `"process"` (default: command name, fallback to directory/OSC), `"pwd"` (prioritize directory), or `"both"` (e.g. `lazygit (~/repo)`).
+- Loaded in iced front-end via `IcedConfig` overlay without modifying frozen `src/**`.
+
+### Next Milestones
+- **M5a Polish & Verification**: Text baseline offset fixed (`run.baseline_y - measure::ascent(font_px)`), cell backgrounds drawn before text runs, dynamic title caching.
+- **M5b (Next Up)**: Chrome and overlays as iced widgets (`stack`, `container`, `text_input`, `pick_list`) — replacing hand-painted chrome geometry and canvas measuring.
+- **M6**: Mouse selection & clipboard integration, search mode overlay, command palette.
+- **M7**: Performance benchmarking vs macroquad reference.
 

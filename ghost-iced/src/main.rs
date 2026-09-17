@@ -12,6 +12,7 @@ use libghostty_vt::key;
 
 mod app;
 mod chrome;
+mod config;
 mod fonts;
 #[allow(dead_code)]
 mod grid_session;
@@ -116,11 +117,14 @@ impl App {
     }
 
     fn title(&self) -> String {
-        let tab = self.state.current();
-        if let Some(pane) = tab.pane(tab.active) {
-            let title = pane.lock().unwrap().term.title();
-            if !title.is_empty() {
-                return title;
+        if self.state.iced_config.dynamic_title != crate::config::DynamicTitleMode::Off {
+            let tab = self.state.current();
+            if let Some(pane) = tab.pane(tab.active) {
+                let guard = pane.lock().unwrap();
+                let title = guard.cached_title();
+                if !title.is_empty() {
+                    return format!("{title} — ghostwave");
+                }
             }
         }
         "ghostwave (iced)".to_string()

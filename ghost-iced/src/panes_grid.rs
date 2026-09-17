@@ -157,6 +157,7 @@ fn grid<'a>(
     let (cell, font_px, padding) = (state.cell, state.config.font_size, state.config.padding);
     let inset = inset(frames);
     let font = fonts::primary();
+    let replace_title = state.iced_config.dynamic_title != crate::config::DynamicTitleMode::Off;
 
     PaneGrid::new(&tab.grid, move |_cell, payload: &GridPane, _maximized| {
         // The cell's payload names panes by identity; the pane layer works with
@@ -214,7 +215,7 @@ fn grid<'a>(
             };
             let label = handle
                 .as_ref()
-                .map(|handle| pane_canvas::cell_label(handle, position, stack_info))
+                .map(|handle| pane_canvas::cell_label(handle, position, stack_info, replace_title))
                 .unwrap_or_default();
             content = content.title_bar(TitleBar::new(label_band(&label, frame_color, font, theme)));
         }
@@ -377,13 +378,13 @@ impl canvas::Program<Message> for PaneCanvas {
                 let point = cursor.position_over(bounds)?;
                 // libghostty takes the wheel as a positive-up delta and decides
                 // for itself whether that is application mouse reporting or a
-                // viewport scroll. On Wayland/Linux, winit delivers pixel deltas
-                // with typical steps of ~15px; normalize so single discrete clicks
-                // never truncate to 0.
+                // viewport scroll. When winit delivers pixel deltas, normalize by
+                // the cell height so single discrete notches never truncate to 0.
+                let line_step = (self.cell.h as f32).max(1.0);
                 let dy = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => *y,
                     mouse::ScrollDelta::Pixels { y, .. } => {
-                        let notches = *y / 15.0;
+                        let notches = *y / line_step;
                         if notches.abs() > 0.0 && notches.abs() < 1.0 {
                             notches.signum()
                         } else {
@@ -508,36 +509,45 @@ mod tests {
     fn stack_label_string_formatting() {
         use crate::pane_canvas::format_pane_label;
 
-        // Single pane without title
-        assert_eq!(format_pane_label("", 1, "", None), "pane 1");
-
-        // Single pane with title
+        // With replace = false (legacy / static pane prefix)
+        assert_eq!(format_pane_label("", 1, "", None, false), "pane 1");
         assert_eq!(
-            format_pane_label("term", 2, "fish", None),
+            format_pane_label("term", 2, "fish", None, false),
             "term 2 — fish"
         );
-
-        // Stack with 1 element is treated as non-stack (no [1/1])
         assert_eq!(
-            format_pane_label("pane", 1, "top", Some((0, 1))),
+            format_pane_label("pane", 1, "top", Some((0, 1)), false),
             "pane 1 — top"
         );
-
-        // Stack with 2 members, first active (0)
         assert_eq!(
-            format_pane_label("pane", 1, "sh", Some((0, 2))),
+            format_pane_label("pane", 1, "sh", Some((0, 2)), false),
             "pane 1 [1/2] — sh"
         );
-
-        // Stack with 3 members, second active (1)
         assert_eq!(
-            format_pane_label("pane", 2, "vim", Some((1, 3))),
+            format_pane_label("pane", 2, "vim", Some((1, 3)), false),
             "pane 2 [2/3] — vim"
         );
-
-        // Stack with 3 members without title
         assert_eq!(
-            format_pane_label("", 1, "", Some((2, 3))),
+            format_pane_label("", 1, "", Some((2, 3)), false),
+            "pane 1 [3/3]"
+        );
+
+        // With replace = true (dynamic process titles replace pane name)
+        assert_eq!(format_pane_label("", 1, "", None, true), "pane 1");
+        assert_eq!(
+            format_pane_label("term", 2, "fish", None, true),
+            "fish"
+        );
+        assert_eq!(
+            format_pane_label("pane", 1, "sh", Some((0, 2)), true),
+            "sh [1/2]"
+        );
+        assert_eq!(
+            format_pane_label("pane", 2, "vim", Some((1, 3)), true),
+            "vim [2/3]"
+        );
+        assert_eq!(
+            format_pane_label("", 1, "", Some((2, 3)), true),
             "pane 1 [3/3]"
         );
     }

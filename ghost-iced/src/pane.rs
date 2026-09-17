@@ -10,6 +10,7 @@ use ghostwave::term::{CellDims, TermPane};
 use libghostty_vt::key::{self, Mods};
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 
+use crate::config::{DynamicTitleMode, PaneTitleFormat};
 use crate::pty_bridge::{self, PtyRxSlot};
 
 /// Crate-wide alias for results that box their error.
@@ -56,6 +57,8 @@ pub struct Pane {
     pub last_bounds: Option<iced::Rectangle>,
     /// The pane's pty output stream, already bridged into iced.
     pub rx: PtyRxSlot,
+    /// Cached dynamic title updated on tick/pty events.
+    pub cached_title: String,
 }
 
 impl Pane {
@@ -108,6 +111,7 @@ impl Pane {
             dirty: true,
             last_bounds: None,
             rx: pty_bridge::spawn(id, rx),
+            cached_title: String::new(),
         })
     }
 
@@ -242,6 +246,141 @@ impl Pane {
         self.term.flush_response();
         self.dirty = true;
     }
+
+    /// Returns the foreground process command running in this pane, if detectable.
+    pub fn foreground_process(&self) -> Option<String> {
+        let pty = self.term.pty.as_ref()?;
+        let fd = pty.as_raw_fd();
+        if fd < 0 {
+            return None;
+        }
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let fg_pid = nix::unistd::tcgetpgrp(borrowed).ok()?;
+        if fg_pid.as_raw() <= 0 {
+            return None;
+        }
+        let shell_pid = self.term.child.as_ref().and_then(|c| c.pid());
+        if shell_pid.is_some_and(|sp| sp == fg_pid) {
+            return None;
+        }
+
+        let comm_path = format!("/proc/{}/comm", fg_pid.as_raw());
+        let comm = std::fs::read_to_string(&comm_path).ok()?;
+        let comm = comm.trim();
+        if comm.is_empty() {
+            None
+        } else {
+            Some(comm.to_string())
+        }
+    }
+
+    /// Detects current working directory of this pane, with tilde replacement for $HOME.
+    pub fn current_dir(&self) -> Option<String> {
+        let osc_pwd = self.term.pwd();
+        let path = if !osc_pwd.is_empty() {
+            Some(osc_pwd)
+        } else if let Some(pid) = self.term.child.as_ref().and_then(|c| c.pid()) {
+            std::fs::read_link(format!("/proc/{}/cwd", pid.as_raw()))
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        } else {
+            None
+        }?;
+
+        Some(shorten_home(&path))
+    }
+
+    /// Returns the cached dynamic title for this pane.
+    pub fn cached_title(&self) -> &str {
+        &self.cached_title
+    }
+
+    /// Recomputes and caches the dynamic title for this pane.
+    pub fn update_title(&mut self, mode: DynamicTitleMode, format: PaneTitleFormat) {
+        if mode == DynamicTitleMode::Off {
+            self.cached_title.clear();
+            return;
+        }
+
+        let osc_title = self.term.title();
+        let fg_cmd = if mode == DynamicTitleMode::Process {
+            self.foreground_process()
+        } else {
+            None
+        };
+        let dir = self.current_dir();
+
+        self.cached_title = match format {
+            PaneTitleFormat::Process => {
+                if let Some(cmd) = fg_cmd {
+                    cmd
+                } else if !osc_title.is_empty() {
+                    osc_title
+                } else {
+                    dir.unwrap_or_default()
+                }
+            }
+            PaneTitleFormat::Pwd => {
+                dir.unwrap_or_else(|| {
+                    if let Some(cmd) = fg_cmd {
+                        cmd
+                    } else {
+                        osc_title
+                    }
+                })
+            }
+            PaneTitleFormat::Both => match (fg_cmd, dir) {
+                (Some(cmd), Some(d)) => format!("{cmd} ({d})"),
+                (Some(cmd), None) => cmd,
+                (None, Some(d)) => {
+                    if !osc_title.is_empty() && osc_title != d {
+                        format!("{osc_title} — {d}")
+                    } else {
+                        d
+                    }
+                }
+                (None, None) => osc_title,
+            },
+        };
+    }
+
+    /// Dynamic title computed on demand; prefer [`Self::cached_title`] in rendering paths.
+    #[allow(dead_code)]
+    pub fn display_title(&self) -> String {
+        if !self.cached_title.is_empty() {
+            return self.cached_title.clone();
+        }
+        let osc_title = self.term.title();
+        let fg_cmd = self.foreground_process();
+        let dir = self.current_dir();
+
+        match (fg_cmd, dir) {
+            (Some(cmd), Some(d)) => format!("{cmd} ({d})"),
+            (Some(cmd), None) => cmd,
+            (None, Some(d)) => {
+                if !osc_title.is_empty() && osc_title != d {
+                    format!("{osc_title} — {d}")
+                } else {
+                    d
+                }
+            }
+            (None, None) => osc_title,
+        }
+    }
+}
+
+/// Condenses a path starting with `$HOME` into `~/...`.
+pub fn shorten_home(path: &str) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if path == home {
+            return "~".to_string();
+        } else if let Some(rel) = path.strip_prefix(&home) {
+            if rel.starts_with('/') {
+                return format!("~{rel}");
+            }
+        }
+    }
+    path.to_string()
 }
 
 /// Cell metrics from the embedded font: `cell_w = ceil('M' advance)`,
@@ -258,5 +397,19 @@ pub fn cell_dims(font_bytes: &[u8], font_px: f32, row_gap: f32) -> CellDims {
         w: (font.metrics('M', font_px).advance_width).max(1.0).ceil() as u32,
         h: (ascent + descent + row_gap).max(8.0).ceil() as u32,
         baseline: ascent + row_gap / 2.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shorten_home() {
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(shorten_home(&home), "~");
+            assert_eq!(shorten_home(&format!("{home}/foo/bar")), "~/foo/bar");
+            assert_eq!(shorten_home("/tmp/foo"), "/tmp/foo");
+        }
     }
 }

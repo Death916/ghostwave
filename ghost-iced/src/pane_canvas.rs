@@ -167,6 +167,7 @@ pub fn format_pane_label(
     index: usize,
     title: &str,
     stack: Option<(usize, usize)>,
+    replace: bool,
 ) -> String {
     let base_name = if name.is_empty() { "pane" } else { name };
     let stack_suffix = match stack {
@@ -175,16 +176,23 @@ pub fn format_pane_label(
     };
     if title.is_empty() {
         format!("{base_name} {index}{stack_suffix}")
+    } else if replace {
+        format!("{title}{stack_suffix}")
     } else {
         format!("{base_name} {index}{stack_suffix} — {title}")
     }
 }
 
 /// Returns a cell's label string from its pane handle, 1-based position and optional stack info.
-pub fn cell_label(pane: &SharedPane, index: usize, stack: Option<(usize, usize)>) -> String {
+pub fn cell_label(
+    pane: &SharedPane,
+    index: usize,
+    stack: Option<(usize, usize)>,
+    replace: bool,
+) -> String {
     let guard = pane.lock().unwrap();
-    let t = &guard.term;
-    format_pane_label(&t.name, index, &t.title(), stack)
+    let title = guard.cached_title();
+    format_pane_label(&guard.term.name, index, title, stack, replace)
 }
 
 /// Paints one pane's terminal content into `rect`, in frame-local coordinates.
@@ -291,6 +299,10 @@ pub(crate) fn paint_pane(
                 strikethrough = style.strikethrough;
             }
 
+            if let Some(c_bg) = cell_bg {
+                frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), c_bg);
+            }
+
             // Text: extend the current run when colour and baseline match,
             // otherwise flush and start a new one. A cell without a glyph (a
             // wide character's continuation, an empty cell) BREAKS the run: the
@@ -317,10 +329,6 @@ pub(crate) fn paint_pane(
                         text: text_buf.clone(),
                     });
                 }
-            }
-
-            if let Some(c_bg) = cell_bg {
-                frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), c_bg);
             }
 
             if underline {
@@ -388,7 +396,7 @@ fn draw_run(frame: &mut Frame, run: &TextRun, font_px: f32, font: Font) {
     }
     frame.fill_text(CanvasText {
         content: run.text.clone(),
-        position: Point::new(run.x, run.baseline_y),
+        position: Point::new(run.x, run.baseline_y - crate::measure::ascent(font_px)),
         color: run.color,
         size: Pixels(font_px),
         font,

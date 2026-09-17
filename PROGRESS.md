@@ -207,11 +207,18 @@ contained. 19/19 tests pass, `ghost-iced` compiles warning-free.
   the discrepancy where newly spawned panes showed pitch-black (`#000000`) backgrounds. `apply_theme`
   now calls `set_default_fg_color` and `set_default_bg_color` as independent operations, and `AppState::apply_terminal_colors()`
   re-syncs all live panes on split.
-- Dynamic process pane titles added to plan: added §18 to `PORT-PLAN.md` for foreground process tracking
-  (`tcgetpgrp` + `/proc/<pid>/comm`) and OSC title sequences, with `dynamic_title` / `pane_title_format` configuration.
+- Dynamic process pane & tab titles implemented:
+  - `Pane::foreground_process()` queries `nix::unistd::tcgetpgrp` on the pty master fd and extracts the
+    foreground command name from `/proc/<pid>/comm`.
+  - Distinguishes active commands (`vim`, `cargo`, `htop`, `python`, etc.) from the interactive login shell,
+    cleanly displaying the command name when executing and directory when idling at prompt.
+  - `Pane::current_dir()` detects working directory via OSC 7 or `/proc/<pid>/cwd` and condenses `$HOME` to `~`.
+  - Pane title band (`cell_label`), tab bar label (`Tab::label`), and window title (`App::title`) all dynamically
+    update to reflect the active command and directory.
+  - All 23/23 unit and integration tests pass.
 - `ghost-iced` compiles completely warning-free on both debug and release profiles.
 
-**Next**: M5b (chrome and overlays as widgets — tab bar, status bar, palette, toast), dynamic process pane titles, and M4 (tabs and sessions save/restore).
+**Next**: Local terminal features parity — M6 (selection, copy/paste, clipboard), search overlay / search mode, and command palette. (Sessions & SSH held for later per user preference).
 
 ### Idle GPU, part 2 (branch `perf/idle-gpu-2`) — idle frame tier 30 → 8 FPS
 User: "gpu usage is pretty high even when idle still" after the earlier adaptive
@@ -890,3 +897,20 @@ remote connection switcher (Ctrl+G — clashes with zellij locked).
 - rustc 1.95.0 in nixpkgs (crate needs ≥1.90).
 - To screenshot for QA: grim/hyprctl may exist — check before claiming
   visual verification.
+
+## 2026-09-17: iced front-end vertical alignment, dynamic title replacement, and view purity
+- **Text & Decoration Vertical Alignment Fix (`pane_canvas.rs`)**:
+  - Root cause: `align_y: Vertical::Top` was passed `run.baseline_y` (`y + cell.baseline`), positioning the top of glyphs at the row baseline and pushing text downward by `ascent` (~14.5px). This pushed text across row boundaries, caused underlines to slice through text, and created highlight gaps.
+  - Fix: converted baseline to iced's top-left text origin with `run.baseline_y - crate::measure::ascent(font_px)`, cleanly centering glyphs vertically in `[y, y + cell.h]`. Cell backgrounds are rendered before text runs, and underlines sit cleanly below descenders.
+- **Dynamic Titles & Process Tracking (`config.rs`, `pane.rs`, `panes_grid.rs`)**:
+  - Added iced configuration overlay (`~/.config/ghostwave/config.toml`): `dynamic_title = "process" | "osc" | "off"` and `pane_title_format = "process" | "pwd" | "both"`, without altering frozen `src/**`.
+  - Replaces `pane N` with dynamic title directly (e.g. `lazygit` or `lazygit [1/2]` when stacked), falling back to `pane N` if title is empty or disabled.
+  - Window title suffix (`{title} — ghostwave`) is conditioned on `dynamic_title != Off`.
+- **View Path Purity & Performance**:
+  - `display_title()` / syscalls (`tcgetpgrp`, `/proc/<pid>/comm`, `/proc/<pid>/cwd`) moved off `view(&self)`.
+  - Evaluations occur on tick (`AppState::tick`) and cache into `Pane::cached_title`. `view(&self)` (`Tab::label`, `cell_label`, `App::title`) reads `cached_title` with zero syscalls and zero allocations.
+- **Scroll Step Normalization**:
+  - High-res pixel scroll deltas normalize against actual cell height `(cell.h as f32).max(1.0)` instead of a fixed 15px constant.
+- **Code Standards**:
+  - Pure rustdoc in source files; technical rationale documented in `PORT-PLAN.md` and `PROGRESS.md`.
+  - 23/23 unit and integration tests passing warning-free.
