@@ -773,10 +773,14 @@ their actions with "not implemented yet" toasts. This is the plan for connecting
    applied twice when the field has focus — the cost is that pasting into it does nothing), and AI
    replies are polled on the tick because a std `mpsc::Receiver` is neither `Hash` nor `Sync` and
    cannot back an iced subscription. 111 tests.
-3. **Selection — smaller than planned**: no core change is needed (decision 2). What is left is
-   painting the highlight in `pane_canvas` from `RowIteration::selection()` once per row, and
-   deleting the redundant `selection.rs`. Copy already works (`Ctrl+Shift+C` → `Action::Copy` →
-   `copy_selection()`).
+3. **Selection — landed (highlight only)**: `pane_canvas::paint_pane` fills `theme.selection` behind a
+   selected cell (`Cell::is_selected()`), which is the reference build's own policy
+   (`src/term.rs:878` uses the same call and the same colour). Gestures and copy were already the
+   core's (`Ctrl+Shift+C` → `Action::Copy` → `copy_selection()`), so nothing else was needed. The
+   per-row `RowIteration::selection()` call the vendored docs recommend is the optimisation to reach
+   for if per-cell `is_selected()` ever shows up in a profile. `selection.rs` stays orphaned — the
+   owner's call is that deduplication happens at the archive cut, not before
+   (`../RETIREMENT-PLAN.md` §5 step 7).
 4. **Chrome widgets swap** (the last M5b item), floats actually painted, then the parity table walk.
 
 ### Pending real-window verification

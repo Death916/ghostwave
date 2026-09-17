@@ -1002,3 +1002,17 @@ Honest gaps at this point:
 - None of slice 2 has been seen in a real window yet (content cells, their title bars, the palette's
   backdrop over the grid), so nothing here is claimed as visually verified.
 
+### 2026-09-17 (later still): selection highlight (part of slice 3)
+
+Selecting text with the mouse now paints the highlight: `pane_canvas::paint_pane` fills
+`theme.selection` behind each selected cell (`Cell::is_selected()`), which is exactly what the
+macroquad build does (`src/term.rs:878` — same call, same colour). Gestures and copy were already in
+place from M3 (`Ctrl+Shift+C` → `Action::Copy` → `TermPane::copy_selection()`), so this was the only
+missing piece; no core change was needed, because libghostty's render API already exposes the
+selection.
+
+`ghost-iced/src/selection.rs` remains in the tree, orphaned and unreferenced: it is a second
+selection model with its own `copy_selection(grid)`, and the owner's instruction is that
+deduplication happens at the archive cut rather than in an ad-hoc pass now
+(`RETIREMENT-PLAN.md` §5 step 7). 111/111 tests still pass.
+

@@ -298,6 +298,10 @@ pub(crate) fn paint_pane(
                 frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), c_bg);
             }
 
+            if c.is_selected().unwrap_or(false) {
+                frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), rgb(theme.selection));
+            }
+
             let baseline_y = y + cell.baseline;
             let extends = match &run {
                 Some(r) => has_glyphs && r.color == fg && r.baseline_y == baseline_y,
