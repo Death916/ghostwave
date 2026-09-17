@@ -702,11 +702,77 @@ Modern terminal emulators dynamically reflect the currently executing foreground
   - Content panes: Synthwave 3D visualizer (`visualizer.rs`), file preview (`preview.rs`), AI assistant chat (`ai.rs`).
 - **M7**: Performance benchmarking and final packaging.
 
-## 19. M5b, M5c & M6 Landing (2026-09-17)
+## 19. Integrating the M5b/M5c/M6 modules (2026-09-17)
+
+`f44223f` added eight modules (~6,400 lines, 102 tests green) but wired none of them: `app.rs`,
+`main.rs`, `panes_grid.rs` and `pane.rs` contain no reference to them, and `input.rs` still answers
+their actions with "not implemented yet" toasts. This is the plan for connecting them.
+
+### Verified API shape (what the modules actually offer)
+
+| module | entry points | parent-facing message type |
+| --- | --- | --- |
+| `palette.rs` | `PaletteState::new(items)`, `update(PaletteMessage) -> Option<PaletteAction>`, `handle_iced_key(..)`, `view(&PaletteState, &Theme) -> Element<PaletteMessage>` | own `PaletteMessage`, returns `PaletteAction::{Execute(Action), Close}` |
+| `search_overlay.rs` | `SearchState::new()`, `set_query`, `toggle_regex/case`, `next/prev_match`, `sync_to_term(_search)`, `sync_from_term(_search)`, `search_overlay_mapped(state, theme, position, map: impl Fn(SearchMessage) -> Message)` | own `SearchMessage`, with a ready-made mapping adapter |
+| `scratchpad.rs` | `ScratchpadState::{new, toggle(&mut AppState), embed_into(&mut AppState), window_size(&AppState)}`, `ScratchpadGeometry::{TopDrawer, Centered}`, `FloatingPane` | none — it drives `AppState` directly |
+| `chrome_widgets.rs` | `tab_bar_for_state(&AppState)`, `status_bar_for_state(&AppState)`, `toast_box(&str, &Theme)` | the parent `Message` directly |
+| `ai.rs` | `AiPane::new(AiConfig)`, `update(AiMessage)`, `send`, `handle_response`, `poll`, `view(&Theme) -> Element<AiMessage>` | own `AiMessage` |
+| `preview.rs` | `PreviewPane::open(path)`, `load`, `handle_action(PreviewAction)`, `view<'a, Message: 'a>(&self, &Theme)` | `PreviewAction` — but `view` attaches **no** messages (see below) |
+| `visualizer.rs` | `VisualizerPane::{new, with_font, with_bg_color}`, `ColorMode::{next, colors}` | none — driven by key/state |
+| `selection.rs` | `SelectionModel::{on_press, on_press_word, on_press_line, on_drag, on_release, extract_text}` | none |
+
+### Decisions this forces
+
+0. **Two seams the slice landed on, worth knowing before touching them.** `ScratchpadState::toggle`
+   takes `&mut AppState`, so the caller moves the manager out of the state it mutates
+   (`std::mem::take`) rather than borrowing it alongside — do not "simplify" that into a borrow.
+   And an action reached from the palette and the same action reached from a key bind share one
+   implementation (`input::execute`), so the palette cannot drift from the binds.
+
+1. **Content panes need a pane kind.** A grid cell currently resolves to a `SharedPane` (a terminal).
+   `Tab.panes: Vec<Option<SharedPane>>` becomes `Vec<Option<PaneEntry>>` with
+   `PaneEntry = Term(SharedPane) | Content(ContentPane)`, and
+   `ContentPane = Preview(PreviewPane) | Ai(AiPane) | Visualizer(VisualizerPane)`, addressed by the
+   same `PaneId` counter so the grid payload and pty routing stay untouched. Callers that mean
+   "terminal" (key send, pty subscription, resize/`set_grid`) match on `Term`.
+2. **Selection needs no core change, and `selection.rs` is redundant — delete it.** Verified in the
+   vendored sources: libghostty's render API exposes the selection
+   (`RowIteration::selection() -> Result<Option<RowSelection>>`, a row-local cell range, and
+   `Cell::is_selected()`), and the port's canvas already walks rows and cells, so the highlight can
+   be painted from the same data the copy path uses. The gestures are already the core's —
+   `pane.rs::mouse_event` → `TermPane::handle_mouse` → `SelectionState::on_click/on_drag/on_release`
+   → `terminal.set_selection(..)`, with `TermPane::copy_selection()` as the only copy. A second
+   front-end `SelectionModel` would let what is highlighted and what is copied disagree, so the
+   module goes at the dedup step (`../RETIREMENT-PLAN.md` §5 step 7) — or as soon as nothing
+   references it, which today is only its `mod` line. Use the per-row `selection()` call rather than
+   per-cell `is_selected()`: the vendored docs call that out explicitly.
+3. **The preview is driven by the keymap, not by its own widgets.** Its `view` emits nothing, so
+   `input.rs` routes scroll/zoom/reset to the focused preview pane's `handle_action`. Adding
+   `on_press` buttons is optional polish, and only via an `..._mapped` adapter.
+4. **Overlays are `Stack` layers, above the pane grid and the chrome** (order matters — see the
+   paint-order traps in `HANDOFF.md` §7): grid → chrome → search bar → palette → scratchpad float →
+   toast. The palette and search overlays capture input while open: keys go to them, not to the pane.
+5. **Chrome widgets land separately from the overlay wiring.** The canvas chrome stays the live path
+   until `chrome_widgets::{tab_bar_for_state, status_bar_for_state, toast_box}` replace it in one
+   dedup pass at the archive cut (`../RETIREMENT-PLAN.md` §5 step 7) — one change at a time, each
+   ending green.
+
+### Slice order (each slice ends with tests green)
+
+1. Parent seams: `Message` variants (`Palette`, `Search`, `Ai { id, msg }`, `Preview { id, action }`),
+   `AppState` fields (`scratchpad`, `palette: Option<..>`, `search: Option<..>`), `input.rs` routing
+   for `OpenCommandBar` / `OpenSearch` / `ToggleScratchpad`, and the overlay layers in `view`.
+2. Content panes: the `PaneEntry`/`ContentPane` refactor, cell rendering in `panes_grid`, and the
+   palette/keymap entry points (`NewAi`, the visualizer, `Ctrl+Click` → preview).
+3. Selection: the core range accessor, highlight painting in `pane_canvas`, copy on the existing
+   action, and `selection.rs` resolved (deleted or reduced).
+4. Chrome widgets swap, floats polish, then the parity table walk in a real window.
+
+## 20. M5b, M5c & M6 modules: what was added (2026-09-17)
 
 The non-iced / macroquad front-end is no longer a consideration or constraint; iced 0.14 is the sole target.
 
-### Landed Modules in `ghost-iced/src/`:
+### Modules added in `ghost-iced/src/` (written, unit-tested, **not yet wired** — see §19):
 1. **`chrome_widgets.rs`**: Native iced 0.14 widgets for the tab bar (active/inactive styling, click-to-focus `Message::FocusTab`, inline `text_input` rename), status bar (mode pill, keybind hints, live 2-harmonic wave visualizer canvas, sync panes chip, theme badge), and floating toast overlay box.
 2. **`scratchpad.rs`**: Floating pane overlay and F12 / `Ctrl+~` scratchpad manager with geometry presets (`TopDrawer`, `Centered`), window boundary clamping, Zellij-style float cycling (`e`/`E`), and origin re-embedding.
 3. **`palette.rs`**: Modal command palette overlay with action inventory from `ghostwave::keymap::Action`, installed themes, fuzzy matching, prefix commands (`open`, `ssh`, `ds`), and keyboard navigation.

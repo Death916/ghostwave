@@ -127,13 +127,19 @@ Do it on a short-lived branch (`feat/retire-macroquad`), because `master` is pro
    `arboard`/`fontdue` only the presentation used) leaves the dependency list. Keep `nix`,
    `libghostty-vt`, `serde`/`toml`, `fontdue` if the font fallback still needs it.
 6. **Delete** the presentation files listed in §4, and the modules from `lib.rs`.
-7. **Docs**: rewrite `README.md` so every claim is a feature the iced build actually has (this repo
+7. **Resolve the port's own duplication in the same pass** — this is where the "the iced front-end is
+   more lines than macroquad" artefact gets settled, not in an ad-hoc pass before the wiring is
+   finished. Once the widget chrome is wired, the canvas chrome it replaced is dead
+   (`chrome.rs` vs `chrome_widgets.rs`, and the hand-painted tab/status bar inside it); once widget
+   layout does the measuring, `measure.rs` loses most of its reason to exist. Until the integration
+   lands those files are still the *live* render path — deleting them early breaks the window.
+8. **Docs**: rewrite `README.md` so every claim is a feature the iced build actually has (this repo
    has been burned by unexercised README claims before); add a `PROGRESS.md` section that keeps the
    macroquad history and points at the tag; update `PORT-PLAN.md`'s framing (it still treats the
    macroquad build as the acceptance reference).
-8. **Verify**: `cargo test` on the single crate, `cargo run` in a real window, walk the §2 checklist
+9. **Verify**: `cargo test` on the single crate, `cargo run` in a real window, walk the §2 checklist
    again on the merged result, `git log --oneline --stat` to confirm only intended paths changed.
-9. **Propagate**: merge `master` into any live dev branch, or delete the stale ones
+10. **Propagate**: merge `master` into any live dev branch, or delete the stale ones
    (`perf/idle-gpu-2`, `selection-autoscroll`, `feat/visual-ghostwave` — check each for unmerged
    work first). Push `master` and the mirror.
 

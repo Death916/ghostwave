@@ -3,10 +3,11 @@
 //! wheel scrollback.
 
 use ghostwave::config::Config;
+use ghostwave::keymap::Action;
 use iced::{
     keyboard,
-    widget::pane_grid,
-    Element, Size, Subscription, Task,
+    widget::{pane_grid, Stack},
+    Element, Length, Size, Subscription, Task,
 };
 use libghostty_vt::key;
 
@@ -100,6 +101,10 @@ pub enum Message {
     },
     /// The pane-grid layer's pane drag: picked, dropped or cancelled.
     GridDrag(pane_grid::DragEvent),
+    /// A message from the command palette overlay.
+    Palette(palette::PaletteMessage),
+    /// A message from the scrollback search overlay.
+    Search(search_overlay::SearchMessage),
 }
 
 struct App {
@@ -203,11 +208,15 @@ impl App {
                 // Remembered for the mouse path: iced's mouse events carry no
                 // modifiers.
                 keys::note_modifiers(modifiers);
-                if let Some(kp) = keys::keypress(&key, physical, modifiers, text.as_deref()) {
-                    if repeat {
-                        input::repeat(&mut self.state, kp);
-                    } else {
-                        input::key_press(&mut self.state, kp, key::Action::Press);
+                // An open overlay owns the keyboard; nothing below this point
+                // reaches a pane while one of them is up.
+                if !self.overlay_key(&key, modifiers, text.as_deref()) {
+                    if let Some(kp) = keys::keypress(&key, physical, modifiers, text.as_deref()) {
+                        if repeat {
+                            input::repeat(&mut self.state, kp);
+                        } else {
+                            input::key_press(&mut self.state, kp, key::Action::Press);
+                        }
                     }
                 }
             }
@@ -217,20 +226,149 @@ impl App {
                 modifiers,
             } => {
                 keys::note_modifiers(modifiers);
-                if let Some(kp) = keys::keypress(&key, physical, modifiers, None) {
-                    input::key_release(&mut self.state, kp);
+                // A release belongs to the press the overlay consumed, so it does
+                // not leak into the shell either.
+                if !self.overlay_open() {
+                    if let Some(kp) = keys::keypress(&key, physical, modifiers, None) {
+                        input::key_release(&mut self.state, kp);
+                    }
                 }
             }
             // The pane-grid layer's own interactions: the grid keeps whatever
             // ratio a split drag ends on, and a drop re-arranges its cells.
             Message::GridResize { split, ratio } => self.state.grid_resize(split, ratio),
             Message::GridDrag(event) => self.state.grid_drag(event),
+            // While an overlay is open it owns the keyboard, so its own messages are
+            // the only path into it.
+            Message::Palette(message) => {
+                if let Some(palette) = self.state.palette.as_mut() {
+                    match palette.update(message) {
+                        Some(palette::PaletteAction::Execute(action)) => {
+                            self.state.palette = None;
+                            input::execute(&mut self.state, action);
+                        }
+                        Some(palette::PaletteAction::Close) => self.state.palette = None,
+                        None => {}
+                    }
+                }
+            }
+            // The search overlay owns the query and the pane's search engine
+            // together: the module's own adapter keeps both in step — a query or
+            // case change re-arms the core search, next/prev steps it, and Close
+            // stops it.
+            Message::Search(message) => {
+                let closing = matches!(message, search_overlay::SearchMessage::Close);
+                let pane = self.state.active_pane();
+                let mut term = pane.as_ref().map(|pane| pane.lock().unwrap());
+                if let Some(search) = self.state.search.as_mut() {
+                    search.update_with_term(message, term.as_mut().map(|guard| &mut guard.term));
+                }
+                if closing {
+                    self.state.search = None;
+                }
+            }
         }
         if self.state.quit {
             // `Ctrl+q` / `Action::Quit`.
             return iced::exit();
         }
         Task::none()
+    }
+
+    /// Whether an overlay currently owns the keyboard.
+    fn overlay_open(&self) -> bool {
+        self.state.palette.is_some() || self.state.search.is_some()
+    }
+
+    /// Routes a key to the open overlay, if any; returns whether one consumed it.
+    ///
+    /// Overlays are exclusive: while one is up the panes are sent no key at all,
+    /// and the terminal keymap is not consulted — a key an overlay does not want
+    /// is dropped rather than falling through to the shell.
+    fn overlay_key(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> bool {
+        if self.state.palette.is_some() {
+            self.palette_key(key, modifiers, text);
+            return true;
+        }
+        if self.state.search.is_some() {
+            self.search_key(key, modifiers, text);
+            return true;
+        }
+        false
+    }
+
+    /// Applies a key to the command palette: navigation, submission and dismissal
+    /// through the palette's own iced handler, text through its query.
+    fn palette_key(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+        text: Option<&str>,
+    ) {
+        let action = self
+            .state
+            .palette
+            .as_mut()
+            .and_then(|palette| palette.handle_iced_key(key, &modifiers));
+        match action {
+            // The same two exits the `Message::Palette` arm takes.
+            Some(palette::PaletteAction::Execute(action)) => {
+                self.state.palette = None;
+                input::execute(&mut self.state, action);
+            }
+            Some(palette::PaletteAction::Close) => self.state.palette = None,
+            None => {
+                if let Some(palette) = self.state.palette.as_mut() {
+                    if is_backspace(key) {
+                        palette.backspace();
+                    } else if let Some(c) = typed_char(text) {
+                        palette.type_char(c);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies a key to the search overlay through the module's own key map,
+    /// driving the search actions so the overlay and the pane's search stay in
+    /// step.
+    fn search_key(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+        text: Option<&str>,
+    ) {
+        match search_overlay::handle_key(key, modifiers) {
+            Some(search_overlay::SearchMessage::Close) => input::close_search(&mut self.state),
+            Some(search_overlay::SearchMessage::NextMatch) => {
+                input::execute(&mut self.state, Action::SearchNext)
+            }
+            Some(search_overlay::SearchMessage::PrevMatch) => {
+                input::execute(&mut self.state, Action::SearchPrev)
+            }
+            Some(search_overlay::SearchMessage::ToggleCaseSensitive) => {
+                input::execute(&mut self.state, Action::SearchToggleCase)
+            }
+            // Regex has no keymap action of its own, so it is the overlay's.
+            Some(search_overlay::SearchMessage::ToggleRegex) => {
+                if let Some(search) = self.state.search.as_mut() {
+                    search.toggle_regex();
+                }
+            }
+            Some(search_overlay::SearchMessage::QueryChanged(_)) => {}
+            None => {
+                if is_backspace(key) {
+                    input::search_backspace(&mut self.state);
+                } else if let Some(c) = typed_char(text) {
+                    input::search_push_char(&mut self.state, c);
+                }
+            }
+        }
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -277,7 +415,30 @@ impl App {
             },
         };
 
-        panes_grid::view(&self.state, panes, mouse_tracking, chrome)
+        let base = panes_grid::view(&self.state, panes, mouse_tracking, chrome);
+        if self.state.search.is_none() && self.state.palette.is_none() {
+            return base;
+        }
+        // Overlays are `Stack` layers above the pane grid and its chrome, the last
+        // child painting on top. The search layer is transparent; the palette
+        // brings its own dimmed backdrop, which is the only full-window fill up
+        // here.
+        let mut layers: Vec<Element<'_, Message>> = vec![base];
+        if let Some(search) = self.state.search.as_ref() {
+            layers.push(search_overlay::search_overlay_mapped(
+                search,
+                &self.state.theme,
+                search_overlay::OverlayPosition::TopRight,
+                Message::Search,
+            ));
+        }
+        if let Some(palette) = self.state.palette.as_ref() {
+            layers.push(palette::view(palette, &self.state.theme).map(Message::Palette));
+        }
+        Stack::with_children(layers)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -302,6 +463,25 @@ impl App {
             }
         }
         Subscription::batch(subs)
+    }
+}
+
+/// Whether the event is the Backspace key.
+fn is_backspace(key: &keyboard::Key) -> bool {
+    matches!(key, keyboard::Key::Named(keyboard::key::Named::Backspace))
+}
+
+/// The single printable character a key event produced, if it produced one.
+///
+/// A composed sequence (a dead-key pair, an IME pre-edit run) or a control
+/// character — Ctrl+C hands over `\u{3}` — is not text to type.
+fn typed_char(text: Option<&str>) -> Option<char> {
+    let mut chars = text?.chars();
+    let c = chars.next()?;
+    if chars.next().is_none() && !c.is_control() {
+        Some(c)
+    } else {
+        None
     }
 }
 

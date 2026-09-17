@@ -8,6 +8,7 @@ use ghostwave::layout::SplitDir;
 use libghostty_vt::key::{self, Mods};
 
 use crate::app::AppState;
+use crate::search_overlay::SearchState;
 
 /// Resolves a key press against the bind table and applies the resulting action.
 ///
@@ -135,7 +136,10 @@ fn send(state: &mut AppState, kp: &KeyPress, action: key::Action) {
 }
 
 /// Arms whose feature is not implemented yet raise a toast instead of acting.
-fn execute(state: &mut AppState, action: Action) {
+///
+/// Shared with the overlay key path in [`crate::main`], so an action reached from
+/// the palette and the same action reached from a bind have one implementation.
+pub(crate) fn execute(state: &mut AppState, action: Action) {
     match action {
         Action::NewPane | Action::NewPaneDown | Action::NewPaneRight => {
             let dir = if action == Action::NewPaneRight {
@@ -162,7 +166,11 @@ fn execute(state: &mut AppState, action: Action) {
         Action::ToggleFloating | Action::ToggleHideFloat | Action::CycleFloat => {
             state.toast("floating panes: not implemented yet")
         }
-        Action::ToggleScratchpad => state.toast("scratchpad: not implemented yet"),
+        Action::ToggleScratchpad => {
+            let mut scratchpad = std::mem::take(&mut state.scratchpad);
+            scratchpad.toggle(state);
+            state.scratchpad = scratchpad;
+        }
 
         Action::NewTab => state.new_tab(),
         Action::CloseTab => state.close_tab(),
@@ -210,14 +218,18 @@ fn execute(state: &mut AppState, action: Action) {
         Action::ScrollToBottom => scroll(state, |p| p.scroll_to_bottom()),
         Action::EditScrollback => state.toast("edit-scrollback: not implemented yet"),
 
-        Action::SearchStart
-        | Action::OpenSearch
-        | Action::SearchNext
-        | Action::SearchPrev
-        | Action::SearchToggleCase
-        | Action::SearchToggleWrap
-        | Action::SearchToggleWholeWord
-        | Action::ConfirmSearch => state.toast("search: not implemented yet"),
+        Action::OpenSearch | Action::SearchStart => open_search(state),
+        Action::SearchNext => step_search(state, true),
+        Action::SearchPrev => step_search(state, false),
+        Action::SearchToggleCase => {
+            if let Some(search) = state.search.as_mut() {
+                search.toggle_case_sensitive();
+            }
+            sync_search(state);
+        }
+        Action::SearchToggleWholeWord => toggle_whole_word(state),
+        Action::SearchToggleWrap => toggle_wrap(state),
+        Action::ConfirmSearch => sync_search(state),
 
         Action::MovePane(dir) => state.move_pane(dir),
         Action::MovePaneNext => state.move_pane_next(),
@@ -252,7 +264,11 @@ fn execute(state: &mut AppState, action: Action) {
                 "synchronized input OFF"
             });
         }
-        Action::OpenCommandBar => state.toast("command palette: not implemented yet"),
+        Action::OpenCommandBar => {
+            state.palette = Some(crate::palette::PaletteState::new(
+                crate::palette::default_items(&ghostwave::theme::names()),
+            ));
+        }
         Action::Ghostwave => state.toast("visualizer pane: not implemented yet"),
         Action::NewAi => state.toast("AI pane: not implemented yet"),
         Action::OpenFile(_) => state.toast("preview panes: not implemented yet"),
@@ -302,6 +318,129 @@ fn split(state: &mut AppState, dir: SplitDir) {
     if let Err(e) = state.split(dir) {
         state.toast(format!("spawn failed: {e}"));
     }
+}
+
+/// Opens the scrollback search overlay and arms the focused pane's search with
+/// the overlay's query.
+///
+/// Re-opening with a query already typed keeps it: the overlay is the query's
+/// owner while it is up.
+pub(crate) fn open_search(state: &mut AppState) {
+    let pane = state.active_pane();
+    let overlay = state.search.get_or_insert_with(SearchState::new);
+    let query = overlay.query.clone();
+    let case_sensitive = overlay.case_sensitive;
+    if let Some(pane) = pane {
+        let mut guard = pane.lock().unwrap();
+        guard.term.search.start();
+        if !query.is_empty() {
+            guard.term.search.set_query(query);
+        }
+        guard.term.search.case_sensitive = case_sensitive;
+        guard.term.search.dirty = true;
+        guard.term.force_repaint = true;
+    }
+}
+
+/// Closes the overlay and disarms the focused pane's search.
+pub(crate) fn close_search(state: &mut AppState) {
+    if let Some(pane) = state.active_pane() {
+        let mut guard = pane.lock().unwrap();
+        guard.term.search.stop();
+        guard.term.force_repaint = true;
+    }
+    state.search = None;
+}
+
+/// Pushes the overlay's query and case setting into the focused pane's search.
+pub(crate) fn sync_search(state: &mut AppState) {
+    let pane = state.active_pane();
+    let Some(overlay) = state.search.as_ref() else {
+        return;
+    };
+    if let Some(pane) = pane {
+        let mut guard = pane.lock().unwrap();
+        overlay.sync_to_term(&mut guard.term);
+    }
+}
+
+/// Appends a typed character to the overlay's query and re-runs the pane's search.
+pub(crate) fn search_push_char(state: &mut AppState, c: char) {
+    if let Some(overlay) = state.search.as_mut() {
+        let query = format!("{}{c}", overlay.query);
+        overlay.set_query(query);
+    }
+    sync_search(state);
+}
+
+/// Drops the overlay query's last character and re-runs the pane's search.
+pub(crate) fn search_backspace(state: &mut AppState) {
+    if let Some(overlay) = state.search.as_mut() {
+        let mut query = overlay.query.clone();
+        if query.pop().is_some() {
+            overlay.set_query(query);
+        }
+    }
+    sync_search(state);
+}
+
+/// Steps the overlay and the focused pane's search to the next or previous match.
+///
+/// The core's matches are viewport rows, so there is no scroll to follow: the
+/// scan and the highlight both live in the painted viewport.
+fn step_search(state: &mut AppState, forward: bool) {
+    let pane = state.active_pane();
+    let overlay = state.search.get_or_insert_with(SearchState::new);
+    match pane {
+        Some(pane) => {
+            let mut guard = pane.lock().unwrap();
+            if forward {
+                overlay.step_next_with_term(&mut guard.term);
+            } else {
+                overlay.step_prev_with_term(&mut guard.term);
+            }
+        }
+        None if forward => overlay.next_match(),
+        None => overlay.prev_match(),
+    }
+}
+
+/// Flips the focused pane's whole-word search flag and reports its new value.
+fn toggle_whole_word(state: &mut AppState) {
+    let Some(pane) = state.active_pane() else {
+        return;
+    };
+    let on = {
+        let mut guard = pane.lock().unwrap();
+        let on = !guard.term.search.whole_word;
+        guard.term.search.whole_word = on;
+        guard.term.search.dirty = true;
+        guard.term.force_repaint = true;
+        on
+    };
+    state.toast(if on {
+        "search: whole word on"
+    } else {
+        "search: whole word off"
+    });
+}
+
+/// Flips the focused pane's search wrap flag and reports its new value.
+fn toggle_wrap(state: &mut AppState) {
+    let Some(pane) = state.active_pane() else {
+        return;
+    };
+    let on = {
+        let mut guard = pane.lock().unwrap();
+        let on = !guard.term.search.wrap;
+        guard.term.search.wrap = on;
+        on
+    };
+    state.toast(if on {
+        "search: wrap on"
+    } else {
+        "search: wrap off"
+    });
 }
 
 fn scroll(state: &mut AppState, f: impl FnOnce(&mut crate::pane::Pane)) {
@@ -609,20 +748,141 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_features_say_so_instead_of_doing_nothing() {
+    fn unimplemented_features_say_so_and_wired_ones_act() {
         let mut s = state();
         ctrl(&mut s, Key::O);
         assert_eq!(s.mode, Mode::Session);
         typed(&mut s, Key::W, 'w');
         assert_eq!(toast(&s), "sessions: not implemented yet");
         assert_eq!(s.mode, Mode::Normal);
+
+        // Ctrl+Shift+p opens the command palette rather than toasting.
+        assert!(s.palette.is_none());
         press(&mut s, Key::P, Mods::CTRL | Mods::SHIFT);
-        assert_eq!(toast(&s), "command palette: not implemented yet");
+        assert!(s.palette.is_some(), "Ctrl+Shift+p opens the command palette");
+
+        // Ctrl+Shift+f opens the search overlay.
         press(&mut s, Key::F, Mods::CTRL | Mods::SHIFT);
-        assert_eq!(toast(&s), "search: not implemented yet");
+        assert!(s.search.is_some(), "Ctrl+Shift+f opens the search overlay");
+
+        // F12 toggles the scratchpad terminal.
+        assert!(!s.scratchpad.is_open());
+        press(&mut s, Key::F12, Mods::empty());
+        assert!(s.scratchpad.is_open(), "F12 opens the scratchpad");
+        assert!(s.scratchpad.pane().is_some(), "the scratchpad pane exists");
+        press(&mut s, Key::F12, Mods::empty());
+        assert!(!s.scratchpad.is_open(), "F12 hides it again");
+
+        // Floating panes have no key binding of their own yet.
         ctrl(&mut s, Key::P);
         typed(&mut s, Key::F, 'f');
         assert_eq!(toast(&s), "floating panes: not implemented yet");
+    }
+
+    #[test]
+    fn command_palette_runs_the_command_it_selects() {
+        use crate::palette::{PaletteAction, PaletteMessage, PaletteState};
+
+        let mut s = state();
+        assert_eq!(s.tabs.len(), 1);
+
+        execute(&mut s, Action::OpenCommandBar);
+        assert!(s.palette.is_some(), "OpenCommandBar opens the palette");
+        assert!(
+            matches!(s.palette.as_ref(), Some(PaletteState { .. })),
+            "the palette carries its state"
+        );
+
+        // The query a user types filters the inventory; the click index is an
+        // index into the filtered list, as the palette's own view emits it.
+        let palette = s.palette.as_mut().expect("the palette is open");
+        palette.set_query("new tab");
+        let index = palette
+            .filtered_items()
+            .iter()
+            .position(|item| item.action == Action::NewTab)
+            .expect("New Tab is still listed under the query");
+        let action = match palette.update(PaletteMessage::ItemClicked(index)) {
+            Some(PaletteAction::Execute(action)) => action,
+            Some(PaletteAction::Close) => panic!("an item click must not close the palette"),
+            None => panic!("an item click must yield an action"),
+        };
+
+        // `Message::Palette` clears the palette and then applies the action.
+        s.palette = None;
+        execute(&mut s, action);
+        assert_eq!(s.tabs.len(), 2, "New Tab from the palette opens a tab");
+        assert!(s.palette.is_none(), "the palette is closed after executing");
+    }
+
+    #[test]
+    fn search_overlay_owns_the_query_and_the_panes_search() {
+        use ghostwave::search::Match;
+
+        let mut s = state();
+        execute(&mut s, Action::OpenSearch);
+        assert!(s.search.is_some(), "OpenSearch opens the overlay");
+        assert!(
+            s.active_pane().unwrap().lock().unwrap().term.search.active,
+            "the pane's search engine is armed"
+        );
+
+        // Typing goes to the overlay's query and from there into the pane.
+        search_push_char(&mut s, 'l');
+        search_push_char(&mut s, 'i');
+        assert_eq!(s.search.as_ref().unwrap().query, "li");
+        assert_eq!(
+            s.active_pane().unwrap().lock().unwrap().term.search.query,
+            "li",
+            "the typed query reaches the pane's search engine"
+        );
+
+        search_backspace(&mut s);
+        assert_eq!(s.search.as_ref().unwrap().query, "l");
+        assert_eq!(
+            s.active_pane().unwrap().lock().unwrap().term.search.query,
+            "l"
+        );
+
+        // The case toggle drives both sides.
+        execute(&mut s, Action::SearchToggleCase);
+        assert!(s.search.as_ref().unwrap().case_sensitive);
+        assert!(
+            s.active_pane().unwrap().lock().unwrap().term.search.case_sensitive,
+            "the case toggle reaches the pane's search engine"
+        );
+
+        // Next/prev step the pane's engine and the overlay's own index together.
+        {
+            let pane = s.active_pane().unwrap();
+            let mut guard = pane.lock().unwrap();
+            guard.term.search.matches = vec![
+                Match {
+                    row: 0,
+                    col_start: 0,
+                    col_end: 1,
+                },
+                Match {
+                    row: 1,
+                    col_start: 0,
+                    col_end: 1,
+                },
+            ];
+            guard.term.search.current = 0;
+        }
+        execute(&mut s, Action::SearchNext);
+        assert_eq!(s.active_pane().unwrap().lock().unwrap().term.search.current, 1);
+        assert_eq!(s.search.as_ref().unwrap().match_index, 1);
+        execute(&mut s, Action::SearchPrev);
+        assert_eq!(s.active_pane().unwrap().lock().unwrap().term.search.current, 0);
+        assert_eq!(s.search.as_ref().unwrap().match_index, 0);
+
+        close_search(&mut s);
+        assert!(s.search.is_none(), "closing drops the overlay");
+        assert!(
+            !s.active_pane().unwrap().lock().unwrap().term.search.active,
+            "closing disarms the pane's search engine"
+        );
     }
 
     #[test]

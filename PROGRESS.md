@@ -939,3 +939,34 @@ remote connection switcher (Ctrl+G — clashes with zellij locked).
   - `ghost-iced`: 102/102 unit tests passing cleanly with 0 warnings.
   - Release binary built cleanly (`cargo build --release --manifest-path ghost-iced/Cargo.toml`).
 
+### 2026-09-17 (later): integrating the new modules — slice 1, overlays
+
+Those modules were written but reachable from nothing: `app.rs`, `main.rs`, `panes_grid.rs` and
+`pane.rs` had no reference to them and every action still raised a "not implemented yet" toast. The
+plan and its verified API table are `ghost-iced/PORT-PLAN.md` §19.
+
+- **Command palette** (`Ctrl+Shift+P`): opens over the grid, owns the keyboard while open
+  (navigation, query, Enter submits), and executes through the same `input::execute` the key binds
+  use — palette entries and binds cannot drift apart.
+- **Scrollback search overlay**: opens on `Ctrl+Shift+F`; the query is pushed into the focused pane's
+  own `ghostwave::search::SearchState` (`TermPane::search` is public), so the overlay and the
+  terminal's match engine share one state, case/regex toggles included.
+- **F12 / `Ctrl+~` scratchpad**: toggles real state (spawn/embed a floating terminal).
+- Overlays are `Stack` layers above the pane grid; a pane receives no keys while one is open.
+- 104/104 tests (102 pre-existing, one updated in place, two new: palette-executes-its-selection and
+  search-owns-the-query).
+
+Honest gaps at this point — these are not claims of working features:
+
+- Nothing scrolls the viewport to a search match. The core's search matches **viewport rows only**
+  (`src/search.rs` documents scrollback-wide search as a TODO) and `TermPane` exposes no
+  scroll-to-match helper, so the overlay syncs state and forces a repaint only.
+- The palette's own `text_input` is never focused, so typing is routed through its query API.
+- `Action::SearchToggleWrap` flips the core's `wrap` field, which `run_on_rows` does not read: that
+  toggle is currently cosmetic.
+- Scratchpad and floating panes are state-only — nothing paints a float yet.
+- `palette::view` draws a 0.65-alpha full-window backdrop above the grid; per the paint-order traps
+  that can suppress the chrome canvas's text pass. Needs a real-window check.
+- The preview / AI / visualizer panes still raise their honest toasts; they need the content-pane
+  refactor (slice 2).
+

@@ -324,6 +324,12 @@ pub struct AppState {
     pub rename_buf: String,
     #[allow(dead_code)]
     pub rename_target: String,
+    /// The command palette, while it is open. Keys and clicks go here, not to a pane.
+    pub palette: Option<crate::palette::PaletteState>,
+    /// The scrollback search overlay, while it is open.
+    pub search: Option<crate::search_overlay::SearchState>,
+    /// Floating panes and the F12 scratchpad terminal.
+    pub scratchpad: crate::scratchpad::ScratchpadState,
     last_tick: std::time::Instant,
     window: Size,
 }
@@ -359,6 +365,9 @@ impl AppState {
             last_tab: None,
             rename_buf: String::new(),
             rename_target: String::new(),
+            palette: None,
+            search: None,
+            scratchpad: crate::scratchpad::ScratchpadState::new(),
             last_tick: std::time::Instant::now(),
             window,
         };
