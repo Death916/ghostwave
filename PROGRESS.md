@@ -1039,6 +1039,13 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   Lesson: when a framework's rendering surprises you, read the framework's own source and how its own
   widgets do the same job (iced's text editor renders its selection as rectangles; iced's canvas draws
   text above shapes) before guessing at colours, ordering or caching.
+- **The iced build is now the app you launch.** `~/.local/bin/ghostwave` was repointed from the macroquad
+  release binary (`target/release/ghostwave`) to `ghost-iced/target/release/ghost-iced`, so rofi and
+  everything else on `PATH` gets the port. It needs no environment setup: the binary carries its nix
+  RUNPATH (`env -u LD_LIBRARY_PATH ldd` reports nothing missing), though those store paths are unrooted,
+  so a `nix-collect-garbage` will break the symlink until the build is rooted — the same failure mode as
+  the old `libdbus` exit 127. The macroquad binary stays at its old path, and the port starts with one
+  pane because session restore is not wired yet.
 - **The selection never appeared in an idle pane, and the reason is in the library's own docs.**
   `Cell::is_selected()` reads the row's *cached cell data*, and the C docs are explicit that cell data
   "is only valid as long as the underlying render state is not updated" — while this painter marks every
