@@ -1025,11 +1025,19 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   toggle did nothing. Both now honour the flag; the existing `next_prev_wraps` test still passes
   because the default is `wrap: true`, and `next_prev_stop_at_the_ends_without_wrap` pins the new
   behaviour. This is a core change, so it fixes the macroquad build's toggle too.
-- **Selection is now one uniform band.** The reference inverts *glyph* cells (light band, dark ink) and
-  fills *blank* cells with `theme.selection`, so a drag over mostly-empty rows came out as light blocks
-  with nothing legible in them — read, correctly, as the selection painting over the text. The port
-  fills every selected cell with `theme.selection` and keeps the glyph readable, falling back to the
-  terminal's default fg when the band and the glyph are within 0.25 luminance of each other.
+- **The selection never appeared in an idle pane, and the reason is in the library's own docs.**
+  `Cell::is_selected()` reads the row's *cached cell data*, and the C docs are explicit that cell data
+  "is only valid as long as the underlying render state is not updated" — while this painter marks every
+  row clean right after drawing it (`row.set_dirty(false)`). So a pane that keeps producing output
+  re-dirties its rows and showed the highlight, whereas an idle pane kept stale cell data and showed
+  nothing: the same code highlighting in one pane and not the other. The painter now takes the range
+  from `RowIteration::selection()` (the query the docs recommend for span renderers: `start_x`/`end_x`,
+  inclusive, `GHOSTTY_NO_VALUE` when the row misses the selection) and applies it per cell, so row
+  dirtiness no longer decides whether a selection is visible.
+- **The band colour also had to be derived rather than trusted.** tokyonight's `selection` (`#283457`)
+  sits only 0.096 luminance above its `bg` (`#1a1b26`) — invisible in practice, which is what "back to
+  nothing" was. The band uses the theme's selection colour when the gap is ≥ 0.15 and otherwise mixes it
+  35% toward the foreground; the glyph colour is never touched, so text cannot be swallowed by the band.
 - **The port's search could never find anything**, and the cause is in the core's design rather than
   the overlay: matches are computed inside `TermPane::render()` (`src/term.rs:812-819`), which the
   iced front-end never calls because it has its own painter. `search.matches` therefore stayed empty

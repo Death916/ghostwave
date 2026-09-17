@@ -257,6 +257,12 @@ pub(crate) fn paint_pane(
             Err(_) => continue,
         };
         let mut run: Option<TextRun> = None;
+        let sel_range = row
+            .selection()
+            .ok()
+            .flatten()
+            .map(|s| (s.start_x.min(s.end_x), s.start_x.max(s.end_x)));
+        let band = selection_band(theme, default_bg, default_fg);
 
         while let Some(c) = cells.next() {
             text_buf.clear();
@@ -299,13 +305,9 @@ pub(crate) fn paint_pane(
                 strikethrough = style.strikethrough;
             }
 
-            let selected = c.is_selected().unwrap_or(false);
+            let selected = sel_range.is_some_and(|(c0, c1)| col_idx >= c0 && col_idx <= c1);
             if selected {
                 selected_cells += 1;
-                let band = rgb(theme.selection);
-                if luma_gap(band, fg) < 0.25 {
-                    fg = default_fg;
-                }
                 cell_bg = Some(band);
             }
             if term.search.contains(row_idx, col_idx) {
@@ -437,6 +439,27 @@ fn draw_run(frame: &mut Frame, run: &TextRun, font_px: f32, font: Font) {
 fn luma_gap(a: Color, b: Color) -> f32 {
     let luma = |c: Color| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
     (luma(a) - luma(b)).abs()
+}
+
+/// The band painted behind selected cells.
+///
+/// The theme's `selection` colour is used when it reads against the pane's
+/// background. Themes whose selection colour sits almost on top of their
+/// background (tokyonight: `#283457` on `#1a1b26`) would give a highlight that
+/// is invisible on screen, so the band is mixed toward the foreground until it
+/// is legible.
+fn selection_band(theme: &GhostTheme, pane_bg: Color, ink: Color) -> Color {
+    let band = rgb(theme.selection);
+    if luma_gap(band, pane_bg) >= 0.15 {
+        return band;
+    }
+    let mix = 0.35;
+    Color {
+        r: band.r * (1.0 - mix) + ink.r * mix,
+        g: band.g * (1.0 - mix) + ink.g * mix,
+        b: band.b * (1.0 - mix) + ink.b * mix,
+        a: 1.0,
+    }
 }
 
 /// Converts a libghostty [`RgbColor`] to an opaque iced [`Color`].
