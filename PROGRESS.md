@@ -1039,6 +1039,17 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   Lesson: when a framework's rendering surprises you, read the framework's own source and how its own
   widgets do the same job (iced's text editor renders its selection as rectangles; iced's canvas draws
   text above shapes) before guessing at colours, ordering or caching.
+- **Sessions work in the port, and the deadlock that hid them was the pane lock.** Saving read each
+  pane's `program`/`args`/`cwd`/`remote`/log name back through the pane's *own* mutex — the same lock the
+  pty path takes — so the first pane locked and never returned: every session test hung, and the same
+  code would have frozen the app on save or quit. None of it changes after construction, so panes now
+  register it in a registry keyed by `PaneId` when they are built (`pane.rs`: `register_meta` /
+  `with_pane_meta`) and the session format reads that instead of the pane (`session.rs`). A session
+  rename now also persists the renamed session, so renaming one that was never written keeps it.
+  130 tests pass with no hangs. Floats are the remaining parity gap: reuse
+  `ScratchpadState::to_float(pane, rect, origin)` plus the `floating`/`next_z_index` bookkeeping and the
+  float layer, closing the pane out of its grid cell on the way out and re-inserting it at the saved
+  origin on the way back.
 - **What parity actually has left, checked against the reference rather than the toast list.** Three
   arms in `ghost-iced/src/input.rs` still toast, but only two are real gaps:
   `Action::EditScrollback` toasts in the **macroquad build too** (`src/app.rs:502`), so parity there is
