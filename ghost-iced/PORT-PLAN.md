@@ -184,6 +184,11 @@ M7 — parity check: side-by-side screenshot against the macroquad build at the 
   then `grim -g "<x>,<y> <w>x<h>" /tmp/shot.png`. Capture the same rect for the
   macroquad build for a true side-by-side. The user judges looks; capture the demo
   screen (`/tmp/iced-demo.sh`) so colours/bold/inverse/unicode are all visible.
+  CORRECTION (M0): that jq filter matches nothing — the macroquad window's class is
+  `miniquad-application` (title `ghostwave`), and the iced window's class is EMPTY
+  (title = the shell's OSC title, e.g. `/tmp`). Match on `title` or by
+  workspace/geometry instead.
+
 - Perf (defer until after parity): `/tmp/bench2.sh idle 'sleep 300' 20` and
   `/tmp/bench2.sh stream 'while :; do echo tick; sleep 0.05; done' 20`.
   Reference numbers from the macroquad build: 8 presents/s idle (1-2% GPU),
@@ -244,3 +249,114 @@ M7 — parity check: side-by-side screenshot against the macroquad build at the 
 
 The old out-of-repo spike at `~/Documents/code/vibed/ghost-iced-spike` is now a
 stale copy — it can be deleted once the in-repo crate builds.
+
+## 12. M0 status (2026-09-16, branch feat/iced-frontend)
+
+Landed in `ghost-iced/src/` and `cargo check`-clean; release binary built and RUN
+(one pane, fish, tty output, colours and glyphs visible; the macroquad build was
+left running untouched, both tiled side by side on ws 2):
+
+    main.rs        iced boot: App/Message/update/view/subscription; config + theme
+                   load from the app crate; grid derived from the window via
+                   iced::window::resize_events (the app's formula:
+                   ((extent - 2*padding) / cell_extent).max(1))
+    pane.rs        Pane { term: TermPane, scratch: RenderScratch }, apply_theme
+                   (set_default_fg/bg_color — same call as app.rs), ingest/exited
+                   (they mirror poll_pty: log first, then vt_write), key_press
+                   (calls TermPane::handle_key, like app.rs), cell_dims (fontdue)
+    pane_canvas.rs canvas::Program: bg, per-cell fg/bg (default-bg rects skipped),
+                   text, underline, strikethrough, cursor (block/bar/underline)
+    keys.rs        iced physical key Code -> libghostty Key (155 arms), mods, text
+    pty_bridge.rs  reader-thread std mpsc -> iced stream, coalesced to 256 KiB;
+                   GHOST_ICED_FIXTURE=<cmd> runs /bin/sh -c instead of a shell
+
+Two facts that differ from the plan's assumptions:
+- `TermPane`'s `render_state`/`row_it`/`cell_it` are PRIVATE, so `ghost-iced` owns
+  a second set and drives it off `pane.term` (the pub `Terminal`). The pane's own
+  `render()` (macroquad) is simply never called from this crate.
+- `Pane::spawn` moves the std receiver to the bridge thread, so `TermPane::poll_pty`
+  sees nothing. `pane.rs::ingest`/`exited` re-do what poll_pty does for the macroquad
+  build (pane log, vt_write, EOF/reap) using the pane's pub fields — no app-crate
+  change, but it is duplicated logic: revisit if the app crate ever grows a
+  "feed(&[u8])" entry point.
+
+Open questions to settle before M1 (unverified, not known-broken):
+- Does the first resize event really land? The pty winsize path is only exercised
+  if it does — probe with `GHOST_ICED_FIXTURE='sh /tmp/grid-check.sh'` (prints
+  `stty size` once a second; the log goes to <data-dir>/panes/, and the fixture must
+  not exit immediately or the async log flush eats the last lines).
+- Glyph fallback: iced is given ONE font (JetBrains Mono, embedded) — SOLVED, and
+  the cause was not what the plan assumed. Two separate bugs, both fixed:
+  (a) the canvas was drawing with `Font::DEFAULT` = iced's built-in **Fira Sans**
+  (proportional) while the cell grid is measured from JetBrains Mono, which is the
+  uneven "gaps between letters" look; the face must be registered
+  (`iced::application(..).font(bytes)`) and named in the canvas `Text`
+  (`fonts::primary()`). (b) `Shaping::Basic` is cosmic-text's "shaping with NO font
+  fallback" (`shape_fallback` is only reached on the Advanced path), so registering
+  the fc-list fallback chain did nothing for glyphs missing from the primary face;
+  the canvas must use `Shaping::Advanced` (what iced's own text pipeline uses).
+  Fallback chain mirrors the macroquad stack (Nerd Font Mono, DejaVu Sans Mono,
+  Noto Sans Mono, Noto Sans Symbols 2, FreeMono, ...). Known remaining gap, shared
+  with the macroquad build: emoji (Noto Color Emoji is CBDT colour-bitmap, which the
+  renderer cannot rasterise, and `fonts.rs` skips colour fonts on purpose).
+  Watch for one side effect of Advanced shaping: it applies the font's default
+  features, so JetBrains Mono's `->`/`=>` ligatures may appear (the macroquad
+  painter has none, it draws per glyph).
+- Cursor draw order: iced composites ALL canvas text above the shape layer, so a
+  block cursor sits behind its glyph (the macroquad painter draws the block over
+  it). Visible only under a glyph; fix by painting that cell's glyph in the cursor
+  colour.
+
+Reboot note: `/tmp/icedspike-target` (2.5 G warm deps; a cold rebuild is ~10 min)
+was copied to `~/.cache/ghost-iced/target`, and the `LD_LIBRARY_PATH` for launching
+to `~/.cache/ghost-iced/ld-path` (`/tmp/iced-spike-ldp` does not survive a boot).
+
+## 13. M1 / M2 notes (2026-09-16, later the same day)
+
+M1 landed: `ghost-iced/src/app.rs` is the iced-side session state (tabs, the split
+tree from `ghostwave::layout`, cached pane rects). Verified on the live pty: three
+panes → three fish children of the iced process, each with its own bridge and pane
+log. Splits/closes go through `layout::split_at` / `close_at`, focus through
+`layout::focus_in_direction` — no layout math is duplicated. `pane_canvas` paints
+each pane inside `Frame::with_clip` (one canvas for the whole window, so pane rects
+stay in the app's own coordinate scheme and clips do the job a GL scissor does in the
+macroquad build).
+
+Decisions worth keeping:
+- **Pane ids are stable; closed panes leave a tombstone** instead of compacting the
+  vec the way `App::remove_dangling_panes` does. Compaction renumbers the panes under
+  the `(tab, pane)` tag its pty bridge already stamped on the stream, so messages
+  would silently land on the wrong pane. Compaction needs a re-tagging story first.
+- **Temporary binds until M3**: Alt+Shift+d/e split, Alt+Shift+w close, Alt+arrows
+  move focus, so multi-pane is reachable without the keymap modes.
+- **Dev knobs**: `GHOST_ICED_PANES=<n>` opens n panes at startup (alternating
+  right/down splits) and `GHOST_ICED_FIXTURE=<cmd>` runs a command instead of a
+  shell — together they make layout, frames and multi-pane log behaviour testable
+  without typing into the window.
+- **Run test instances with `XDG_DATA_HOME=/tmp/ghost-iced-data`.** Both front-ends
+  use the same data dir, and `session::prune_logs()` (called when any instance
+  deletes a session) removes pane logs that no saved session references — i.e. a
+  macroquad instance pruning can unlink the iced instance's *live* logs. Observed as
+  `(deleted)` entries in `/proc/<pid>/fd`.
+- `pane.rs::ingest`/`exited` reproduce `poll_pty` (log first, then `vt_write`,
+  EOF/reap) because the receiver lives on the bridge thread. Verified: a fixture
+  piping `seq 1 30000` into two panes produced two ~196 KB pane logs.
+
+M2 (chrome) is being built from `ghost-iced/CHROME-REFERENCE.md`, a line-cited spec
+extracted from the macroquad render path (geometry formulas, theme field names, font
+sizes, format strings, wave parameters). Two port decisions:
+- **The chrome is painted in the same canvas as the panes**, in the reference's
+  order (panes → frames → tab bar → status bar → toast), because "looks parity" is
+  the acceptance criterion and canvas painting reuses the reference geometry and
+  colour fields verbatim. iced widgets would be more idiomatic (and better for
+  hit-testing/a11y) but would need the geometry re-derived; revisiting is optional.
+- **Canvas text can't be measured, so `measure.rs` measures it** with fontdue from
+  the same font file (`measure_text` in macroquad sums per-char advances) and also
+  converts the reference's baselines to iced's top-left text origin
+  (`top = baseline - measure::ascent(px)`).
+- **Animation is a conditional tick subscription**, not a frame loop:
+  `TickRate::Fast` (16 ms) while the wave is energized or a toast is up,
+  `TickRate::Slow` (125 ms) while the wave idles — matching the macroquad idle tier,
+  at the cost of 8 presents/s instead of 0 — and `Off` (no tick at all) when
+  `visual_wave = false`. Real durations replace the reference's frame counts.
+

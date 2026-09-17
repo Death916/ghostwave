@@ -12,6 +12,97 @@ Binary name: `ghostwave`
 
 ## STATUS: main terminal features solid — render/mouse/keybinds fixed, parity work in progress
 
+### iced front-end, M0 (branch `feat/iced-frontend`) — second front-end builds and runs, one pane
+New crate `ghost-iced/` (iced 0.14 + libghostty-vt, path-dep on the app lib, `[workspace]`
+marker so it never joins the app package; `ghost-iced/PORT-PLAN.md` is the port plan).
+The macroquad front-end is untouched and still the reference; both run side by side.
+- **Moves untouched**: pty, session, layout, config, theme, search, palette, clipboard are
+  imported from the app crate, not copied. `TermPane` (pty + VT + scrollback + selection +
+  key encoding + pane log) is the pane; the macroquad `render()` is simply never called.
+- **The pane's render scratch (`RenderState`/`RowIterator`/`CellIterator`) is private**, so
+  the iced painter owns a second set driven off the pub `term` field. Its pty receiver moves
+  to a reader→iced bridge thread (`pty_bridge.rs`, 256 KiB coalescing), so pty output is an
+  iced event instead of a poll; `pane.rs::ingest`/`exited` re-do what `poll_pty` does for the
+  macroquad build (pane log, `vt_write`, EOF/reap).
+- **Grid follows the window** via `iced::window::resize_events`, with the app's own formula
+  `((extent - 2*padding) / cell_extent).max(1)`; verified on the live pty with a fixture that
+  printed `stty size`: `30 100` at spawn → `68 140` after the compositor tiled the window.
+- **Two text bugs found and fixed — both were wrong defaults, not port work**:
+  (1) the canvas was drawing with `Font::DEFAULT`, i.e. iced's built-in proportional Fira Sans,
+  while the cell grid is measured from JetBrains Mono at 12px — this is what made glyph
+  spacing look uneven. The face must be registered (`iced::application(..).font(bytes)`) and
+  named in the canvas `Text`. (2) `Shaping::Basic` is cosmic-text's *"shaping with no font
+  fallback"* (`shape_fallback` is only reached on the advanced path), so no amount of
+  registered fallback fonts helps a glyph the primary face lacks — starship's `❯` (U+276F),
+  braille, nerd-font icons all stayed tofu until the canvas switched to `Shaping::Advanced`
+  (what iced's own text pipeline uses everywhere). Fallback chain mirrors the macroquad
+  stack via `fc-list` (Nerd Font Mono → DejaVu Sans Mono → Noto Sans Mono → …).
+  Side effect to watch: Advanced shaping applies the font's default features, so JetBrains
+  Mono's `->`/`=>` ligatures may appear (macroquad draws per glyph and has none).
+- **Text runs**: consecutive same-colour cells are drawn as ONE canvas text item (mirroring
+  `term.rs`'s `CellRun`/`flush_run`), so glyphs advance by the font's 7.2px advance rather
+  than being pinned to the rounded-up 8px cell — one text item per cell leaves a visible gap
+  after every character. Underline/strikethrough are drawn; per-cell bg rects are skipped
+  when they equal the terminal default (~2000 fewer rects/frame).
+- **Not implemented yet** (plan milestones M1–M6): multi-pane/tab chrome, keymap modes,
+  mouse, scrollback wheel, selection/copy, search overlay, palette, preview/visualizer,
+  kitty graphics. `font_size`/`theme`/`padding`/`row_gap`/`scrollback` come from
+  `config.toml` and the theme's fg/bg are applied to the pane like `apply_terminal_colors`.
+- Known shared gap: emoji stay tofu in BOTH front-ends (the only emoji font here is Noto
+  Color Emoji, a CBDT colour-bitmap face neither renderer can rasterise; `fonts.rs` skips
+  colour fonts deliberately). Cursor is composited behind its glyph under iced (text layer
+  sits above shapes) — visible only when the cursor is on a glyph.
+
+### iced front-end, M1 + M2 (branch `feat/iced-frontend`) — multi-pane, frames, tab bar, status bar
+The iced front-end now renders a full tab: N panes from `layout::layout`, pane frames
+and labels, the tab bar, the status bar (mode pill, hints, right-aligned theme name,
+sync chip) and the toast box. The macroquad front-end is untouched and still the
+reference; both were captured at the same window size and compared.
+- **M1**: `ghost-iced/src/app.rs` holds tabs + the split tree + cached pane rects.
+  Splits/closes/focus go through `layout::split_at` / `close_at` /
+  `focus_in_direction` — no layout math duplicated. Verified live: 3 panes → 3 fish
+  children of the iced process, each with its own pty bridge and pane log (a fixture
+  piping `seq 1 30000` into two panes produced two ~196 KB pane logs). Each pane is
+  painted inside `Frame::with_clip` — one canvas for the window, so rects stay in the
+  app's coordinate scheme while clipping replaces the macroquad build's GL scissor.
+  Pane ids are stable and closed panes leave a tombstone (compacting the vec, as
+  `App::remove_dangling_panes` does, would renumber panes under the `(tab, pane)` tag
+  their pty bridge already stamped on the stream).
+- **M2**: chrome painted per `ghost-iced/CHROME-REFERENCE.md`, a line-cited spec
+  extracted from `main.rs`'s render path. Chrome is painted into the same canvas as the
+  panes in the reference's order (panes → frames → tab bar → status bar → toast), which
+  keeps geometry and theme fields identical to the reference. Canvas text cannot be
+  measured, so `measure.rs` measures it with fontdue from the same font file
+  (macroquad's `measure_text` sums per-char advances) and converts the spec's baselines
+  to iced's top-left origin; every box width is `text_width + pad`, as in the reference.
+  Tab clicks hit-test at the renderer's 130px chip width (the reference's own hit test
+  uses 120 — a real 10px mis-selection bug not copied).
+- **Animation is a conditional tick**, not a frame loop: 16 ms while the wave is
+  energized or a toast is up, 125 ms while the wave idles (matching the macroquad idle
+  tier, at the cost of 8 presents/s rather than 0), and no tick at all when
+  `visual_wave = false`. `iced::time::every` does not exist in 0.14, so `tick.rs` runs a
+  small publisher thread, the same shape as the pty bridges; the reference's frame
+  counts became real durations.
+- **Verified by capture at the same window size** (1133x1382, both builds): tab chip
+  with the pane's OSC title (`/tmp`) on `theme.tab_active` over a `theme.tab_bg` strip,
+  status bar with the `NORMAL` pill, the exact hint string, the right-aligned theme
+  name, and three framed panes with labels. **No wave in either build** — with the
+  115-char NORMAL hints (~897px) plus the mode pill and margins, the reference's own
+  guard (`wave_end_x > wave_start_x + 50`) fails at this width, so the wave only
+  appears on wider (maximized) windows: parity, not a port gap, but the wave's drawing
+  is still unexercised.
+- iced renders every text item above every shape in one `Frame`, so the pane
+  frame/label pass is clipped to the content rect — otherwise a top-row pane label
+  floats over the tab bar instead of being covered by it (which chrome-last drawing
+  achieves in the macroquad build).
+- Shared-`XDG_DATA_HOME` hazard: `session::prune_logs()` (run when any instance deletes
+  a session) removes pane logs no saved session references, so a macroquad instance can
+  unlink the iced instance's LIVE logs (seen as `(deleted)` in `/proc/<pid>/fd`). Test
+  the iced build with `XDG_DATA_HOME=/tmp/ghost-iced-data`; `GHOST_ICED_PANES=<n>` and
+  `GHOST_ICED_FIXTURE=<cmd>` make layout/multi-pane/log behaviour testable without
+  typing. Temporary binds until M3: Alt+Shift+d/e split, Alt+Shift+w close, Alt+arrows
+  focus.
+
 ### Idle GPU, part 2 (branch `perf/idle-gpu-2`) — idle frame tier 30 → 8 FPS
 User: "gpu usage is pretty high even when idle still" after the earlier adaptive
 pacing fix (6b26de4). Re-measured from scratch on the live instance (started a day
