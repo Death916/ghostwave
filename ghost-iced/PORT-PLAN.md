@@ -615,3 +615,35 @@ knob retired once the grid path is the only path); M5b chrome and overlays as wi
 hand-painted chrome geometry; M5c floats on the overlay layer. Stacks land with M5a since they
 are payload-shaped, not layout-shaped.
 
+### Parity checklist for M5a (the acceptance target)
+
+Parity means the pane *features* the macroquad build has, not its pixels (§16 dropped that).
+Every row must work in the iced front-end, driven by the existing binds in `input.rs`:
+
+| feature | binds | iced mechanism |
+| --- | --- | --- |
+| split down / right | `Ctrl+p d`, `Ctrl+p r`, `Ctrl+Shift+d`, `Ctrl+d` | `State::split` |
+| split into a stack | `Ctrl+p s` | push onto the payload's `Vec` |
+| cycle a stack's members | `Ctrl+p w` | advance `GridPane::active` |
+| close pane | `Ctrl+p x`, `Ctrl+w` | `State::close` |
+| focus by click | left click | `PaneGrid::on_click` |
+| focus directionally | `Ctrl+p h/j/k/l`, `Ctrl+Shift+<arrow/hjkl>` | `State::adjacent` |
+| focus cycle / by index | `Ctrl+p p`, `Ctrl+Shift+1..9` | walk `State::iter` in layout order |
+| move pane | `Ctrl+h` then `h/j/k/l`, `n`/`p` | `State::swap`, `State::drop` |
+| resize | `Ctrl+n` then `h/j/k/l`, `H/J/K/L`, `=`/`-` | `State::resize` on the adjacent split |
+| zoom | `Ctrl+p z`, `Ctrl+m` | `State::maximize` / `restore` |
+| frames on/off | `Ctrl+p Shift+z` | our pane chrome (container borders + title band) |
+| sync panes | `Ctrl+p b` | our broadcast in `input::send` |
+| break pane to a new tab | `Ctrl+t b` | payload moves into a new tab's grid |
+| pane label per pane | always | the pane's `title_bar` |
+| wheel scrollback / terminal mouse | wheel, click, drag | our canvas → `TermPane::handle_mouse` |
+| drag a divider to resize | mouse | `PaneGrid::on_resize` (new; the macroquad build has no equivalent) |
+| drag a pane onto another | mouse on the title bar | `PaneGrid::on_drag` + `State::drop` (new) |
+
+Floats, preview/AI/visualizer panes and kitty graphics are out of scope here (M5c / M6).
+
+Verification while the pane layer is rebuilt: the pane operations are driven through
+`input::key_press` in tests exactly like the M3 suite (asserting grid cardinality, which pane is
+focused via `State::adjacent`/`maximized`, and that a stack's payload cycles), plus a real-window
+run for the interactions a test cannot press: click focus, drag-resize, drag-move.
+

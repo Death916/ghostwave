@@ -1,44 +1,38 @@
-//! iced `pane_grid` pane layer: the alternative to the hand-rolled canvas pane
-//! layer ([`crate::pane_canvas`]), selected by `GHOST_ICED_PANEGRID`.
+//! iced `pane_grid` pane layer: the pane layer that hands the panes to iced,
+//! selected by `GHOST_ICED_PANEGRID`.
 //!
-//! `ghostwave::layout::Node` stays the single source of truth: the
-//! [`pane_grid::State`] held in [`GridCache`] is derived from the active tab's
-//! tree, and every grid interaction is written back into that tree — a click
-//! focuses the pane under it, a split drag moves the split's ratio, a pane drag
-//! re-arranges the tree. The keymap layer therefore keeps operating on one tree
-//! and both pane layers describe the same session.
+//! The tab's own [`pane_grid::State`] is the layout authority ([`crate::app`]),
+//! so this module reads it rather than reconstructing it: one [`PaneCanvas`] per
+//! cell, painted at the bounds iced gives it, with iced owning the split drags,
+//! the pane drags and the focus placement that follow from them.
 //!
-//! Geometry mirrors the canvas layer while frames are shown: a [`SPACING`] px
-//! gutter between panes with the window background showing through it, each
-//! pane's terminal area inset by [`PANE_INSET`] px inside its grid region (half
-//! the gutter on either side, so the frame stroke lands in the gutter), a
-//! [`TITLE_H`] px label band as the pane's title bar, and a frame stroke in
-//! `theme.frame_active` (2 px, focused pane) or `theme.frame` (1 px). Frames off
-//! mirrors the canvas layer's touching panes: no gutter, no inset, no band.
+//! Geometry: a [`SPACING`] px gutter between cells with the window background
+//! showing through it, each cell's terminal area inset by [`PANE_INSET`] px and
+//! sitting below a [`TITLE_H`] px label band, framed by a stroke in
+//! `theme.frame_active` (focused pane) or `theme.frame`. Frames off drops the
+//! gutter, the inset and the band, so panes touch.
 //!
 //! Terminal content stays the canvas layer's: one [`PaneCanvas`] per pane paints
 //! that pane at its own bounds with the shared painter.
 //!
-//! Quirks: `ghostwave::layout::Node::Stack` has no `pane_grid` equivalent, so a
-//! stack contributes its active pane only. Floating panes are out of scope.
-
-use std::collections::BTreeMap;
+//! A cell holds a list of panes ([`GridPane`]): several of them are a
+//! zellij-style stack, of which the active member is drawn and typed into.
+//! Floating panes are out of scope.
 
 use ghostwave::app::{STATUS_BAR_H, TAB_BAR_H};
-use ghostwave::layout::{Dir, Node, Rect, SplitDir};
+use ghostwave::layout::SplitDir;
 use ghostwave::term::{CellDims, MouseEv, MouseEvKind};
 use ghostwave::theme::Theme as GhostTheme;
 use iced::widget::canvas::{self, Action, Event, Frame, Geometry};
-use iced::widget::pane_grid::{self, Axis, Configuration, Content, Pane, PaneGrid, Split, TitleBar};
+use iced::widget::pane_grid::{self, Axis, Content, PaneGrid, TitleBar};
 use iced::widget::{Canvas, container, text};
 use iced::{
     Background, Border, Element, Fill, Font, Length, Padding, Point, Rectangle, Renderer, Size,
-    Theme,
-    alignment, mouse,
+    Theme, alignment, mouse,
 };
 
 use crate::Message;
-use crate::app::AppState;
+use crate::app::{AppState, GridPane};
 use crate::fonts;
 use crate::keys;
 use crate::pane::SharedPane;
@@ -48,22 +42,17 @@ use crate::pane_canvas::{self, CanvasState, ChromeData, TerminalCanvas};
 /// canvas layer.
 const ENV: &str = "GHOST_ICED_PANEGRID";
 
-/// Gutter between neighbouring panes, in px.
+/// Gutter between neighbouring cells, in px.
 pub const SPACING: f32 = 4.0;
 
-/// Inset of a pane's terminal area inside its grid region, in px.
+/// Inset of a pane's terminal area inside its cell, in px.
 pub const PANE_INSET: f32 = 2.0;
 
 /// Height of a pane's label band (its title bar), in px.
 pub const TITLE_H: f32 = 14.0;
 
-/// A pane's smallest extent on either axis, in px.
+/// A cell's smallest extent on either axis, in px.
 pub const MIN_SIZE: f32 = 50.0;
-
-/// Ratio limits the derived state is built with, mirroring the clamps
-/// `ghostwave::layout` applies when it paints a tree.
-const RATIO_MIN: f32 = 0.05;
-const RATIO_MAX: f32 = 0.95;
 
 /// Whether the pane layer is iced's `pane_grid`.
 pub fn enabled() -> bool {
@@ -75,7 +64,7 @@ pub fn spacing(frames: bool) -> f32 {
     if frames { SPACING } else { 0.0 }
 }
 
-/// Inset of a pane's terminal area inside its grid region, in px.
+/// Inset of a pane's terminal area inside its cell, in px.
 pub fn inset(frames: bool) -> f32 {
     if frames { PANE_INSET } else { 0.0 }
 }
@@ -85,59 +74,7 @@ pub fn title_h(frames: bool) -> f32 {
     if frames { TITLE_H } else { 0.0 }
 }
 
-/// The `pane_grid` state derived from one tab's split tree, plus what is needed
-/// to write a split drag back into that tree.
-pub struct GridCache {
-    /// Tab this state was derived from.
-    pub tab: usize,
-    /// `AppState::tree_revision` this state was derived from.
-    pub revision: u64,
-    /// One grid pane per terminal pane; `T` is the pane's index into
-    /// `Tab::panes`. Pane and split ids are a function of the tree's shape only,
-    /// so they stay valid across a rebuild.
-    pub state: pane_grid::State<usize>,
-    /// The tree path of every split, so a split drag can move the same split in
-    /// `Tab::root`.
-    pub splits: BTreeMap<Split, Vec<u8>>,
-}
-
-impl GridCache {
-    /// Derives the grid state from `root`.
-    pub fn derive(tab: usize, revision: u64, root: &Node) -> Self {
-        let state = pane_grid::State::with_configuration(config(root));
-        let mut splits = BTreeMap::new();
-        collect_splits(state.layout(), &mut Vec::new(), &mut splits);
-        Self {
-            tab,
-            revision,
-            state,
-            splits,
-        }
-    }
-
-    /// Whether this state was derived from `tab` at `revision`.
-    pub fn is_fresh(&self, tab: usize, revision: u64) -> bool {
-        self.tab == tab && self.revision == revision
-    }
-}
-
-/// `ghostwave::layout::Node` → `pane_grid` configuration. A stack contributes its
-/// active pane only.
-fn config(node: &Node) -> Configuration<usize> {
-    match node {
-        Node::Leaf { pane } => Configuration::Pane(*pane),
-        Node::Stack { panes, active } => Configuration::Pane(panes[*active]),
-        Node::Split { dir, ratio, a, b } => Configuration::Split {
-            axis: axis(*dir),
-            // Matches what the tree painter would draw for the same tree.
-            ratio: ratio.clamp(RATIO_MIN, RATIO_MAX),
-            a: Box::new(config(a)),
-            b: Box::new(config(b)),
-        },
-    }
-}
-
-/// The grid axis a tree split direction splits along. `SplitDir::Horizontal` is
+/// The grid axis a split direction splits along. `SplitDir::Horizontal` is
 /// side-by-side, which is iced's vertical axis: the two enums are crossed.
 pub fn axis(dir: SplitDir) -> Axis {
     match dir {
@@ -146,126 +83,11 @@ pub fn axis(dir: SplitDir) -> Axis {
     }
 }
 
-/// Records every split id against its tree path. Ids are handed out in the same
-/// depth-first order [`config`] walks the tree in, so the walk here pairs them up.
-fn collect_splits(node: &pane_grid::Node, path: &mut Vec<u8>, out: &mut BTreeMap<Split, Vec<u8>>) {
-    if let pane_grid::Node::Split { id, a, b, .. } = node {
-        path.push(0);
-        collect_splits(a, path, out);
-        path.pop();
-        path.push(1);
-        collect_splits(b, path, out);
-        path.pop();
-        out.insert(*id, path.clone());
-    }
-}
-
-/// Pane rects in content coordinates, from the derived state's own layout:
-/// `pane_grid` lays the panes out with its own `pane_regions`, so deriving them
-/// from the tree instead would let the ptys and the painted panes drift apart.
-///
-/// Each rect is a pane's terminal area: inside the frame stroke and below the
-/// label band.
-pub fn pane_rects(cache: &GridCache, content: Rect, frames: bool) -> Vec<(usize, Rect)> {
-    let (spacing, inset, title) = (spacing(frames), inset(frames), title_h(frames));
-    let regions = cache.state.layout().pane_regions(
-        spacing,
-        MIN_SIZE,
-        Size::new(content.w.max(1.0), content.h.max(1.0)),
-    );
-    regions
-        .into_iter()
-        .filter_map(|(pane, region)| {
-            let id = *cache.state.get(pane)?;
-            Some((
-                id,
-                Rect {
-                    x: content.x + region.x + inset,
-                    y: content.y + region.y + title + inset,
-                    w: (region.width - 2.0 * inset).max(1.0),
-                    h: (region.height - title - 2.0 * inset).max(1.0),
-                },
-            ))
-        })
-        .collect()
-}
-
-/// Converts a `pane_grid` split ratio into the tree's ratio for the same split.
-///
-/// A grid ratio is a position inside the split's region, which spans both panes
-/// plus the gutter; a tree ratio is the share of that region given to the `a`
-/// side (`ghostwave::layout::SplitDir::Horizontal`'s left pane, `Vertical`'s top
-/// pane). This mirrors `pane_grid::Axis::split`, so a drag that is written back
-/// does not shift the split by the rounding difference.
-pub fn tree_ratio(
-    state: &pane_grid::State<usize>,
-    split: Split,
-    ratio: f32,
-    spacing: f32,
-    bounds: Size,
-) -> Option<f32> {
-    let regions = state.layout().split_regions(spacing, MIN_SIZE, bounds);
-    let (axis, region, _) = regions.get(&split)?;
-    let share = match axis {
-        Axis::Horizontal => {
-            let top = (region.height * ratio - spacing / 2.0)
-                .round()
-                .clamp(MIN_SIZE, (region.height - MIN_SIZE - spacing).max(MIN_SIZE));
-            top / region.height.max(1.0)
-        }
-        Axis::Vertical => {
-            let left = (region.width * ratio - spacing / 2.0)
-                .round()
-                .clamp(MIN_SIZE, (region.width - MIN_SIZE - spacing).max(MIN_SIZE));
-            left / region.width.max(1.0)
-        }
-    };
-    Some(share.clamp(RATIO_MIN, RATIO_MAX))
-}
-
-/// Where a dragged pane was dropped, in this crate's terms.
-#[derive(Clone, Copy, Debug)]
-pub enum DropTarget {
-    /// An edge of the whole grid: move the pane to that side of the tab.
-    Grid(Dir),
-    /// Another pane; `dir` is the edge it was dropped on, `None` its centre,
-    /// which trades the two panes' places.
-    OnPane { pane: usize, dir: Option<Dir> },
-}
-
-/// Translates a grid drop target; `None` when the target pane is not in the
-/// state.
-pub fn drop_target(
-    target: pane_grid::Target,
-    state: &pane_grid::State<usize>,
-) -> Option<DropTarget> {
-    Some(match target {
-        pane_grid::Target::Edge(edge) => DropTarget::Grid(dir_of(edge)),
-        pane_grid::Target::Pane(pane, region) => {
-            let pane = *state.get(pane)?;
-            match region {
-                pane_grid::Region::Center => DropTarget::OnPane { pane, dir: None },
-                pane_grid::Region::Edge(edge) => DropTarget::OnPane {
-                    pane,
-                    dir: Some(dir_of(edge)),
-                },
-            }
-        }
-    })
-}
-
-/// The terminal pane a grid pane holds.
-pub fn pane_of(state: &pane_grid::State<usize>, pane: Pane) -> Option<usize> {
-    state.get(pane).copied()
-}
-
-/// iced's edge as this tree's direction.
-fn dir_of(edge: pane_grid::Edge) -> Dir {
-    match edge {
-        pane_grid::Edge::Top => Dir::Up,
-        pane_grid::Edge::Bottom => Dir::Down,
-        pane_grid::Edge::Left => Dir::Left,
-        pane_grid::Edge::Right => Dir::Right,
+/// The split direction a grid axis splits along; the inverse of [`axis`].
+pub fn dir_of(axis: Axis) -> SplitDir {
+    match axis {
+        Axis::Vertical => SplitDir::Horizontal,
+        Axis::Horizontal => SplitDir::Vertical,
     }
 }
 
@@ -274,7 +96,8 @@ fn dir_of(edge: pane_grid::Edge) -> Dir {
 ///
 /// The canvas paints the tab bar, the status bar and the window background the
 /// gutters show through, and keeps the pane rects empty so that panes, their
-/// frames and their mouse handling belong to the grid alone.
+/// frames and their mouse handling belong to the grid alone. `panes` are the
+/// active tab's live panes, keyed by their index in the tab.
 pub fn view<'a>(
     state: &'a AppState,
     panes: Vec<(usize, SharedPane)>,
@@ -303,17 +126,7 @@ pub fn view<'a>(
     .width(Fill)
     .height(Fill);
 
-    let Some(cache) = state
-        .grid
-        .as_ref()
-        .filter(|cache| cache.is_fresh(state.active_tab, state.tree_revision))
-    else {
-        // Without a derived state there is no grid to show; the canvas layer's
-        // chrome still is.
-        return chrome_layer.into();
-    };
-
-    let layer = container(grid(cache, panes, mouse_tracking, state)).padding(Padding {
+    let layer = container(grid(state, panes, mouse_tracking)).padding(Padding {
         top: TAB_BAR_H,
         right: 0.0,
         bottom: STATUS_BAR_H,
@@ -328,28 +141,34 @@ pub fn view<'a>(
         .into()
 }
 
-/// Builds the pane grid from the derived state: one pane per terminal pane, each
-/// its own canvas under a title bar, framed by its own container border.
+/// Builds the pane grid from the tab's own state: one pane per cell, each the
+/// cell's active pane drawn by its own canvas under a title bar, and framed by
+/// its own container border.
 fn grid<'a>(
-    cache: &'a GridCache,
+    state: &'a AppState,
     panes: Vec<(usize, SharedPane)>,
     mouse_tracking: Vec<usize>,
-    state: &'a AppState,
 ) -> PaneGrid<'a, Message> {
+    let tab = state.current();
+    let tab_index = state.active_tab;
     let frames = state.show_frames;
-    let active = state.current().active;
+    let active = tab.active;
     let theme = state.theme;
     let (cell, font_px, padding) = (state.cell, state.config.font_size, state.config.padding);
-    let tab = state.active_tab;
     let inset = inset(frames);
     let font = fonts::primary();
 
-    PaneGrid::new(&cache.state, move |pane, &pane_id, _maximized| {
-        let handle = panes
-            .iter()
-            .find(|(id, _)| *id == pane_id)
-            .map(|(_, handle)| handle.clone());
-        let focused = pane_id == active;
+    PaneGrid::new(&tab.grid, move |_cell, payload: &GridPane, _maximized| {
+        // The cell's payload names panes by identity; the pane layer works with
+        // the index the tab addresses them by.
+        let index = payload.active_id().and_then(|id| tab.index_of(id));
+        let handle = index.and_then(|index| {
+            panes
+                .iter()
+                .find(|(pane, _)| *pane == index)
+                .map(|(_, handle)| handle.clone())
+        });
+        let focused = index == Some(active);
         // `Content` has no padding of its own, so the frame width is part of the
         // canvas inset: without it the opaque canvas covers the pane's own
         // border and only the gutters show it.
@@ -360,17 +179,22 @@ fn grid<'a>(
         } else {
             pane_canvas::FRAME_INACTIVE_W
         };
+        let frame_color = if focused {
+            theme.frame_active
+        } else {
+            theme.frame
+        };
         let body: Element<'a, Message> = match handle.clone() {
             Some(handle) => container(
                 Canvas::new(PaneCanvas {
-                    tab,
-                    pane: pane_id,
+                    tab: tab_index,
+                    pane: index.unwrap_or_default(),
                     active,
                     handle,
                     cell,
                     font_px,
                     padding,
-                    tracking: mouse_tracking.contains(&pane_id),
+                    tracking: index.is_some_and(|index| mouse_tracking.contains(&index)),
                 })
                 .width(Fill)
                 .height(Fill),
@@ -379,24 +203,13 @@ fn grid<'a>(
             .into(),
             None => text("").into(),
         };
-        let frame_color = if focused {
-            theme.frame_active
-        } else {
-            theme.frame
-        };
         let mut content = Content::new(body);
         if frames {
-            // The pane's 1-based position in the tab, which is the order the grid
-            // hands its panes out in.
-            let index = cache
-                .state
-                .iter()
-                .position(|(other, _)| *other == pane)
-                .map(|i| i + 1)
-                .unwrap_or(pane_id + 1);
+            // The pane's 1-based position in the tab.
+            let position = index.map(|index| index + 1).unwrap_or(1);
             let label = handle
                 .as_ref()
-                .map(|handle| pane_canvas::pane_label(handle, index))
+                .map(|handle| pane_canvas::pane_label(handle, position))
                 .unwrap_or_default();
             content = content.title_bar(TitleBar::new(label_band(&label, frame_color, font, theme)));
         }
@@ -492,7 +305,7 @@ fn grid_style(theme: &GhostTheme) -> pane_grid::Style {
 pub struct PaneCanvas {
     /// Tab these panes belong to, so forwarded events can be tagged.
     pub tab: usize,
-    /// The pane's id (index into `Tab::panes`).
+    /// The pane's index into its tab.
     pub pane: usize,
     /// The tab's focused pane, so a click knowledgeably focuses what it hit.
     pub active: usize,

@@ -1,6 +1,6 @@
-//! ghostwave on iced: a tab of panes from `ghostwave::layout`, painted on one
-//! clipped canvas, with pane frames, labels, click-to-focus and wheel
-//! scrollback.
+//! ghostwave on iced: a tab of terminal panes laid out by iced's `pane_grid`,
+//! painted on one clipped canvas, with pane frames, labels, click-to-focus and
+//! wheel scrollback.
 
 use ghostwave::config::Config;
 use iced::{
@@ -13,6 +13,8 @@ use libghostty_vt::key;
 mod app;
 mod chrome;
 mod fonts;
+#[allow(dead_code)]
+mod grid_session;
 mod input;
 mod keys;
 mod measure;
@@ -46,7 +48,7 @@ pub enum Message {
         id: pane::PaneId,
         reason: String,
     },
-    /// Carries the new window size; every pane's rect and grid is re-derived from it.
+    /// Carries the new window size; every pane's grid follows from it.
     Resized(Size),
     /// Advances the wave and expires the toast; subscribed only while something
     /// is actually animating.
@@ -154,27 +156,15 @@ impl App {
                 ev,
                 mods,
             } => {
-                if std::env::var_os("GHOST_ICED_DEBUG").is_some() {
-                    eprintln!(
-                        "[msg] Mouse pane={pane} focus={focus} kind={:?} active={}",
-                        ev.kind,
-                        self.state.current().active
-                    );
-                }
                 if focus && tab == self.state.active_tab {
                     self.state.focus(pane);
                 }
                 let rect = self
                     .state
-                    .rects
-                    .iter()
+                    .pane_rects()
+                    .into_iter()
                     .find(|(id, _)| *id == pane)
-                    .map(|(_, r)| ghostwave::layout::Rect {
-                        x: r.x,
-                        y: r.y,
-                        w: r.width,
-                        h: r.height,
-                    });
+                    .map(|(_, rect)| rect);
                 if let (Some(rect), Some(pane)) = (rect, self.state.pane_mut(tab, pane)) {
                     pane.lock().unwrap().mouse_event(
                         rect,
@@ -213,10 +203,8 @@ impl App {
                     input::key_release(&mut self.state, kp);
                 }
             }
-            // The pane-grid layer's own interactions; focus comes from the pane
-            // canvas that saw the press, not from pane_grid's click detection
-            // (its `contents` order does not line up with the layout children here,
-            // so it reports another pane).
+            // The pane-grid layer's own interactions: the grid keeps whatever
+            // ratio a split drag ends on, and a drop re-arranges its cells.
             Message::GridResize { split, ratio } => self.state.grid_resize(split, ratio),
             Message::GridDrag(event) => self.state.grid_drag(event),
         }
@@ -281,7 +269,22 @@ impl App {
         Canvas::new(TerminalCanvas {
             tab: self.state.active_tab,
             panes,
-            rects: self.state.rects.clone(),
+            // The canvas layer draws its own frames around these, so they are the
+            // pane layer's rects for the active tab's grid.
+            rects: self
+                .state
+                .pane_rects()
+                .into_iter()
+                .map(|(id, rect)| {
+                    (
+                        id,
+                        Rectangle::new(
+                            Point::new(rect.x, rect.y),
+                            Size::new(rect.w.max(1.0), rect.h.max(1.0)),
+                        ),
+                    )
+                })
+                .collect(),
             active: tab.active,
             cell: self.state.cell,
             font_px: self.state.config.font_size,

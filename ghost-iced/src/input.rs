@@ -306,7 +306,7 @@ mod tests {
     use super::*;
     use ghostwave::config::Config;
     use ghostwave::keymap::Mode;
-    use ghostwave::layout::{Node, SplitDir};
+    use iced::widget::pane_grid::{Axis, Node as GridNode};
     use libghostty_vt::key::Key;
 
     fn state() -> AppState {
@@ -388,9 +388,15 @@ mod tests {
         // A vertical split puts the new pane BELOW the focused one.
         assert_eq!(live_panes(&s), 2);
         assert!(
-            matches!(s.current().root, Node::Split { dir: SplitDir::Vertical, .. }),
+            matches!(
+                s.current().grid.layout(),
+                GridNode::Split {
+                    axis: Axis::Horizontal,
+                    ..
+                }
+            ),
             "d must split downward, got {:?}",
-            s.current().root
+            s.current().grid.layout()
         );
         // A modal action returns to Normal.
         assert_eq!(s.mode, Mode::Normal);
@@ -417,17 +423,23 @@ mod tests {
         let mut s = state();
         ctrl(&mut s, Key::P);
         typed(&mut s, Key::S, 's');
-        assert!(
-            matches!(s.current().root, Node::Stack { .. }),
-            "pane mode `s` stacks, got {:?}",
-            s.current().root
+        let cell = {
+            let tab = s.current();
+            let focused = tab.focused().expect("a focused cell");
+            tab.grid.get(focused).expect("its payload").clone()
+        };
+        assert_eq!(
+            cell.panes.len(),
+            2,
+            "pane mode `s` stacks the new pane into the focused cell"
         );
+        assert_eq!(cell.active_id(), Some(cell.panes[1]));
         ctrl(&mut s, Key::P);
         typed(&mut s, Key::Z, 'z');
-        assert!(s.current().zoomed.contains(&s.current().active));
+        assert!(s.current().grid.maximized().is_some());
         ctrl(&mut s, Key::P);
         typed(&mut s, Key::Z, 'z');
-        assert!(!s.current().zoomed.contains(&s.current().active));
+        assert!(s.current().grid.maximized().is_none());
         let frames = s.show_frames;
         ctrl(&mut s, Key::P);
         press(&mut s, Key::Z, Mods::SHIFT); // shift+z = ToggleFrames
@@ -486,9 +498,9 @@ mod tests {
         press(&mut s, Key::D, Mods::CTRL | Mods::SHIFT);
         assert_eq!(live_panes(&s), 2);
         assert!(matches!(
-            s.current().root,
-            Node::Split {
-                dir: SplitDir::Vertical,
+            s.current().grid.layout(),
+            GridNode::Split {
+                axis: Axis::Horizontal,
                 ..
             }
         ));
@@ -503,7 +515,7 @@ mod tests {
 
         // Ctrl+m toggles zoom on the focused pane.
         press(&mut s, Key::M, Mods::CTRL);
-        assert!(s.current().zoomed.contains(&s.current().active));
+        assert!(s.current().grid.maximized().is_some());
     }
 
     #[test]
@@ -511,17 +523,17 @@ mod tests {
         let mut s = state();
         ctrl(&mut s, Key::P);
         typed(&mut s, Key::R, 'r');
-        let before = format!("{:?}", s.current().root);
+        let before = format!("{:?}", s.current().grid.layout());
         ctrl(&mut s, Key::N);
         assert_eq!(s.mode, Mode::Resize);
         typed(&mut s, Key::L, 'l');
         // Resize stays in the mode: its own binds keep it open.
-        assert_ne!(format!("{:?}", s.current().root), before);
+        assert_ne!(format!("{:?}", s.current().grid.layout()), before);
 
         ctrl(&mut s, Key::H);
         typed(&mut s, Key::L, 'l');
-        // Move mode swaps the focused pane with its neighbour: pane ids move in
-        // the tree, the count does not change.
+        // Move mode swaps the focused pane with its neighbour: the cells trade
+        // their panes, the count does not change.
         assert_eq!(live_panes(&s), 2);
     }
 
@@ -578,6 +590,101 @@ mod tests {
         ctrl(&mut s, Key::P);
         typed(&mut s, Key::F, 'f');
         assert_eq!(toast(&s), "floating panes: not implemented yet");
+    }
+
+    #[test]
+    fn focus_stack_move_and_break_follow_the_grid() {
+        let mut s = state();
+        // Three panes: the first split right, then the focused pane split down.
+        ctrl(&mut s, Key::P);
+        typed(&mut s, Key::R, 'r');
+        let right = s.current().active;
+        ctrl(&mut s, Key::P);
+        typed(&mut s, Key::D, 'd');
+        assert_eq!(live_panes(&s), 3);
+
+        // Pane mode h/l move the focus between neighbouring cells.
+        ctrl(&mut s, Key::P);
+        typed(&mut s, Key::H, 'h');
+        assert_eq!(s.current().active, 0, "h focuses the pane on the left");
+        ctrl(&mut s, Key::P);
+        typed(&mut s, Key::L, 'l');
+        assert_eq!(s.current().active, right, "l focuses it back");
+
+        // Move mode is sticky, and with nothing to the right it leaves the layout
+        // alone; `n` then swaps the focused pane with the next cell in layout
+        // order.
+        let before = format!("{:?}", s.current().grid.layout());
+        ctrl(&mut s, Key::H);
+        assert_eq!(s.mode, Mode::Move);
+        typed(&mut s, Key::L, 'l');
+        assert_eq!(format!("{:?}", s.current().grid.layout()), before);
+        typed(&mut s, Key::N, 'n');
+        assert_ne!(format!("{:?}", s.current().grid.layout()), before);
+
+        // A plain pane is not a stack.
+        ctrl(&mut s, Key::P);
+        typed(&mut s, Key::W, 'w');
+        assert_eq!(toast(&s), "not in a stack (create with pane-mode s)");
+
+        // Stacking a pane into the focused cell and cycling shows the other member.
+        ctrl(&mut s, Key::P);
+        typed(&mut s, Key::S, 's');
+        let stacked = s.current().active;
+        assert_eq!(live_panes(&s), 4);
+        ctrl(&mut s, Key::P);
+        typed(&mut s, Key::W, 'w');
+        assert_ne!(s.current().active, stacked, "w shows the stack's other pane");
+
+        // Closing the shown member leaves the cell to the other one and moves the
+        // focus with it.
+        let cell = s.current().focused().expect("a focused cell");
+        ctrl(&mut s, Key::P);
+        typed(&mut s, Key::X, 'x');
+        let ids: Vec<_> = s
+            .current()
+            .panes
+            .iter()
+            .map(|p| p.as_ref().map(|p| p.lock().unwrap().id))
+            .collect();
+        assert_eq!(live_panes(&s), 3);
+        {
+            let tab = s.current();
+            assert_eq!(tab.grid.len(), 3, "the cell survives its pane");
+            let payload = tab.grid.get(cell).expect("the cell is still there");
+            assert_eq!(payload.panes.len(), 1, "the cell kept its other pane");
+            assert_eq!(
+                payload.active_id().and_then(|id| tab.index_of(id)),
+                Some(tab.active),
+                "the focus follows the cell's remaining pane"
+            );
+        }
+
+        // Breaking the focused pane out of the grid moves it, identity and all,
+        // into a tab of its own.
+        let moved = s.current().pane(s.current().active).map(|p| p.lock().unwrap().id);
+        ctrl(&mut s, Key::T);
+        typed(&mut s, Key::B, 'b');
+        assert_eq!(s.tabs.len(), 2, "break-pane opens a tab");
+        assert_eq!(s.active_tab, 1);
+        assert_eq!(live_panes(&s), 1, "the pane is alone in the new tab");
+        assert_eq!(
+            s.current().pane(s.current().active).map(|p| p.lock().unwrap().id),
+            moved,
+            "the pane keeps its identity across tabs"
+        );
+        assert_eq!(s.tabs[0].panes.iter().filter(|p| p.is_some()).count(), 2);
+
+        // Breaking the only pane out of a tab leaves that tab empty; a split into
+        // it starts it over.
+        ctrl(&mut s, Key::T);
+        typed(&mut s, Key::B, 'b');
+        assert_eq!(s.tabs.len(), 3);
+        s.goto_tab(1);
+        assert_eq!(live_panes(&s), 0);
+        ctrl(&mut s, Key::P);
+        typed(&mut s, Key::D, 'd');
+        assert_eq!(live_panes(&s), 1, "a split repopulates the emptied tab");
     }
 
     #[test]
