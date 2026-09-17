@@ -195,7 +195,7 @@ impl App {
                 },
                 mods,
             };
-            self.update(ev(
+            let _ = self.update(ev(
                 ghostwave::term::MouseEvKind::Press(button),
                 60.0,
                 y0,
@@ -204,7 +204,7 @@ impl App {
             ));
             for step in 1..=12 {
                 let step = step as f32;
-                self.update(ev(
+                let _ = self.update(ev(
                     ghostwave::term::MouseEvKind::Motion,
                     60.0 + step * 30.0,
                     y0 + step * 14.0,
@@ -212,7 +212,7 @@ impl App {
                     Some(button),
                 ));
             }
-            self.update(ev(
+            let _ = self.update(ev(
                 ghostwave::term::MouseEvKind::Release(button),
                 420.0,
                 y0 + 168.0,

@@ -29,11 +29,20 @@ pub(crate) const FRAME_ACTIVE_W: f32 = 2.0;
 pub(crate) const FRAME_INACTIVE_W: f32 = 1.0;
 /// Alpha of the selection band drawn over a selected cell.
 const BAND_ALPHA: f32 = 0.7;
-/// The glyph a selection band is built from.
+/// The glyph every block of colour is built from.
 ///
-/// The band is drawn as text rather than as a filled rectangle: a pane's filled
-/// rectangles do not reach the screen in every pane, while its glyphs do.
-const BAND_GLYPH: char = '\u{2588}';
+/// Cell backgrounds, the selection band, search matches and the cursor are all
+/// drawn as text rather than as filled rectangles: a pane's filled rectangles do
+/// not reach the screen in every pane, while its glyphs do.
+const BLOCK_GLYPH: char = '\u{2588}';
+/// The glyph for a search row's left-edge marker.
+const MARKER_GLYPH: char = '\u{258F}';
+/// The glyph for a bar cursor.
+const BAR_GLYPH: char = '\u{258F}';
+/// The glyph for an underline cursor and for underlined cells.
+const UNDERLINE_GLYPH: char = '\u{2581}';
+/// The glyph for struck-through cells.
+const STRIKE_GLYPH: char = '\u{2500}';
 
 /// Paints the window chrome: tab bar, status bar, wave, toast and overlays.
 pub struct TerminalCanvas {
@@ -264,7 +273,7 @@ pub(crate) fn paint_pane(
             Err(_) => continue,
         };
         let mut run: Option<TextRun> = None;
-        let mut band_run: Option<TextRun> = None;
+        let mut blocks: Vec<TextRun> = Vec::new();
         let sel_range = row
             .selection()
             .ok()
@@ -274,6 +283,7 @@ pub(crate) fn paint_pane(
             a: BAND_ALPHA,
             ..selection_band(theme, default_bg, default_fg)
         };
+        let match_band = rgb(theme.search_match);
 
         while let Some(c) = cells.next() {
             text_buf.clear();
@@ -317,37 +327,20 @@ pub(crate) fn paint_pane(
             }
 
             let selected = sel_range.is_some_and(|(c0, c1)| col_idx >= c0 && col_idx <= c1);
+            let matched = term.search.contains(row_idx, col_idx);
             if selected {
                 selected_cells += 1;
             }
-            if term.search.contains(row_idx, col_idx) {
-                frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), rgb(theme.search_match));
-                fg = rgb(theme.bg);
-            } else if let Some(c_bg) = cell_bg {
-                frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), c_bg);
-            }
 
             let baseline_y = y + cell.baseline;
-
-            if selected {
-                match band_run.as_mut() {
-                    Some(previous) if previous.color == band && previous.baseline_y == baseline_y => {
-                        previous.text.push(BAND_GLYPH);
-                    }
-                    _ => {
-                        if let Some(previous) = band_run.take() {
-                            draw_run(frame, &previous, font_px, font);
-                        }
-                        band_run = Some(TextRun {
-                            x,
-                            baseline_y,
-                            color: band,
-                            text: BAND_GLYPH.to_string(),
-                        });
-                    }
-                }
-            } else if let Some(previous) = band_run.take() {
-                draw_run(frame, &previous, font_px, font);
+            if let Some(c_bg) = cell_bg {
+                push_block(&mut blocks, c_bg, x, baseline_y, BLOCK_GLYPH);
+            }
+            if matched {
+                push_block(&mut blocks, match_band, x, baseline_y, BLOCK_GLYPH);
+                fg = rgb(theme.bg);
+            } else if selected {
+                push_block(&mut blocks, band, x, baseline_y, BLOCK_GLYPH);
             }
 
             let extends = match &run {
@@ -360,6 +353,7 @@ pub(crate) fn paint_pane(
                 }
             } else {
                 if let Some(r) = run.take() {
+                    flush_blocks(frame, &mut blocks, font_px, font);
                     draw_run(frame, &r, font_px, font);
                 }
                 if has_glyphs {
@@ -373,14 +367,10 @@ pub(crate) fn paint_pane(
             }
 
             if underline {
-                frame.fill_rectangle(Point::new(x, y + ch - 1.0), Size::new(cw, 1.0), fg);
+                push_block(&mut blocks, fg, x, baseline_y, UNDERLINE_GLYPH);
             }
             if strikethrough {
-                frame.fill_rectangle(
-                    Point::new(x, y + (ch / 2.0).floor()),
-                    Size::new(cw, 1.0),
-                    fg,
-                );
+                push_block(&mut blocks, fg, x, baseline_y, STRIKE_GLYPH);
             }
 
             x += cw;
@@ -388,17 +378,22 @@ pub(crate) fn paint_pane(
         }
 
         if let Some(r) = run.take() {
+            flush_blocks(frame, &mut blocks, font_px, font);
             draw_run(frame, &r, font_px, font);
         }
-        if let Some(previous) = band_run.take() {
-            draw_run(frame, &previous, font_px, font);
-        }
+        flush_blocks(frame, &mut blocks, font_px, font);
 
         if term.search.row_has_match(row_idx) {
-            frame.fill_rectangle(
-                Point::new(ox - 3.0, y + 2.0),
-                Size::new(2.0, ch - 4.0),
-                rgb(theme.search_match),
+            draw_run(
+                frame,
+                &TextRun {
+                    x: ox - cw,
+                    baseline_y: y + cell.baseline,
+                    color: match_band,
+                    text: MARKER_GLYPH.to_string(),
+                },
+                font_px,
+                font,
             );
         }
 
@@ -417,15 +412,22 @@ pub(crate) fn paint_pane(
             .cursor_visual_style()
             .unwrap_or(CursorVisualStyle::Block);
 
-        match style {
-            CursorVisualStyle::Bar => {
-                frame.fill_rectangle(Point::new(cx, cy), Size::new(2.0, ch), cursor_color)
-            }
-            CursorVisualStyle::Underline => {
-                frame.fill_rectangle(Point::new(cx, cy + ch - 1.0), Size::new(cw, 1.0), cursor_color)
-            }
-            _ => frame.fill_rectangle(Point::new(cx, cy), Size::new(cw, ch), cursor_color),
-        }
+        let glyph = match style {
+            CursorVisualStyle::Bar => BAR_GLYPH,
+            CursorVisualStyle::Underline => UNDERLINE_GLYPH,
+            _ => BLOCK_GLYPH,
+        };
+        draw_run(
+            frame,
+            &TextRun {
+                x: cx,
+                baseline_y: cy + cell.baseline,
+                color: cursor_color,
+                text: glyph.to_string(),
+            },
+            font_px,
+            font,
+        );
     }
 
     if debug {
@@ -452,6 +454,30 @@ struct TextRun {
     text: String,
 }
 
+
+/// Adds one block glyph to the row's pending blocks, merging with the previous one
+/// when it continues the same colour on the same line.
+fn push_block(blocks: &mut Vec<TextRun>, color: Color, x: f32, baseline_y: f32, glyph: char) {
+    match blocks.last_mut() {
+        Some(run) if run.color == color && run.baseline_y == baseline_y => run.text.push(glyph),
+        _ => blocks.push(TextRun {
+            x,
+            baseline_y,
+            color,
+            text: glyph.to_string(),
+        }),
+    }
+}
+
+/// Draws the row's pending blocks.
+///
+/// Called before the row's glyphs are drawn, so blocks land under the text they
+/// sit behind.
+fn flush_blocks(frame: &mut Frame, blocks: &mut Vec<TextRun>, font_px: f32, font: Font) {
+    for run in blocks.drain(..) {
+        draw_run(frame, &run, font_px, font);
+    }
+}
 
 fn draw_run(frame: &mut Frame, run: &TextRun, font_px: f32, font: Font) {
     if run.text.is_empty() {
