@@ -1039,6 +1039,17 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   Lesson: when a framework's rendering surprises you, read the framework's own source and how its own
   widgets do the same job (iced's text editor renders its selection as rectangles; iced's canvas draws
   text above shapes) before guessing at colours, ordering or caching.
+- **The cut is done: the iced front-end is the app, macroquad is gone.** The port's sources moved to
+  the crate root and became the binary; the macroquad presentation (`app.rs`, `main.rs`, `palette.rs`,
+  `ai.rs`, `preview.rs`, `visualizer.rs`) is deleted along with its renderer and kitty-graphics code,
+  and `macroquad`/`image` left the dependency list. Three of the port's modules were renamed around
+  core modules that stay: `ui_config.rs`, `ui_fonts.rs`, `ui_session.rs`. Two things the cut exposed:
+  the port's asset `include_bytes!` paths were one directory too deep once it sat in `src/`, and the
+  AI pane's chat request lived in the deleted core `ai.rs` — it was restored from `macroquad-final`.
+  One crate now: `lib` = core, `bin` = the iced app. `cargo test`: 49 + 130 + 1 + 6 pass. README
+  rewritten so every claim is something this build does, with the unported items (remote/SSH, kitty
+  graphics, middle-click paste, preview images, session parking) named in a "Not in this build"
+  section pointing at the archive.
 - **How the crate move (step 5) is shaped, decided before touching it.** The root package already has a
   **lib** (`src/lib.rs` = the core) plus a **bin** (`src/main.rs` = macroquad), and a bin target can use
   its own package's lib by name — so after the cut the port's sources must move into a **subdirectory**
