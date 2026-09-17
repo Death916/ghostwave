@@ -42,7 +42,7 @@ const PRIMARY_FAMILY: &str = "jetbrains mono";
 pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
     let mut out: Vec<(String, Vec<u8>)> = Vec::new();
     if limit == 0 {
-        eprintln!("[ghost-iced] fallback fonts: 0");
+        eprintln!("[ghostwave] fallback fonts: 0");
         return out;
     }
 
@@ -108,7 +108,7 @@ pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
 
     let names: Vec<&str> = out.iter().map(|(f, _)| f.as_str()).collect();
     eprintln!(
-        "[ghost-iced] fallback fonts: {} ({})",
+        "[ghostwave] fallback fonts: {} ({})",
         out.len(),
         names.join(", ")
     );

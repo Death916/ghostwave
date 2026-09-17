@@ -97,7 +97,7 @@ pub fn spawn(id: crate::pane::PaneId, rx: mpsc::Receiver<PtyMsg>) -> PtyRxSlot {
         });
 
     if let Err(e) = spawned {
-        eprintln!("[ghost-iced] pty bridge thread failed to start: {e}");
+        eprintln!("[ghostwave] pty bridge thread failed to start: {e}");
     }
 
     PtyRxSlot(Arc::new(Slot {

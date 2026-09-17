@@ -43,7 +43,7 @@ pub fn stream(slot: &TickSlot) -> Pin<Box<dyn Stream<Item = Message> + Send>> {
         });
 
     if let Err(e) = spawned {
-        eprintln!("[ghost-iced] tick thread failed to start: {e}");
+        eprintln!("[ghostwave] tick thread failed to start: {e}");
         return Box::pin(iced::futures::stream::pending::<Message>());
     }
 

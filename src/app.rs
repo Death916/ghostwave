@@ -437,7 +437,7 @@ impl AppState {
                     SplitDir::Vertical
                 };
                 if state.split(dir).is_err() {
-                    eprintln!("[ghost-iced] GHOST_ICED_PANES: stopped after {i} panes");
+                    eprintln!("[ghostwave] GHOST_ICED_PANES: stopped after {i} panes");
                     break;
                 }
             }

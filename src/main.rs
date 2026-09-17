@@ -138,7 +138,7 @@ impl App {
         let mut state = AppState::new(config, cell, START_WINDOW).expect("spawn the first pane");
         ui_session::restore_last(&mut state);
         eprintln!(
-            "[ghost-iced] cell {}x{} px, baseline {}, theme {}, frames {}, session '{}', tab '{}' with {} pane(s)",
+            "[ghostwave] cell {}x{} px, baseline {}, theme {}, frames {}, session '{}', tab '{}' with {} pane(s)",
             cell.w,
             cell.h,
             cell.baseline,
@@ -225,7 +225,7 @@ impl App {
                 true,
                 Some(button),
             ));
-            eprintln!("[ghost-iced] selftest drag finished in pane {pane:?}");
+            eprintln!("[ghostwave] selftest drag finished in pane {pane:?}");
         }
     }
 
@@ -266,7 +266,7 @@ impl App {
                     let mut guard = pane_ref.lock().unwrap();
                     if std::env::var_os("GHOST_ICED_DEBUG").is_some() {
                         eprintln!(
-                            "[ghost-iced] mouse tab {tab} pane {pane:?} {:?} x {:.1} y {:.1} button_down {:?}",
+                            "[ghostwave] mouse tab {tab} pane {pane:?} {:?} x {:.1} y {:.1} button_down {:?}",
                             ev.kind, ev.x, ev.y, ev.button_down
                         );
                     }
