@@ -1046,10 +1046,12 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   register it in a registry keyed by `PaneId` when they are built (`pane.rs`: `register_meta` /
   `with_pane_meta`) and the session format reads that instead of the pane (`session.rs`). A session
   rename now also persists the renamed session, so renaming one that was never written keeps it.
-  130 tests pass with no hangs. Floats are the remaining parity gap: reuse
-  `ScratchpadState::to_float(pane, rect, origin)` plus the `floating`/`next_z_index` bookkeeping and the
-  float layer, closing the pane out of its grid cell on the way out and re-inserting it at the saved
-  origin on the way back.
+  130 tests pass with no hangs. Floats took the route the reference implied: `ScratchpadState::to_float`
+  on the very `floating` list the float layer paints, with the pane closed out of its grid cell so the
+  grid stops painting it, and embedding back by splitting beside the focused cell — the float, hide and
+  cycle binds are confirmed working in the iced build (owner, 2026-09-17), as are sessions. Remote panes
+  are now the last real parity gap: the reference's `ensure_remote_binary` / `remote_attach_cmd` /
+  `connect_remote_pane` / `kill_remote_pane` / `live_remote_specs` subsystem, about 250 lines.
 - **What parity actually has left, checked against the reference rather than the toast list.** Three
   arms in `ghost-iced/src/input.rs` still toast, but only two are real gaps:
   `Action::EditScrollback` toasts in the **macroquad build too** (`src/app.rs:502`), so parity there is
