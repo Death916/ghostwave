@@ -12,11 +12,14 @@ Binary name: `ghostwave`
 
 ## STATUS: main terminal features solid — render/mouse/keybinds fixed, parity work in progress
 
-**iced front-end WIP (branch `feat/iced-frontend`, commit `7d143e4`)**: a second front-end in
-`ghost-iced/` now renders a full tab (panes, frames, tab bar, status bar, wave, toast) from the
-same terminal core. Not merged; the macroquad build is still the default binary and the
-reference. Port state, module map, exact build/run commands and the M3 plan live in
-`ghost-iced/PORT-PLAN.md` §13 — read that first.
+**iced front-end WIP (branch `feat/iced-frontend`, commit `6b0807c`)**: a second front-end in
+`ghost-iced/` renders a full tab (panes, frames, tab bar, status bar, wave, toast) from the same
+terminal core, drives every keymap mode, and — as of M5a part 1 — keeps its layout in iced's own
+`pane_grid::State`, with the macroquad tree format demoted to the session save/load shape (19/19
+tests pass). Not merged; the macroquad build is still the default binary and the reference.
+**Start with `ghost-iced/HANDOFF.md`** (brief for the next session), then
+`ghost-iced/PORT-PLAN.md` §13 (status), §16 (direction change), §17 (Plan A + the M5a parity
+table).
 
 ### iced front-end, M0 (branch `feat/iced-frontend`) — second front-end builds and runs, one pane
 New crate `ghost-iced/` (iced 0.14 + libghostty-vt, path-dep on the app lib, `[workspace]`
@@ -160,6 +163,35 @@ history or addresses a future maintainer goes in these markdown files instead.
 The user's read on the two builds: iced's text looks sharper and is preferred, and the port
 stays reversible — a wipe and continue with macroquad remains a live option until iced
 reaches parity.
+
+### iced front-end, M3 + M5a part 1 (branch `feat/iced-frontend`) — input parity, then the pane layer moved into iced
+
+**M3 (input parity)** — `input.rs` mirrors the reference's `keymap::handle`/`execute` as an iced
+message handler: pane/tab/resize/move/scroll/lock modes, the globals, `Ctrl+q`, and a toast for
+everything not ported yet (palette, search, sessions). Repeats are platform events now (no
+synthetic repeat timer) and a release is forwarded only when the press was not consumed. 13
+acceptance tests drive real panes through `input::key_press`; there is no key-injection tool on
+Hyprland 0.5x, so those tests are the verification.
+
+**M5a part 1 (the pane layer)** — a tab now owns `pane_grid::State<GridPane>` (payload
+`{ panes: Vec<PaneId>, active }`, so a zellij stack is one cell holding several ids) and every pane
+operation routes through iced: `split` / `close` / `adjacent` / `resize` / `maximize` / `restore` /
+`swap` / `drop`. `AppState`'s rect cache, `tree_revision`, `sync_grid` and the derived `GridCache`
+layer are deleted; `ghostwave::layout::Node` survives only as the session save/load format, with
+the conversion in `grid_session.rs` tested both ways (single, right, down, nested, stack). Fixed on
+the way: closing a stacked pane left the focus on the closed pane, because `pop_focused_stack`
+mutated the cell's payload before `focused_id()` looked the cell up by the pane it no longer
+contained. 19/19 tests pass, `ghost-iced` compiles warning-free.
+
+**Why the pane layer moved**: the first cut derived a `pane_grid::State` from our tree and kept the
+tree authoritative; iced pairs its panes with layout children positionally, so in that state
+`on_click` reported the first pane for every click (measured: a press in the right cell published
+`Pane(0)`) and focus snapped to the wrong pane. Using the widget as a renderer for a tree it does
+not own was the bug — the grid owns the layout now (PORT-PLAN §17).
+
+**Next**: M5a part 2, the pane view — per-cell canvas of the active member, stack-aware title bars,
+`on_click` focus, drag-resize and drag-move, ptys sized from the bounds iced actually lays out, and
+rounded pane origins for sharp text. Brief and exact commands: `ghost-iced/HANDOFF.md`.
 
 ### Idle GPU, part 2 (branch `perf/idle-gpu-2`) — idle frame tier 30 → 8 FPS
 User: "gpu usage is pretty high even when idle still" after the earlier adaptive

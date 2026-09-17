@@ -313,15 +313,24 @@ to `~/.cache/ghost-iced/ld-path` (`/tmp/iced-spike-ldp` does not survive a boot)
 
 ## 13. Status + next up (2026-09-16, cold-start handoff — read this first)
 
-Committed: `7d143e4` on `feat/iced-frontend` ("WIP iced front-end: second front-end renders a
-full tab (M0-M2)"). Not merged and not to be merged yet. master untouched, the macroquad
-front-end is still the default binary and the reference, and `src/**` + the top-level
-`Cargo.toml` have not been modified (verify with `git diff --stat -- src Cargo.toml`).
+**Start with `HANDOFF.md`** (same directory): it is the brief for whoever picks this up next —
+state, exact commands, the next task in order, the pitfalls already paid for, and the conventions
+the owner enforces. This section keeps the port's history and the detail behind it.
 
-**Done: M0** (one pane) **M1** (N panes / frames / labels / click focus / wheel scroll)
-**M2** (tab bar, status bar + wave, toast, conditional animation tick).
-**Next: M3 input parity** — the keymap modes and Action dispatch. Then M4 (tabs + sessions),
-M5 (leftover knobs + runtime theme switch), M6 (extras), M7 (parity + perf).
+Committed: `6b0807c` on `feat/iced-frontend` ("iced: pane_grid owns the pane layer (M5a part 1)").
+Not merged and not to be merged yet. master untouched, the macroquad front-end is still the
+default binary and the reference, and `src/**` + the top-level `Cargo.toml` have not been modified
+(verify with `git diff --stat -- src Cargo.toml`). Tests 19/19, `ghost-iced` warning-free, working
+tree clean, nothing running.
+
+**Done: M0** (one pane) **M1** (N panes / frames / labels / focus / wheel scroll) **M2** (chrome:
+tab bar, status bar + wave, toast, conditional animation tick) **M3** (input parity: every keymap
+mode, every action routed or honestly toasted) **M5a part 1** (the pane layer: a tab owns
+`pane_grid::State<GridPane>`, the operations route through iced, `layout::Node` demoted to the
+session format with tested conversions — see §17).
+**Next: M5a part 2, the pane view** — the steps are in `HANDOFF.md` §6 and the acceptance target
+is the parity table in §17. Then M5b (chrome as widgets), M4 (sessions), M6 (selection), M7 (the
+numbers that decide whether the iced front-end replaces the macroquad one).
 
 ### Build / run / verify (exact commands)
 
