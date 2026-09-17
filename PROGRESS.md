@@ -1039,6 +1039,18 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   Lesson: when a framework's rendering surprises you, read the framework's own source and how its own
   widgets do the same job (iced's text editor renders its selection as rectangles; iced's canvas draws
   text above shapes) before guessing at colours, ordering or caching.
+- **How the crate move (step 5) is shaped, decided before touching it.** The root package already has a
+  **lib** (`src/lib.rs` = the core) plus a **bin** (`src/main.rs` = macroquad), and a bin target can use
+  its own package's lib by name — so after the cut the port's sources must move into a **subdirectory**
+  (e.g. `src/ui/`), not into `src/` directly: the port has `app.rs`, `input.rs`, `session.rs`, `pane.rs`,
+  `theme.rs` and friends, which collide with core files of the same names. The port's `main.rs` becomes
+  the root binary, its `mod` declarations gain the subdirectory prefix, `ghost-iced/Cargo.toml`'s
+  `[workspace]` marker and `ghost-iced/Cargo.lock` go away, the second `ghostwave = { path = ".." }`
+  dependency collapses into the same package, and `use ghostwave::…` keeps working unchanged because it
+  still names the lib. Order matters: do 5 (move) then 6 (delete the presentation files) and only then 4
+  (de-macroquad the core) — the macroquad-typed surfaces in `term.rs`/`keymap.rs`/`fonts.rs` are still
+  used by the macroquad `main.rs`/`app.rs` until those are deleted, so stripping them earlier breaks the
+  build on this branch for no gain.
 - **Retirement, step by step.** The archive is cut and pushed: branch `macroquad-archive` (one commit on
   top of `8c40aaf` adding `ARCHIVE.md`) and annotated tag `macroquad-final` → `8c40aaf`, verified on the
   remote, at a commit a fresh worktree proved green (66 + 66 + 1 + 6 tests). That kills the only
