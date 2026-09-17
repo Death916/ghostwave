@@ -71,7 +71,9 @@ pub enum Message {
     /// the mouse) or into selection / viewport scrolling.
     Mouse {
         tab: usize,
-        pane: usize,
+        /// The pane's identity. Not its index: the index is resolved only when
+        /// the message is handled, by which point the layout may have changed.
+        pane: pane::PaneId,
         ev: ghostwave::term::MouseEv,
         /// Modifier state for the pane's encoder; iced's mouse events do not
         /// carry it.
@@ -121,6 +123,10 @@ struct App {
     state: AppState,
 }
 
+/// Whether the synthetic self-test drag has already run.
+static SELF_TEST_DRAG_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl App {
     fn new() -> (Self, Task<Message>) {
         let config = Config::load();
@@ -156,6 +162,67 @@ impl App {
         "ghostwave (iced)".to_string()
     }
 
+    /// Drives one synthetic drag through the normal mouse path, so the selection
+    /// painter can be exercised without a pointer at the window. Enabled by
+    /// `GHOST_ICED_SELFTEST`.
+    fn self_test_drag(&mut self) {
+        if std::env::var_os("GHOST_ICED_SELFTEST").is_none()
+            || SELF_TEST_DRAG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let button = libghostty_vt::mouse::Button::Left;
+        let tab = self.state.active_tab;
+        let mods = keys::current_mods();
+        for (index, y0) in [(0usize, 300.0f32), (1, 600.0)] {
+            let pane = match self.state.pane_mut(self.state.active_tab, index) {
+                Some(pane) => pane.lock().unwrap().id,
+                None => continue,
+            };
+            let ev = |kind: ghostwave::term::MouseEvKind,
+                      x: f32,
+                      y: f32,
+                      any_pressed: bool,
+                      button_down: Option<libghostty_vt::mouse::Button>| Message::Mouse {
+                tab,
+                pane,
+                ev: ghostwave::term::MouseEv {
+                    kind,
+                    x,
+                    y,
+                    any_pressed,
+                    button_down,
+                },
+                mods,
+            };
+            self.update(ev(
+                ghostwave::term::MouseEvKind::Press(button),
+                60.0,
+                y0,
+                false,
+                None,
+            ));
+            for step in 1..=12 {
+                let step = step as f32;
+                self.update(ev(
+                    ghostwave::term::MouseEvKind::Motion,
+                    60.0 + step * 30.0,
+                    y0 + step * 14.0,
+                    true,
+                    Some(button),
+                ));
+            }
+            self.update(ev(
+                ghostwave::term::MouseEvKind::Release(button),
+                420.0,
+                y0 + 168.0,
+                true,
+                Some(button),
+            ));
+            eprintln!("[ghost-iced] selftest drag finished in pane {pane:?}");
+        }
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Output { id, data } => {
@@ -172,7 +239,10 @@ impl App {
                 }
             }
             Message::Resized(size) => self.state.set_window(size),
-            Message::Tick => self.state.tick(),
+            Message::Tick => {
+                self.self_test_drag();
+                self.state.tick()
+            }
             Message::FocusTab(index) => {
                 if index < self.state.tabs.len() {
                     self.state.active_tab = index;
@@ -186,12 +256,12 @@ impl App {
                 ev,
                 mods,
             } => {
-                if let Some(pane_ref) = self.state.pane_mut(tab, pane) {
+                if let Some(pane_ref) = self.state.pane_by_id(pane) {
                     let mut guard = pane_ref.lock().unwrap();
                     if std::env::var_os("GHOST_ICED_DEBUG").is_some() {
                         eprintln!(
-                            "[ghost-iced] mouse tab {tab} pane {pane} id {} {:?} x {:.1} y {:.1} button_down {:?}",
-                            guard.id.0, ev.kind, ev.x, ev.y, ev.button_down
+                            "[ghost-iced] mouse tab {tab} pane {pane:?} {:?} x {:.1} y {:.1} button_down {:?}",
+                            ev.kind, ev.x, ev.y, ev.button_down
                         );
                     }
                     let (w, h) = guard
@@ -429,6 +499,7 @@ impl App {
             let canvas = Canvas::new(panes_grid::PaneCanvas {
                 tab: tab_index,
                 pane: index,
+                pane_id: float.id(),
                 handle,
                 cell: self.state.cell,
                 font_px: self.state.config.font_size,

@@ -178,6 +178,7 @@ fn grid<'a>(state: &'a AppState, mouse_tracking: Vec<usize>) -> PaneGrid<'a, Mes
                 Canvas::new(PaneCanvas {
                     tab: tab_index,
                     pane: index.unwrap_or_default(),
+                    pane_id: entry.map(|entry| entry.id()).unwrap_or(PaneId(0)),
                     handle: handle.clone(),
                     cell,
                     font_px,
@@ -329,8 +330,15 @@ fn grid_style(theme: &GhostTheme) -> pane_grid::Style {
 pub struct PaneCanvas {
     /// Tab these panes belong to, so forwarded events can be tagged.
     pub tab: usize,
-    /// The pane's index into its tab.
+    /// The pane's index into its tab, kept for logging and mouse tracking.
     pub pane: usize,
+    /// The pane's identity.
+    ///
+    /// Events are tagged with this rather than the index: the index is only
+    /// meaningful for the layout generation that produced it, so a focus change,
+    /// close or split between a press and the motion events that follow it would
+    /// resolve an index against a different pane.
+    pub pane_id: PaneId,
     pub handle: SharedPane,
     pub cell: CellDims,
     pub font_px: f32,
@@ -487,7 +495,7 @@ impl PaneCanvas {
     ) -> Message {
         Message::Mouse {
             tab: self.tab,
-            pane: self.pane,
+            pane: self.pane_id,
             ev: MouseEv {
                 kind,
                 x: point.x - bounds.x,

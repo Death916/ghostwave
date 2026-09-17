@@ -1020,6 +1020,460 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_leaves_a_selection_the_painter_can_read() {
+        let mut s = state();
+        let (tab, index) = (s.active_tab, 0);
+        let pane = s.pane_mut(tab, index).expect("a pane");
+        let (cell, padding) = (s.cell, s.config.padding);
+        let rect = ghostwave::layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 200.0,
+        };
+        let mods = crate::keys::current_mods();
+        let left = crate::pane_canvas::vt_button(iced::mouse::Button::Left).expect("a real button");
+        {
+            let mut guard = pane.lock().unwrap();
+            guard.ingest(b"alpha beta gamma\r\ndelta epsilon zeta\r\n");
+            guard.mouse_event(
+                rect,
+                cell,
+                padding,
+                ghostwave::term::MouseEv {
+                    kind: ghostwave::term::MouseEvKind::Press(left),
+                    x: 20.0,
+                    y: 10.0,
+                    any_pressed: false,
+                    button_down: None,
+                },
+                mods,
+            );
+            for step in 1..=5 {
+                let d = step as f32;
+                guard.mouse_event(
+                    rect,
+                    cell,
+                    padding,
+                    ghostwave::term::MouseEv {
+                        kind: ghostwave::term::MouseEvKind::Motion,
+                        x: 20.0 + d * 30.0,
+                        y: 10.0 + d * 20.0,
+                        any_pressed: true,
+                        button_down: Some(left),
+                    },
+                    mods,
+                );
+            }
+            guard.mouse_event(
+                rect,
+                cell,
+                padding,
+                ghostwave::term::MouseEv {
+                    kind: ghostwave::term::MouseEvKind::Release(left),
+                    x: 170.0,
+                    y: 110.0,
+                    any_pressed: true,
+                    button_down: None,
+                },
+                mods,
+            );
+        }
+
+        let mut guard = pane.lock().unwrap();
+        let crate::pane::Pane { term, scratch, .. } = &mut *guard;
+        let crate::pane::RenderScratch {
+            render_state,
+            row_it,
+            ..
+        } = scratch;
+        let snapshot = render_state.update(&term.term).expect("a snapshot");
+        let mut rows = row_it.update(&snapshot).expect("rows");
+        let mut ranges = Vec::new();
+        while let Some(row) = rows.next() {
+            if let Some(sel) = row.selection().ok().flatten() {
+                ranges.push((sel.start_x, sel.end_x));
+            }
+        }
+        assert!(
+            !ranges.is_empty(),
+            "a drag left no row selection range for the painter: {ranges:?}"
+        );
+    }
+
+    #[test]
+    fn the_selection_range_survives_a_clean_pass() {
+        let mut s = state();
+        let (tab, index) = (s.active_tab, 0);
+        let pane = s.pane_mut(tab, index).expect("a pane");
+        let (cell, padding) = (s.cell, s.config.padding);
+        let rect = ghostwave::layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 200.0,
+        };
+        let mods = crate::keys::current_mods();
+        let left = crate::pane_canvas::vt_button(iced::mouse::Button::Left).expect("a real button");
+        {
+            let mut guard = pane.lock().unwrap();
+            guard.ingest(b"alpha beta gamma\r\ndelta epsilon zeta\r\n");
+            guard.mouse_event(
+                rect,
+                cell,
+                padding,
+                ghostwave::term::MouseEv {
+                    kind: ghostwave::term::MouseEvKind::Press(left),
+                    x: 20.0,
+                    y: 10.0,
+                    any_pressed: false,
+                    button_down: None,
+                },
+                mods,
+            );
+            guard.mouse_event(
+                rect,
+                cell,
+                padding,
+                ghostwave::term::MouseEv {
+                    kind: ghostwave::term::MouseEvKind::Motion,
+                    x: 180.0,
+                    y: 110.0,
+                    any_pressed: true,
+                    button_down: Some(left),
+                },
+                mods,
+            );
+        }
+
+        let mut guard = pane.lock().unwrap();
+        let crate::pane::Pane { term, scratch, .. } = &mut *guard;
+        let crate::pane::RenderScratch {
+            render_state,
+            row_it,
+            ..
+        } = scratch;
+
+        let mut before = Vec::new();
+        {
+            let snapshot = render_state.update(&term.term).expect("a snapshot");
+            let mut rows = row_it.update(&snapshot).expect("rows");
+            while let Some(row) = rows.next() {
+                if let Some(sel) = row.selection().ok().flatten() {
+                    before.push((sel.start_x, sel.end_x));
+                }
+                let _ = row.set_dirty(false);
+            }
+            let _ = snapshot.set_dirty(libghostty_vt::render::Dirty::Clean);
+        }
+
+        let mut after = Vec::new();
+        {
+            let snapshot = render_state.update(&term.term).expect("a snapshot");
+            let mut rows = row_it.update(&snapshot).expect("rows");
+            while let Some(row) = rows.next() {
+                if let Some(sel) = row.selection().ok().flatten() {
+                    after.push((sel.start_x, sel.end_x));
+                }
+            }
+        }
+
+        assert!(!before.is_empty(), "no range before clearing: {before:?}");
+        assert!(
+            !after.is_empty(),
+            "the selection range must survive the painter's clean pass: {after:?}"
+        );
+    }
+
+    /// Drives a drag through the real mouse path in the pane at `index` and
+    /// returns the selection ranges the painter would see, one per selected row.
+    fn drag_and_read_selection(s: &mut AppState, index: usize) -> Vec<(u16, u16)> {
+        let pane = s.pane_mut(s.active_tab, index).expect("a pane");
+        let (cell, padding) = (s.cell, s.config.padding);
+        let rect = ghostwave::layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 200.0,
+        };
+        let mods = crate::keys::current_mods();
+        let left = crate::pane_canvas::vt_button(iced::mouse::Button::Left).expect("a real button");
+        {
+            let mut guard = pane.lock().unwrap();
+            guard.ingest(b"alpha beta gamma\r\ndelta epsilon zeta\r\n");
+            guard.mouse_event(
+                rect,
+                cell,
+                padding,
+                ghostwave::term::MouseEv {
+                    kind: ghostwave::term::MouseEvKind::Press(left),
+                    x: 20.0,
+                    y: 10.0,
+                    any_pressed: false,
+                    button_down: None,
+                },
+                mods,
+            );
+            for step in 1..=5 {
+                let d = step as f32;
+                guard.mouse_event(
+                    rect,
+                    cell,
+                    padding,
+                    ghostwave::term::MouseEv {
+                        kind: ghostwave::term::MouseEvKind::Motion,
+                        x: 20.0 + d * 20.0,
+                        y: 10.0 + d * 20.0,
+                        any_pressed: true,
+                        button_down: Some(left),
+                    },
+                    mods,
+                );
+            }
+            guard.mouse_event(
+                rect,
+                cell,
+                padding,
+                ghostwave::term::MouseEv {
+                    kind: ghostwave::term::MouseEvKind::Release(left),
+                    x: 120.0,
+                    y: 110.0,
+                    any_pressed: true,
+                    button_down: None,
+                },
+                mods,
+            );
+        }
+
+        let mut guard = pane.lock().unwrap();
+        let crate::pane::Pane { term, scratch, .. } = &mut *guard;
+        let crate::pane::RenderScratch {
+            render_state,
+            row_it,
+            ..
+        } = scratch;
+        let snapshot = render_state.update(&term.term).expect("a snapshot");
+        let mut rows = row_it.update(&snapshot).expect("rows");
+        let mut ranges = Vec::new();
+        while let Some(row) = rows.next() {
+            if let Some(sel) = row.selection().ok().flatten() {
+                ranges.push((sel.start_x, sel.end_x));
+            }
+        }
+        ranges
+    }
+
+    #[test]
+    fn an_existing_pane_still_selects_after_a_split() {
+        let mut s = state();
+        let existing = s.pane_mut(s.active_tab, 0).expect("a pane").lock().unwrap().id;
+
+        let single = drag_and_read_selection(&mut s, 0);
+        assert!(!single.is_empty(), "a single pane selects: {single:?}");
+
+        execute(&mut s, Action::NewPaneRight);
+        let live = s.current().panes.iter().filter(|p| p.is_some()).count();
+        assert_eq!(live, 2, "the split added a second pane");
+
+        let index = s.current().index_of(existing).expect("the pane is still there");
+        let after = drag_and_read_selection(&mut s, index);
+        assert!(
+            !after.is_empty(),
+            "the pane that was already there must still select after a split \
+             (it is index {index} now): {after:?}"
+        );
+    }
+
+    /// Drives a drag through the real mouse path in the pane at `index`.
+    fn drag_in(s: &mut AppState, index: usize) {
+        let pane = s.pane_mut(s.active_tab, index).expect("a pane");
+        let (cell, padding) = (s.cell, s.config.padding);
+        let rect = ghostwave::layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 200.0,
+        };
+        let mods = crate::keys::current_mods();
+        let left = crate::pane_canvas::vt_button(iced::mouse::Button::Left).expect("a real button");
+        let mut guard = pane.lock().unwrap();
+        guard.mouse_event(
+            rect,
+            cell,
+            padding,
+            ghostwave::term::MouseEv {
+                kind: ghostwave::term::MouseEvKind::Press(left),
+                x: 20.0,
+                y: 10.0,
+                any_pressed: false,
+                button_down: None,
+            },
+            mods,
+        );
+        for step in 1..=5 {
+            let d = step as f32;
+            guard.mouse_event(
+                rect,
+                cell,
+                padding,
+                ghostwave::term::MouseEv {
+                    kind: ghostwave::term::MouseEvKind::Motion,
+                    x: 20.0 + d * 20.0,
+                    y: 10.0 + d * 20.0,
+                    any_pressed: true,
+                    button_down: Some(left),
+                },
+                mods,
+            );
+        }
+        guard.mouse_event(
+            rect,
+            cell,
+            padding,
+            ghostwave::term::MouseEv {
+                kind: ghostwave::term::MouseEvKind::Release(left),
+                x: 120.0,
+                y: 110.0,
+                any_pressed: true,
+                button_down: None,
+            },
+            mods,
+        );
+    }
+
+    /// The selection ranges the painter would see for the pane at `index`.
+    ///
+    /// With `mark_clean` this also does what [`pane_canvas::paint_pane`] does at
+    /// the end of a pass: mark every row clean and settle the snapshot.
+    fn ranges_of(s: &mut AppState, index: usize, mark_clean: bool) -> Vec<(u16, u16)> {
+        let pane = s.pane_mut(s.active_tab, index).expect("a pane");
+        let mut guard = pane.lock().unwrap();
+        let crate::pane::Pane { term, scratch, .. } = &mut *guard;
+        let crate::pane::RenderScratch {
+            render_state,
+            row_it,
+            ..
+        } = scratch;
+        let snapshot = render_state.update(&term.term).expect("a snapshot");
+        let mut rows = row_it.update(&snapshot).expect("rows");
+        let mut ranges = Vec::new();
+        while let Some(row) = rows.next() {
+            if let Some(sel) = row.selection().ok().flatten() {
+                ranges.push((sel.start_x, sel.end_x));
+            }
+            if mark_clean {
+                let _ = row.set_dirty(false);
+            }
+        }
+        if mark_clean {
+            let _ = snapshot.set_dirty(libghostty_vt::render::Dirty::Clean);
+        }
+        ranges
+    }
+
+    #[test]
+    fn a_drag_in_a_pane_that_was_already_painted_still_selects() {
+        let mut s = state();
+        {
+            let pane = s.pane_mut(s.active_tab, 0).expect("a pane");
+            let mut guard = pane.lock().unwrap();
+            guard.ingest(b"alpha beta gamma\r\ndelta epsilon zeta\r\n");
+        }
+
+        // A paint pass with nothing selected; the pane is idle from here on, which
+        // is exactly the state a pane is in when the owner drags in it.
+        let _ = ranges_of(&mut s, 0, true);
+
+        drag_in(&mut s, 0);
+
+        let after = ranges_of(&mut s, 0, false);
+        assert!(
+            !after.is_empty(),
+            "a drag in an already-painted idle pane left the painter no selection range: {after:?}"
+        );
+    }
+
+    #[test]
+    fn each_grid_cell_holds_its_own_pane_after_a_split() {
+        let mut s = state();
+        let first = s.pane_mut(s.active_tab, 0).expect("a pane").lock().unwrap().id;
+        execute(&mut s, Action::NewPaneRight);
+
+        let tab = s.current();
+        let mut live: Vec<usize> = tab.panes.iter().flatten().map(|e| e.id().0).collect();
+        let mut cells: Vec<usize> = tab
+            .grid
+            .iter()
+            .filter_map(|(_, cell)| cell.active_id())
+            .map(|id| id.0)
+            .collect();
+        live.sort_unstable();
+        cells.sort_unstable();
+        assert_eq!(
+            live, cells,
+            "the grid's cells do not hold exactly the live panes"
+        );
+        let mut deduped = cells.clone();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            cells.len(),
+            "one pane is painted by more than one cell"
+        );
+        assert!(
+            tab.index_of(first).is_some(),
+            "the pane that was already there is no longer in the tab"
+        );
+    }
+
+    #[test]
+    fn a_pane_you_drag_in_after_closing_and_splitting_is_the_one_that_gets_the_selection() {
+        let mut s = state();
+        // The owner's other sequence: close a pane, then split a new one in, then
+        // drag in the pane that was still on screen.
+        execute(&mut s, Action::NewPaneRight);
+        let survivor = s
+            .current()
+            .panes
+            .iter()
+            .flatten()
+            .map(|e| e.id())
+            .next()
+            .expect("a pane");
+        execute(&mut s, Action::ClosePane);
+        execute(&mut s, Action::NewPaneRight);
+
+        let tab = s.current();
+        let live: Vec<usize> = tab.panes.iter().flatten().map(|e| e.id().0).collect();
+        let mut cells: Vec<usize> = tab
+            .grid
+            .iter()
+            .filter_map(|(_, cell)| cell.active_id())
+            .map(|id| id.0)
+            .collect();
+        cells.sort_unstable();
+        let mut expect = live.clone();
+        expect.sort_unstable();
+        assert_eq!(
+            cells, expect,
+            "after a close and a split the cells no longer hold the live panes"
+        );
+
+        let index = s
+            .current()
+            .index_of(survivor)
+            .expect("the surviving pane is still in the tab");
+        let ranges = ranges_of(&mut s, index, false);
+        let _ = ranges;
+        drag_in(&mut s, index);
+        let after = ranges_of(&mut s, index, false);
+        assert!(
+            !after.is_empty(),
+            "the surviving pane (index {index}) got no selection from the drag: {after:?}"
+        );
+    }
+
+    #[test]
     fn a_search_query_finds_text_the_pane_has_written() {
         let mut s = state();
         let active = s.current().active;

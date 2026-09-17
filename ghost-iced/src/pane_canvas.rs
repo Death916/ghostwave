@@ -27,6 +27,13 @@ pub(crate) const LABEL_PAD: f32 = 8.0;
 pub(crate) const FRAME_ACTIVE_W: f32 = 2.0;
 /// Width in px of a frame stroke on a pane that is not focused.
 pub(crate) const FRAME_INACTIVE_W: f32 = 1.0;
+/// Alpha of the selection band drawn over a selected cell.
+const BAND_ALPHA: f32 = 0.7;
+/// The glyph a selection band is built from.
+///
+/// The band is drawn as text rather than as a filled rectangle: a pane's filled
+/// rectangles do not reach the screen in every pane, while its glyphs do.
+const BAND_GLYPH: char = '\u{2588}';
 
 /// Paints the window chrome: tab bar, status bar, wave, toast and overlays.
 pub struct TerminalCanvas {
@@ -257,12 +264,16 @@ pub(crate) fn paint_pane(
             Err(_) => continue,
         };
         let mut run: Option<TextRun> = None;
+        let mut band_run: Option<TextRun> = None;
         let sel_range = row
             .selection()
             .ok()
             .flatten()
             .map(|s| (s.start_x.min(s.end_x), s.start_x.max(s.end_x)));
-        let band = selection_band(theme, default_bg, default_fg);
+        let band = Color {
+            a: BAND_ALPHA,
+            ..selection_band(theme, default_bg, default_fg)
+        };
 
         while let Some(c) = cells.next() {
             text_buf.clear();
@@ -308,7 +319,6 @@ pub(crate) fn paint_pane(
             let selected = sel_range.is_some_and(|(c0, c1)| col_idx >= c0 && col_idx <= c1);
             if selected {
                 selected_cells += 1;
-                cell_bg = Some(band);
             }
             if term.search.contains(row_idx, col_idx) {
                 frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), rgb(theme.search_match));
@@ -318,6 +328,28 @@ pub(crate) fn paint_pane(
             }
 
             let baseline_y = y + cell.baseline;
+
+            if selected {
+                match band_run.as_mut() {
+                    Some(previous) if previous.color == band && previous.baseline_y == baseline_y => {
+                        previous.text.push(BAND_GLYPH);
+                    }
+                    _ => {
+                        if let Some(previous) = band_run.take() {
+                            draw_run(frame, &previous, font_px, font);
+                        }
+                        band_run = Some(TextRun {
+                            x,
+                            baseline_y,
+                            color: band,
+                            text: BAND_GLYPH.to_string(),
+                        });
+                    }
+                }
+            } else if let Some(previous) = band_run.take() {
+                draw_run(frame, &previous, font_px, font);
+            }
+
             let extends = match &run {
                 Some(r) => has_glyphs && r.color == fg && r.baseline_y == baseline_y,
                 None => false,
@@ -357,6 +389,9 @@ pub(crate) fn paint_pane(
 
         if let Some(r) = run.take() {
             draw_run(frame, &r, font_px, font);
+        }
+        if let Some(previous) = band_run.take() {
+            draw_run(frame, &previous, font_px, font);
         }
 
         if term.search.row_has_match(row_idx) {

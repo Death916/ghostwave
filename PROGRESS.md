@@ -1025,6 +1025,20 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   toggle did nothing. Both now honour the flag; the existing `next_prev_wraps` test still passes
   because the default is `wrap: true`, and `next_prev_stop_at_the_ends_without_wrap` pins the new
   behaviour. This is a core change, so it fixes the macroquad build's toggle too.
+- **A pane's filled rectangles do not reach the screen in every pane; its glyphs do.** That, and only
+  that, is why the selection highlight was invisible. iced draws a canvas's shapes as triangle primitives
+  and its text as glyph primitives; in a pane that had been on screen before a split, only the glyphs
+  rendered, so a band drawn with `fill_rectangle` never appeared while the pane's own text did. The
+  decisive evidence was the owner's report of an earlier attempt, not the logs: that build inverted the
+  glyph colour *and* filled the band, and the owner saw the text disappear while no band appeared — the
+  signature of a fill that never renders plus a glyph colour that does. The band is now built from glyphs:
+  each selected cell contributes a full block (`BAND_GLYPH`, `\u{2588}`) to a text run at `BAND_ALPHA`,
+  emitted through the same run mechanism as the terminal text, with the text drawn over it in its own
+  colour. Search-match highlighting still fills, so it remains invisible in that pane until it gets the
+  same treatment.
+  Lesson: when a framework's rendering surprises you, read the framework's own source and how its own
+  widgets do the same job (iced's text editor renders its selection as rectangles; iced's canvas draws
+  text above shapes) before guessing at colours, ordering or caching.
 - **The selection never appeared in an idle pane, and the reason is in the library's own docs.**
   `Cell::is_selected()` reads the row's *cached cell data*, and the C docs are explicit that cell data
   "is only valid as long as the underlying render state is not updated" — while this painter marks every
