@@ -1062,6 +1062,21 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   (de-macroquad the core) — the macroquad-typed surfaces in `term.rs`/`keymap.rs`/`fonts.rs` are still
   used by the macroquad `main.rs`/`app.rs` until those are deleted, so stripping them earlier breaks the
   build on this branch for no gain.
+- **M5b (widget chrome) was attempted and reverted — and it exposed the rule behind the "fills do not
+  render" mystery.** Wiring `chrome_widgets` as its own layer did make the widget chrome live (tab bar,
+  status bar, toast, rename prompt all built by widgets), and in doing so proved something the earlier
+  diagnosis got wrong: iced batches **every shape in a layer before any text**, across *sibling*
+  canvases. The port paints each pane in its own canvas, and cell backgrounds were drawn as block
+  *glyphs* (the workaround from the selection bug) — so the newest pane's background glyphs landed on top
+  of the older pane's text, hiding its output. That is not "fills do not render": the fills were being
+  overpainted by a later canvas's glyphs. Clipping each cell body (`.clip(true)`) fixes the *spatial*
+  bleed but cannot reorder text against text; putting cell backgrounds back to shapes fixes the ordering
+  but then covered the pane's own later output. Neither combination matched the canvas chrome, and the
+  owner called it: reverted (`git checkout -- src`), tree back at `3d44fe3`, and the working release
+  binary was never touched because the swap was never committed. `chrome_widgets.rs` (801 lines) stays in
+  the tree unwired as the basis for a future attempt. The right shape for that attempt is *not* per-cell
+  canvases: one canvas per window painting every pane restores the single global paint order that the
+  macroquad build had, which is what makes backgrounds-under-text work at all.
 - **Retirement, step by step.** The archive is cut and pushed: branch `macroquad-archive` (one commit on
   top of `8c40aaf` adding `ARCHIVE.md`) and annotated tag `macroquad-final` → `8c40aaf`, verified on the
   remote, at a commit a fresh worktree proved green (66 + 66 + 1 + 6 tests). That kills the only
