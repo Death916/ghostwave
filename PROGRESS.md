@@ -1016,3 +1016,20 @@ selection model with its own `copy_selection(grid)`, and the owner's instruction
 deduplication happens at the archive cut rather than in an ad-hoc pass now
 (`RETIREMENT-PLAN.md` §5 step 7). 111/111 tests still pass.
 
+### 2026-09-17: search fixes from the first real test run
+
+The first hands-on run of the wired overlays turned up two things worth recording:
+
+- **The wrap toggle in the core was a lie.** `SearchState::next_match` / `prev_match` always wrapped
+  (`current = (current + 1) % matches.len()`), so the `wrap` field was never read and the UI's wrap
+  toggle did nothing. Both now honour the flag; the existing `next_prev_wraps` test still passes
+  because the default is `wrap: true`, and `next_prev_stop_at_the_ends_without_wrap` pins the new
+  behaviour. This is a core change, so it fixes the macroquad build's toggle too.
+- **The port's search could never find anything**, and the cause is in the core's design rather than
+  the overlay: matches are computed inside `TermPane::render()` (`src/term.rs:812-819`), which the
+  iced front-end never calls because it has its own painter. `search.matches` therefore stayed empty
+  and the overlay honestly reported "no matches". The port now runs the same pass itself
+  (`Pane::refresh_search`, gated on `search.active() && search.dirty` exactly like the core) and
+  paints matches the way the reference does: a matched cell inverts to `theme.search_match` with the
+  glyph in `theme.bg`, plus the reference's 2 px row marker at the pane's left edge.
+

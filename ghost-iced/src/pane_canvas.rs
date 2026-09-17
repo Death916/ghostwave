@@ -243,10 +243,12 @@ pub(crate) fn paint_pane(
     };
 
     let mut y = oy;
+    let mut row_idx: u32 = 0;
     let mut text_buf = String::with_capacity(128);
 
     while let Some(row) = rows.next() {
         let mut x = ox;
+        let mut col_idx: u16 = 0;
         let mut cells = match cell_it.update(row) {
             Ok(it) => it,
             Err(_) => continue,
@@ -294,12 +296,17 @@ pub(crate) fn paint_pane(
                 strikethrough = style.strikethrough;
             }
 
-            if let Some(c_bg) = cell_bg {
-                frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), c_bg);
-            }
+            if term.search.contains(row_idx, col_idx) {
+                frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), rgb(theme.search_match));
+                fg = rgb(theme.bg);
+            } else {
+                if let Some(c_bg) = cell_bg {
+                    frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), c_bg);
+                }
 
-            if c.is_selected().unwrap_or(false) {
-                frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), rgb(theme.selection));
+                if c.is_selected().unwrap_or(false) {
+                    frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), rgb(theme.selection));
+                }
             }
 
             let baseline_y = y + cell.baseline;
@@ -337,14 +344,24 @@ pub(crate) fn paint_pane(
             }
 
             x += cw;
+            col_idx += 1;
         }
 
         if let Some(r) = run.take() {
             draw_run(frame, &r, font_px, font);
         }
 
+        if term.search.row_has_match(row_idx) {
+            frame.fill_rectangle(
+                Point::new(ox - 3.0, y + 2.0),
+                Size::new(2.0, ch - 4.0),
+                rgb(theme.search_match),
+            );
+        }
+
         let _ = row.set_dirty(false);
         y += ch;
+        row_idx += 1;
     }
 
     if snapshot.cursor_visible().unwrap_or(false)

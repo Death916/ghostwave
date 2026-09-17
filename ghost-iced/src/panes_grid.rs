@@ -353,7 +353,9 @@ impl canvas::Program<Message> for PaneCanvas {
     ) -> Option<Action<Message>> {
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(button)) => {
-                let point = cursor.position_over(bounds)?;
+                let point = cursor.position_over(bounds);
+                debug_mouse("press", self.pane, Some(*button), state, bounds, point);
+                let point = point?;
                 let pressed = pane_canvas::vt_button(*button)?;
                 state.press(*button);
                 Some(Action::publish(self.mouse_message(
@@ -364,7 +366,9 @@ impl canvas::Program<Message> for PaneCanvas {
                 )))
             }
             Event::Mouse(mouse::Event::ButtonReleased(button)) => {
-                let point = cursor.position()?;
+                let point = cursor.position();
+                debug_mouse("release", self.pane, Some(*button), state, bounds, point);
+                let point = point?;
                 let released = pane_canvas::vt_button(*button)?;
                 state.release(*button);
                 Some(Action::publish(self.mouse_message(
@@ -375,10 +379,13 @@ impl canvas::Program<Message> for PaneCanvas {
                 )))
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let point = cursor.position();
                 if !state.any_pressed() && !self.tracking {
+                    debug_mouse("motion:dropped", self.pane, None, state, bounds, point);
                     return None;
                 }
-                let point = cursor.position()?;
+                debug_mouse("motion", self.pane, None, state, bounds, point);
+                let point = point?;
                 Some(Action::publish(self.mouse_message(
                     point,
                     bounds,
@@ -472,6 +479,29 @@ impl PaneCanvas {
             mods: keys::current_mods(),
         }
     }
+}
+
+/// Logs one canvas mouse event, when `GHOST_ICED_DEBUG` is set.
+fn debug_mouse(
+    label: &str,
+    pane: usize,
+    button: Option<mouse::Button>,
+    state: &CanvasState,
+    bounds: Rectangle,
+    point: Option<Point>,
+) {
+    if std::env::var_os("GHOST_ICED_DEBUG").is_none() {
+        return;
+    }
+    eprintln!(
+        "[mouse] {label} pane={pane} button={button:?} any_pressed={} button_down={:?} bounds=({:.1},{:.1} {:.1}x{:.1}) point={point:?}",
+        state.any_pressed(),
+        state.button_down(),
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height,
+    );
 }
 
 #[cfg(test)]

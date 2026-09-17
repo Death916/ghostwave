@@ -252,6 +252,30 @@ impl Pane {
         self.dirty = true;
     }
 
+    /// Recomputes this pane's search matches for the current viewport.
+    ///
+    /// The core runs this pass inside its own render function, which this
+    /// front-end does not call, so the same pass runs here.
+    pub fn refresh_search(&mut self) {
+        if !self.term.search.active() || !self.term.search.dirty {
+            return;
+        }
+        let Pane { term, scratch, .. } = self;
+        let ghostwave::term::TermPane {
+            search, term: vt, ..
+        } = term;
+        let Ok(snapshot) = scratch.render_state.update(vt) else {
+            return;
+        };
+        let Ok(mut rows) = scratch.row_it.update(&snapshot) else {
+            return;
+        };
+        search.matches.clear();
+        if search.run_on_rows(&mut rows).is_ok() {
+            search.dirty = false;
+        }
+    }
+
     /// Returns the foreground process command running in this pane, if detectable.
     pub fn foreground_process(&self) -> Option<String> {
         let pty = self.term.pty.as_ref()?;

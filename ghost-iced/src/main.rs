@@ -160,7 +160,9 @@ impl App {
         match message {
             Message::Output { id, data } => {
                 if let Some(pane) = self.state.pane_by_id(id) {
-                    pane.lock().unwrap().ingest(&data);
+                    let mut guard = pane.lock().unwrap();
+                    guard.ingest(&data);
+                    guard.refresh_search();
                     self.state.pty_activity = true;
                 }
             }
@@ -186,6 +188,12 @@ impl App {
             } => {
                 if let Some(pane_ref) = self.state.pane_mut(tab, pane) {
                     let mut guard = pane_ref.lock().unwrap();
+                    if std::env::var_os("GHOST_ICED_DEBUG").is_some() {
+                        eprintln!(
+                            "[ghost-iced] mouse tab {tab} pane {pane} id {} {:?} x {:.1} y {:.1} button_down {:?}",
+                            guard.id.0, ev.kind, ev.x, ev.y, ev.button_down
+                        );
+                    }
                     let (w, h) = guard
                         .last_bounds
                         .map(|b| (b.width, b.height))
@@ -260,6 +268,15 @@ impl App {
                 let mut term = pane.as_ref().map(|pane| pane.lock().unwrap());
                 if let Some(search) = self.state.search.as_mut() {
                     search.update_with_term(message, term.as_mut().map(|guard| &mut guard.term));
+                }
+                if let Some(guard) = term.as_mut() {
+                    guard.refresh_search();
+                    let matches = guard.term.search.matches.len();
+                    let current = guard.term.search.current;
+                    if let Some(search) = self.state.search.as_mut() {
+                        search.set_total_matches(matches);
+                        search.set_match_index(current);
+                    }
                 }
                 if closing {
                     self.state.search = None;

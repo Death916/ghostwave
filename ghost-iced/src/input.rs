@@ -13,7 +13,7 @@ use libghostty_vt::key::{self, Mods};
 
 use crate::ai::AiPane;
 use crate::app::AppState;
-use crate::pane::{ContentPane, PaneEntry};
+use crate::pane::{ContentPane, PaneEntry, SharedPane};
 use crate::preview::{PreviewAction, PreviewPane};
 use crate::search_overlay::SearchState;
 
@@ -473,6 +473,24 @@ fn new_content(state: &mut AppState, content: ContentPane) {
     state.toast(format!("{label} pane opened"));
 }
 
+/// Re-runs a pane's own match pass and mirrors the result into the open overlay.
+///
+/// The core recomputes search matches only inside its own render function, which this
+/// front-end never calls, so every point where the query or its options change drives
+/// the pass itself ([`crate::pane::Pane::refresh_search`]) — and the overlay that shows
+/// the count reads it back from the pane.
+fn pane_search_refresh(state: &mut AppState, pane: &SharedPane) {
+    let (matches, current) = {
+        let mut guard = pane.lock().unwrap();
+        guard.refresh_search();
+        (guard.term.search.matches.len(), guard.term.search.current)
+    };
+    if let Some(overlay) = state.search.as_mut() {
+        overlay.set_total_matches(matches);
+        overlay.set_match_index(current);
+    }
+}
+
 /// Opens the scrollback search overlay and arms the focused pane's search with
 /// the overlay's query.
 ///
@@ -483,15 +501,18 @@ pub(crate) fn open_search(state: &mut AppState) {
     let overlay = state.search.get_or_insert_with(SearchState::new);
     let query = overlay.query.clone();
     let case_sensitive = overlay.case_sensitive;
-    if let Some(pane) = pane {
-        let mut guard = pane.lock().unwrap();
-        guard.term.search.start();
-        if !query.is_empty() {
-            guard.term.search.set_query(query);
+    if let Some(pane) = &pane {
+        {
+            let mut guard = pane.lock().unwrap();
+            guard.term.search.start();
+            if !query.is_empty() {
+                guard.term.search.set_query(query);
+            }
+            guard.term.search.case_sensitive = case_sensitive;
+            guard.term.search.dirty = true;
+            guard.term.force_repaint = true;
         }
-        guard.term.search.case_sensitive = case_sensitive;
-        guard.term.search.dirty = true;
-        guard.term.force_repaint = true;
+        pane_search_refresh(state, pane);
     }
 }
 
@@ -505,15 +526,21 @@ pub(crate) fn close_search(state: &mut AppState) {
     state.search = None;
 }
 
-/// Pushes the overlay's query and case setting into the focused pane's search.
+/// Pushes the overlay's query and case setting into the focused pane's search and
+/// re-runs the pane's match pass for the new query.
 pub(crate) fn sync_search(state: &mut AppState) {
     let pane = state.active_pane();
-    let Some(overlay) = state.search.as_ref() else {
-        return;
-    };
-    if let Some(pane) = pane {
-        let mut guard = pane.lock().unwrap();
-        overlay.sync_to_term(&mut guard.term);
+    {
+        let Some(overlay) = state.search.as_ref() else {
+            return;
+        };
+        if let Some(pane) = &pane {
+            let mut guard = pane.lock().unwrap();
+            overlay.sync_to_term(&mut guard.term);
+        }
+    }
+    if let Some(pane) = &pane {
+        pane_search_refresh(state, pane);
     }
 }
 
@@ -543,6 +570,9 @@ pub(crate) fn search_backspace(state: &mut AppState) {
 /// scan and the highlight both live in the painted viewport.
 fn step_search(state: &mut AppState, forward: bool) {
     let pane = state.active_pane();
+    if let Some(pane) = &pane {
+        pane_search_refresh(state, pane);
+    }
     let overlay = state.search.get_or_insert_with(SearchState::new);
     match pane {
         Some(pane) => {
@@ -558,7 +588,8 @@ fn step_search(state: &mut AppState, forward: bool) {
     }
 }
 
-/// Flips the focused pane's whole-word search flag and reports its new value.
+/// Flips the focused pane's whole-word search flag, re-runs the scan and reports
+/// the new value.
 fn toggle_whole_word(state: &mut AppState) {
     let Some(pane) = state.active_pane() else {
         return;
@@ -571,6 +602,7 @@ fn toggle_whole_word(state: &mut AppState) {
         guard.term.force_repaint = true;
         on
     };
+    pane_search_refresh(state, &pane);
     state.toast(if on {
         "search: whole word on"
     } else {
@@ -958,6 +990,31 @@ mod tests {
         execute(&mut s, action);
         assert_eq!(s.tabs.len(), 2, "New Tab from the palette opens a tab");
         assert!(s.palette.is_none(), "the palette is closed after executing");
+    }
+
+    #[test]
+    fn a_search_query_finds_text_the_pane_has_written() {
+        let mut s = state();
+        let active = s.current().active;
+        let pane = s
+            .pane_mut(s.active_tab, active)
+            .expect("the tab has a focused pane");
+        pane.lock().unwrap().ingest(b"hello hi there\r\n");
+
+        open_search(&mut s);
+        assert!(s.search.is_some(), "the overlay is open");
+        search_push_char(&mut s, 'h');
+        search_push_char(&mut s, 'i');
+
+        let (active, matches) = {
+            let guard = pane.lock().unwrap();
+            (guard.term.search.active(), guard.term.search.matches.len())
+        };
+        assert!(active, "the query arms the pane's own search");
+        assert!(
+            matches > 0,
+            "the query must reach the pane's match pass, found {matches}"
+        );
     }
 
     #[test]
