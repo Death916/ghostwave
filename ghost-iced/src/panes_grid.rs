@@ -366,13 +366,23 @@ impl canvas::Program<Message> for PaneCanvas {
                 )))
             }
             Event::Mouse(mouse::Event::ButtonReleased(button)) => {
-                let point = cursor.position();
-                debug_mouse("release", self.pane, Some(*button), state, bounds, point);
-                let point = point?;
-                let released = pane_canvas::vt_button(*button)?;
+                let owned = state.any_pressed();
                 state.release(*button);
-                Some(Action::publish(self.mouse_message(
+                let point = cursor.position();
+                debug_mouse(
+                    if owned { "release" } else { "release:ignored" },
+                    self.pane,
+                    Some(*button),
+                    state,
+                    bounds,
                     point,
+                );
+                if !owned {
+                    return None;
+                }
+                let released = pane_canvas::vt_button(*button)?;
+                Some(Action::publish(self.mouse_message(
+                    clamp_into(bounds, point?),
                     bounds,
                     MouseEvKind::Release(released),
                     state,
@@ -380,14 +390,23 @@ impl canvas::Program<Message> for PaneCanvas {
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let point = cursor.position();
-                if !state.any_pressed() && !self.tracking {
+                if state.any_pressed() {
+                    debug_mouse("motion:drag", self.pane, None, state, bounds, point);
+                    let point = clamp_into(bounds, point?);
+                    return Some(Action::publish(self.mouse_message(
+                        point,
+                        bounds,
+                        MouseEvKind::Motion,
+                        state,
+                    )));
+                }
+                if !self.tracking || cursor.position_over(bounds).is_none() {
                     debug_mouse("motion:dropped", self.pane, None, state, bounds, point);
                     return None;
                 }
                 debug_mouse("motion", self.pane, None, state, bounds, point);
-                let point = point?;
                 Some(Action::publish(self.mouse_message(
-                    point,
+                    point?,
                     bounds,
                     MouseEvKind::Motion,
                     state,
@@ -479,6 +498,15 @@ impl PaneCanvas {
             mods: keys::current_mods(),
         }
     }
+}
+
+/// Clamps a window-space point into `bounds`, so a drag that leaves the pane still
+/// reports a position inside it.
+fn clamp_into(bounds: Rectangle, point: Point) -> Point {
+    Point::new(
+        point.x.clamp(bounds.x, bounds.x + bounds.width),
+        point.y.clamp(bounds.y, bounds.y + bounds.height),
+    )
 }
 
 /// Logs one canvas mouse event, when `GHOST_ICED_DEBUG` is set.
