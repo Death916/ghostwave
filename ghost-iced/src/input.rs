@@ -282,8 +282,20 @@ pub(crate) fn execute(state: &mut AppState, action: Action) {
             state.rename_buf.clear();
         }
         Action::CycleStack => state.cycle_stack(),
-        Action::ToggleFloating | Action::ToggleHideFloat | Action::CycleFloat => {
-            state.toast("floating panes: not implemented yet")
+        Action::ToggleFloating => {
+            let mut scratchpad = std::mem::take(&mut state.scratchpad);
+            scratchpad.toggle_float_pane(state);
+            state.scratchpad = scratchpad;
+        }
+        Action::ToggleHideFloat => {
+            let mut scratchpad = std::mem::take(&mut state.scratchpad);
+            scratchpad.toggle_hide_float(state);
+            state.scratchpad = scratchpad;
+        }
+        Action::CycleFloat => {
+            let mut scratchpad = std::mem::take(&mut state.scratchpad);
+            scratchpad.cycle_float(state);
+            state.scratchpad = scratchpad;
         }
         Action::ToggleScratchpad => {
             let mut scratchpad = std::mem::take(&mut state.scratchpad);
@@ -1003,7 +1015,10 @@ mod tests {
 
         ctrl(&mut s, Key::P);
         typed(&mut s, Key::F, 'f');
-        assert_eq!(toast(&s), "floating panes: not implemented yet");
+        assert!(
+            !s.scratchpad.floating.is_empty(),
+            "the float bind really floats the focused pane"
+        );
     }
 
     #[test]

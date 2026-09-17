@@ -176,6 +176,13 @@ impl ScratchpadGeometry {
     }
 }
 
+/// The id of the pane the active tab has focused, read without locking it.
+fn active_pane_id(app: &AppState) -> Option<PaneId> {
+    let tab = app.tabs.get(app.active_tab)?;
+    let entry = tab.panes.get(tab.active)?.as_ref()?;
+    Some(entry.id())
+}
+
 /// State and manager for floating panes and the F12 scratchpad overlay.
 #[derive(Clone, Debug)]
 pub struct ScratchpadState {
@@ -404,6 +411,90 @@ impl ScratchpadState {
             });
         }
         self.focused_float = Some(self.floating.len() - 1);
+    }
+
+    /// Floats the focused pane out of its grid cell, or embeds it back if it is
+    /// already floating.
+    ///
+    /// A floated pane keeps its place in `tab.panes` but loses its grid cell, so
+    /// the grid stops painting it and the float layer takes over — the same split
+    /// of duties the scratchpad uses. Embedding reverses it: the float is dropped
+    /// and the pane splits back in beside the focused cell. The origin a float was
+    /// created from is not kept, which matches the reference's behaviour when its
+    /// recorded origin has gone stale.
+    pub fn toggle_float_pane(&mut self, app: &mut AppState) {
+        let tab_index = app.active_tab;
+        let Some(active) = active_pane_id(app) else {
+            return;
+        };
+        if self.floating.iter().any(|float| float.pane == active) {
+            self.floating.retain(|float| float.pane != active);
+            self.focused_float = None;
+            {
+                let tab = &mut app.tabs[tab_index];
+                if let Some(target) = tab.focused() {
+                    tab.grid.split(
+                        iced::widget::pane_grid::Axis::Vertical,
+                        target,
+                        crate::app::GridPane::single(active),
+                    );
+                }
+            }
+            app.toast("floating pane embedded");
+            return;
+        }
+        let rect = self.geometry.compute_rect(self.window_size(app));
+        {
+            let tab = &mut app.tabs[tab_index];
+            if let Some(index) = tab.index_of(active) {
+                if let Some(cell) = tab.handle(index) {
+                    let _ = tab.grid.close(cell);
+                }
+            }
+        }
+        self.to_float(active, rect, None);
+        app.toast("floating pane (the same bind embeds it again)");
+    }
+
+    /// Hides or shows the focused floating pane.
+    pub fn toggle_hide_float(&mut self, app: &mut AppState) {
+        let Some(active) = active_pane_id(app) else {
+            return;
+        };
+        match self.floating.iter_mut().find(|float| float.pane == active) {
+            Some(float) => {
+                float.hidden = !float.hidden;
+                let hidden = float.hidden;
+                app.toast(if hidden {
+                    "floating pane hidden"
+                } else {
+                    "floating pane shown"
+                });
+            }
+            None => app.toast("no floating pane here (float one first)"),
+        }
+    }
+
+    /// Focuses the next floating pane of this tab, showing it if it was hidden.
+    pub fn cycle_float(&mut self, app: &mut AppState) {
+        if self.floating.is_empty() {
+            app.toast("no floating panes");
+            return;
+        }
+        let current =
+            active_pane_id(app).and_then(|id| self.floating.iter().position(|f| f.pane == id));
+        let next = match current {
+            Some(index) => (index + 1) % self.floating.len(),
+            None => 0,
+        };
+        self.floating[next].hidden = false;
+        self.focused_float = Some(next);
+        let pane = self.floating[next].pane;
+        let index = app.tabs[app.active_tab].index_of(pane);
+        if let Some(index) = index {
+            app.focus_index(index);
+        }
+        app.toast(format!("floating pane {}", next + 1));
     }
 
     /// Re-attaches a floating pane back into the pane grid, returning its stored layout origin if tracked.
