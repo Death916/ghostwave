@@ -2,6 +2,15 @@
 
 Written 2026-09-17 against `master` `8c40aaf` / `feat/iced-frontend` `e492c2c`.
 
+> **Status (end of 2026-09-17): steps 2, 3, 5, 6 and 8 are done, and step 7 turned out to need a UI
+> change instead of a deletion** — the widget chrome (`chrome_widgets.rs`) is now the live chrome, laid
+> out as a `Column` of bands, and the canvas chrome it replaced is deleted. What remains: step 9's
+> second half (walk the feature checklist once more on the merged result) and step 10 (merge
+> `feat/retire-macroquad` + `feat/widget-chrome` into `master`, then retire the stale branches, which
+> have already been checked for unmerged work). Step 4 (de-macroquad the core) happened as part of step
+> 6, because the macroquad-typed surfaces had no users once the presentation files were deleted.
+> Remote/SSH panes are the one feature still missing from the iced build, tracked in `PROGRESS.md`.
+
 ## 1. Decision and scope
 
 The iced front-end is the future of this project: it renders better, and panes, overlays and the

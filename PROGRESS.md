@@ -1068,6 +1068,24 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   (de-macroquad the core) — the macroquad-typed surfaces in `term.rs`/`keymap.rs`/`fonts.rs` are still
   used by the macroquad `main.rs`/`app.rs` until those are deleted, so stripping them earlier breaks the
   build on this branch for no gain.
+- **Where this session ended (2026-09-17).** The column chrome and the cleanup are committed on
+  `feat/widget-chrome` (`30318d5`, `08e5758`) and pushed; `feat/retire-macroquad` holds the retirement
+  cut and the archive; `macroquad-archive` / tag `macroquad-final` is untouched by any of it. Neither
+  feature branch is merged — **master is protected and the merge is the owner's call.** The release
+  binary on `PATH` (`~/.local/bin/ghostwave`) is built from `feat/widget-chrome` and verified by eye.
+  Remaining work, in the owner's order: **remote/SSH panes** (the only missing feature; `ghostd/` is in
+  the tree, only the front-end half is unported) and then merging the two branches. Everything else
+  that was on the parity list is done and verified: selection, search, palette, sessions, floats, the
+  F12 scratchpad, the visualizer and AI panes, cursor styles, and the widget chrome. The stale
+  branches (`feat/iced-frontend`, `feat/visual-ghostwave`, `perf/idle-gpu-2`, `selection-autoscroll`)
+  were checked for unmerged work and deleted locally and on the forge.
+- **Cleanup pass: 60 warnings to zero, and the dead canvas chrome deleted.** `chrome.rs` (450 lines) and
+  `pane_canvas.rs`'s `TerminalCanvas`/`ChromeData` were unreachable once the chrome became widgets, so
+  they are gone, along with `measure.rs`'s width helpers (only `ascent` serves the pane painter now), the
+  pane-log byte counter that was assigned but never read, four `term.rs` fields left from the macroquad
+  renderer, and the unused imports across the crate; `search.rs`'s `is_word_boundary` is test-only. 12
+  files, 64 insertions, 661 deletions, `cargo check` clean, tests 49 + 130 + 1 + 6, no behaviour change.
+  Two profiler leftovers (`flamegraph.html`, `perf.data`) removed from the tree root.
 - **Window chrome belongs in a column, not in layers — and that is what M5b actually needed.** The swap
   is done in its proper form: `main.rs` builds a `Column` of tab bar → pane grid → status bar, and a
   `Stack` appears only when something pops up (floats, search, palette, sessions, toast). That removes
