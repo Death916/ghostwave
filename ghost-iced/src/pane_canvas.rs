@@ -302,18 +302,17 @@ pub(crate) fn paint_pane(
             let selected = c.is_selected().unwrap_or(false);
             if selected {
                 selected_cells += 1;
+                let band = rgb(theme.selection);
+                if luma_gap(band, fg) < 0.25 {
+                    fg = default_fg;
+                }
+                cell_bg = Some(band);
             }
             if term.search.contains(row_idx, col_idx) {
                 frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), rgb(theme.search_match));
                 fg = rgb(theme.bg);
-            } else {
-                if let Some(c_bg) = cell_bg {
-                    frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), c_bg);
-                }
-
-                if selected {
-                    frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), rgb(theme.selection));
-                }
+            } else if let Some(c_bg) = cell_bg {
+                frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), c_bg);
             }
 
             let baseline_y = y + cell.baseline;
@@ -432,6 +431,12 @@ fn draw_run(frame: &mut Frame, run: &TextRun, font_px: f32, font: Font) {
         shaping: text::Shaping::Advanced,
         ..CanvasText::default()
     });
+}
+
+/// Perceived-luminance gap between two colours, in `0.0..=1.0`.
+fn luma_gap(a: Color, b: Color) -> f32 {
+    let luma = |c: Color| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    (luma(a) - luma(b)).abs()
 }
 
 /// Converts a libghostty [`RgbColor`] to an opaque iced [`Color`].

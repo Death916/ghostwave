@@ -1025,6 +1025,11 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   toggle did nothing. Both now honour the flag; the existing `next_prev_wraps` test still passes
   because the default is `wrap: true`, and `next_prev_stop_at_the_ends_without_wrap` pins the new
   behaviour. This is a core change, so it fixes the macroquad build's toggle too.
+- **Selection is now one uniform band.** The reference inverts *glyph* cells (light band, dark ink) and
+  fills *blank* cells with `theme.selection`, so a drag over mostly-empty rows came out as light blocks
+  with nothing legible in them — read, correctly, as the selection painting over the text. The port
+  fills every selected cell with `theme.selection` and keeps the glyph readable, falling back to the
+  terminal's default fg when the band and the glyph are within 0.25 luminance of each other.
 - **The port's search could never find anything**, and the cause is in the core's design rather than
   the overlay: matches are computed inside `TermPane::render()` (`src/term.rs:812-819`), which the
   iced front-end never calls because it has its own painter. `search.matches` therefore stayed empty
