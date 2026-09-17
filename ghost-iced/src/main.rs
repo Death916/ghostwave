@@ -7,7 +7,7 @@ use ghostwave::keymap::Action;
 use iced::{
     keyboard,
     widget::{pane_grid, Stack},
-    Element, Fill, Length, Padding, Size, Subscription, Task,
+    Background, Element, Fill, Length, Padding, Size, Subscription, Task,
 };
 use libghostty_vt::key;
 
@@ -439,14 +439,21 @@ impl App {
             .width(Fill)
             .height(Fill);
             let window = Column::with_children(vec![
-                text(title).size(12.0).font(fonts::primary()).into(),
+                container(text(title).size(12.0).font(fonts::primary()))
+                    .width(Fill)
+                    .padding([2.0, 6.0])
+                    .style(move |_theme| container::Style {
+                        background: Some(Background::Color(pane_canvas::rgb(theme.tab_active))),
+                        ..Default::default()
+                    })
+                    .into(),
                 container(canvas)
                     .width(Fill)
                     .height(Fill)
                     .style(move |_theme| container::Style {
                         border: iced::Border {
                             color: pane_canvas::rgb(theme.frame_active),
-                            width: 1.0,
+                            width: 2.0,
                             ..Default::default()
                         },
                         ..Default::default()

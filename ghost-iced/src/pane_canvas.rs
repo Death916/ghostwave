@@ -206,9 +206,12 @@ pub(crate) fn paint_pane(
     font: Font,
     theme: &GhostTheme,
 ) {
+    let pane_id = pane.id;
+    let debug = std::env::var_os("GHOST_ICED_DEBUG").is_some();
     let Pane {
         term, scratch, ..
     } = pane;
+    let mut selected_cells = 0usize;
     let crate::pane::RenderScratch {
         render_state,
         row_it,
@@ -296,6 +299,10 @@ pub(crate) fn paint_pane(
                 strikethrough = style.strikethrough;
             }
 
+            let selected = c.is_selected().unwrap_or(false);
+            if selected {
+                selected_cells += 1;
+            }
             if term.search.contains(row_idx, col_idx) {
                 frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), rgb(theme.search_match));
                 fg = rgb(theme.bg);
@@ -304,7 +311,7 @@ pub(crate) fn paint_pane(
                     frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), c_bg);
                 }
 
-                if c.is_selected().unwrap_or(false) {
+                if selected {
                     frame.fill_rectangle(Point::new(x, y), Size::new(cw, ch), rgb(theme.selection));
                 }
             }
@@ -383,6 +390,17 @@ pub(crate) fn paint_pane(
             }
             _ => frame.fill_rectangle(Point::new(cx, cy), Size::new(cw, ch), cursor_color),
         }
+    }
+
+    if debug {
+        eprintln!(
+            "[paint] pane={pane_id:?} rect=({:.1},{:.1} {:.1}x{:.1}) selected_cells={selected_cells} matches={}",
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            term.search.matches.len()
+        );
     }
 
     let _ = snapshot.set_dirty(Dirty::Clean);
