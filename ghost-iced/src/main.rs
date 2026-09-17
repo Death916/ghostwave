@@ -31,6 +31,8 @@ mod pty_bridge;
 pub mod scratchpad;
 pub mod search_overlay;
 pub mod selection;
+mod session;
+pub mod sessions_overlay;
 mod tick;
 pub mod visualizer;
 
@@ -107,6 +109,8 @@ pub enum Message {
     Palette(palette::PaletteMessage),
     /// A message from the scrollback search overlay.
     Search(search_overlay::SearchMessage),
+    /// A message from the named-session picker.
+    Sessions(sessions_overlay::SessionsMessage),
     /// A message from an AI chat pane's own widgets: its prompt input, its send
     /// button, its clear button.
     Ai {
@@ -131,14 +135,16 @@ impl App {
     fn new() -> (Self, Task<Message>) {
         let config = Config::load();
         let cell = pane::cell_dims(FONT_BYTES, config.font_size, config.row_gap);
-        let state = AppState::new(config, cell, START_WINDOW).expect("spawn the first pane");
+        let mut state = AppState::new(config, cell, START_WINDOW).expect("spawn the first pane");
+        session::restore_last(&mut state);
         eprintln!(
-            "[ghost-iced] cell {}x{} px, baseline {}, theme {}, frames {}, tab '{}' with {} pane(s)",
+            "[ghost-iced] cell {}x{} px, baseline {}, theme {}, frames {}, session '{}', tab '{}' with {} pane(s)",
             cell.w,
             cell.h,
             cell.baseline,
             state.theme.name,
             state.show_frames,
+            state.current_session,
             state.current().name,
             state.current().panes.iter().filter(|p| p.is_some()).count()
         );
@@ -360,9 +366,11 @@ impl App {
                     }
                 }
             }
+            Message::Sessions(message) => session::picker_message(&mut self.state, message),
             Message::Noop => {}
         }
         if self.state.quit {
+            session::save(&self.state);
             return iced::exit();
         }
         Task::none()
@@ -370,7 +378,9 @@ impl App {
 
     /// Whether an overlay currently owns the keyboard.
     fn overlay_open(&self) -> bool {
-        self.state.palette.is_some() || self.state.search.is_some()
+        self.state.palette.is_some()
+            || self.state.search.is_some()
+            || self.state.session_picker.is_some()
     }
 
     /// Routes a key to the open overlay, if any; returns whether one consumed it.
@@ -390,6 +400,10 @@ impl App {
         }
         if self.state.search.is_some() {
             self.search_key(key, modifiers, text);
+            return true;
+        }
+        if self.state.session_picker.is_some() {
+            self.sessions_key(key, modifiers);
             return true;
         }
         false
@@ -459,6 +473,14 @@ impl App {
                     input::search_push_char(&mut self.state, c);
                 }
             }
+        }
+    }
+
+    /// Applies a key to the session picker: the overlay's own key map decides what
+    /// the key means, and the session module performs what it asks for.
+    fn sessions_key(&mut self, key: &keyboard::Key, modifiers: keyboard::Modifiers) {
+        if let Some(message) = sessions_overlay::handle_key(key, modifiers) {
+            session::picker_message(&mut self.state, message);
         }
     }
 
@@ -585,13 +607,20 @@ impl App {
                 ghostwave::keymap::Mode::RenamePane => {
                     Some(("Pane".to_string(), self.state.rename_buf.clone()))
                 }
+                ghostwave::keymap::Mode::RenameSession => {
+                    Some(("Session".to_string(), self.state.rename_buf.clone()))
+                }
                 _ => None,
             },
         };
 
         let base = panes_grid::view(&self.state, mouse_tracking, chrome);
         let floats = self.float_layer();
-        if floats.is_none() && self.state.search.is_none() && self.state.palette.is_none() {
+        if floats.is_none()
+            && self.state.search.is_none()
+            && self.state.palette.is_none()
+            && self.state.session_picker.is_none()
+        {
             return base;
         }
         let mut layers: Vec<Element<'_, Message>> = vec![base];
@@ -604,6 +633,13 @@ impl App {
                 &self.state.theme,
                 search_overlay::OverlayPosition::TopRight,
                 Message::Search,
+            ));
+        }
+        if let Some(picker) = self.state.session_picker.as_ref() {
+            layers.push(sessions_overlay::view_mapped(
+                picker,
+                &self.state.theme,
+                Message::Sessions,
             ));
         }
         if let Some(palette) = self.state.palette.as_ref() {

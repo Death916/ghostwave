@@ -96,6 +96,19 @@ impl Tab {
         }
     }
 
+    /// A tab restored from a saved session: the panes it kept and the grid their
+    /// saved layout tree converts to ([`crate::grid_session`]), with the first
+    /// pane focused.
+    pub fn restored(name: String, panes: Vec<PaneEntry>, grid: pane_grid::State<GridPane>) -> Self {
+        Self {
+            name,
+            grid,
+            panes: panes.into_iter().map(Some).collect(),
+            active: 0,
+            sync_panes: false,
+        }
+    }
+
     /// Tab-bar label: the tab's name, or the active pane's OSC title when the name
     /// is unset or still the generated `"Tab N"`.
     pub fn label(&self, index: usize) -> String {
@@ -359,6 +372,10 @@ pub struct AppState {
     pub palette: Option<crate::palette::PaletteState>,
     /// The scrollback search overlay, while it is open.
     pub search: Option<crate::search_overlay::SearchState>,
+    /// The named session this workspace is running inside.
+    pub current_session: String,
+    /// The named-session picker, while it is open. Keys and clicks go here.
+    pub session_picker: Option<crate::sessions_overlay::SessionsOverlay>,
     /// Floating panes and the F12 scratchpad terminal.
     pub scratchpad: crate::scratchpad::ScratchpadState,
     last_tick: std::time::Instant,
@@ -398,6 +415,8 @@ impl AppState {
             rename_target: String::new(),
             palette: None,
             search: None,
+            current_session: ghostwave::session::last_session(),
+            session_picker: None,
             scratchpad: crate::scratchpad::ScratchpadState::new(),
             last_tick: std::time::Instant::now(),
             window,
@@ -444,7 +463,7 @@ impl AppState {
     }
 
     /// Forks a pty pane for this front-end, themed but not yet in any tab.
-    fn spawn_pane(&self) -> Result<(PaneId, SharedPane)> {
+    pub(crate) fn spawn_pane(&self) -> Result<(PaneId, SharedPane)> {
         let mut pane = Pane::spawn(
             SPAWN_COLS,
             SPAWN_ROWS,
@@ -459,6 +478,28 @@ impl AppState {
 
     pub fn current(&self) -> &Tab {
         &self.tabs[self.active_tab]
+    }
+
+    /// A tab holding one fresh shell, for a session with nothing saved to
+    /// restore.
+    pub(crate) fn fresh_tab(&self) -> Result<Tab> {
+        let (_, pane) = self.spawn_pane()?;
+        Ok(Tab::new("Tab 1".to_string(), PaneEntry::Term(pane)))
+    }
+
+    /// Replaces the whole workspace with `tabs`, the first one focused — what
+    /// loading a session does.
+    ///
+    /// The outgoing tabs are dropped, which closes their ptys: this front-end
+    /// does not park a session the way the macroquad build does. Floating panes
+    /// and the scratchpad go with their tab, so both are reset here rather than
+    /// left holding panes that no longer exist.
+    pub fn replace_tabs(&mut self, tabs: Vec<Tab>) {
+        self.tabs = tabs;
+        self.active_tab = 0;
+        self.last_tab = None;
+        self.scratchpad = crate::scratchpad::ScratchpadState::new();
+        self.relayout();
     }
 
     pub fn set_window(&mut self, size: Size) {

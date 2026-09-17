@@ -415,8 +415,23 @@ pub(crate) fn execute(state: &mut AppState, action: Action) {
         Action::Ghostwave => new_content(state, ContentPane::visualizer()),
         Action::NewAi => new_content(state, ContentPane::ai(state.config.ai.clone())),
         Action::OpenFile(path) => new_content(state, ContentPane::preview(path)),
-        Action::SessionManager | Action::SessionNew | Action::SessionRename
-        | Action::SessionDelete | Action::Detach => state.toast("sessions: not implemented yet"),
+        Action::SessionManager => crate::session::open_picker(state),
+        Action::SessionNew => {
+            let name = crate::session::next_name();
+            crate::session::start(state, &name);
+        }
+        Action::SessionRename => {
+            state.mode = Mode::RenameSession;
+            state.rename_buf = state.current_session.clone();
+            state.rename_target = state.current_session.clone();
+        }
+        Action::SessionDelete => crate::session::delete_current(state),
+        Action::Detach => {
+            crate::session::save(state);
+            let name = state.current_session.clone();
+            state.toast(format!("session {name} saved — quitting"));
+            state.quit = true;
+        }
         Action::ConnectSsh(_) | Action::ConnectDurableSsh(_) | Action::KillRemoteSession => {
             state.toast("remote panes: not implemented yet")
         }
@@ -446,7 +461,7 @@ pub(crate) fn execute(state: &mut AppState, action: Action) {
                 }
                 Mode::RenameSession => {
                     state.mode = Mode::Normal;
-                    state.toast("sessions: not implemented yet");
+                    crate::session::rename(state, &name);
                 }
                 _ => state.mode = Mode::Normal,
             }
@@ -709,6 +724,37 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// A session name no other test in this process shares.
+    fn unique_session(prefix: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("iced-{prefix}-{}-{n}", std::process::id())
+    }
+
+    /// Types text a character at a time, the way the rename prompt receives it.
+    fn type_str(state: &mut AppState, text: &str) {
+        for c in text.chars() {
+            key_press(
+                state,
+                KeyPress {
+                    key: Key::A,
+                    mods: Mods::empty(),
+                    text: Some(c),
+                },
+                key::Action::Press,
+            );
+        }
+    }
+
+    /// Sends a key to the open session picker through the same two calls main's
+    /// key path makes: the overlay's own key map, then the session module.
+    fn pick(state: &mut AppState, text: &str) {
+        let key = iced::keyboard::Key::Character(text.into());
+        let message = crate::sessions_overlay::handle_key(&key, iced::keyboard::Modifiers::default())
+            .expect("a picker bind");
+        crate::session::picker_message(state, message);
+    }
+
     #[test]
     fn mode_entry_binds_enter_and_leave_each_mode() {
         let mut s = state();
@@ -937,8 +983,9 @@ mod tests {
         ctrl(&mut s, Key::O);
         assert_eq!(s.mode, Mode::Session);
         typed(&mut s, Key::W, 'w');
-        assert_eq!(toast(&s), "sessions: not implemented yet");
+        assert!(s.session_picker.is_some(), "w opens the session manager");
         assert_eq!(s.mode, Mode::Normal);
+        s.session_picker = None;
 
         assert!(s.palette.is_none());
         press(&mut s, Key::P, Mods::CTRL | Mods::SHIFT);
@@ -957,6 +1004,82 @@ mod tests {
         ctrl(&mut s, Key::P);
         typed(&mut s, Key::F, 'f');
         assert_eq!(toast(&s), "floating panes: not implemented yet");
+    }
+
+    #[test]
+    fn the_session_actions_reach_the_session_state() {
+        let _guard = crate::session::test_lock();
+        let mut s = state();
+        let before = unique_session("binds");
+        s.current_session = before.clone();
+
+        ctrl(&mut s, Key::O);
+        assert_eq!(s.mode, Mode::Session);
+        typed(&mut s, Key::W, 'w');
+        assert!(s.session_picker.is_some(), "w opens the session manager");
+        assert_eq!(s.mode, Mode::Normal, "the modal mode is left after the bind");
+        assert_eq!(
+            s.session_picker.as_ref().unwrap().selected_name(),
+            Some(before.as_str()),
+            "the picker selects the session the workspace is in"
+        );
+
+        pick(&mut s, "d");
+        assert_eq!(
+            toast(&s),
+            "cannot delete the current session",
+            "deleting the session in use is refused"
+        );
+        assert!(s.session_picker.is_some(), "and the picker stays open");
+
+        pick(&mut s, "r");
+        assert!(s.session_picker.is_none(), "r closes the picker for the prompt");
+        assert_eq!(s.mode, Mode::RenameSession);
+        assert_eq!(s.rename_buf, before, "the prompt starts on the session's name");
+        type_str(&mut s, "-renamed");
+        press(&mut s, Key::Enter, Mods::empty());
+        let renamed = format!("{before}-renamed");
+        assert_eq!(s.mode, Mode::Normal);
+        assert_eq!(s.current_session, renamed, "Enter renamed the session");
+        assert!(
+            ghostwave::session::load(&renamed).is_some(),
+            "and the renamed session is on disk"
+        );
+
+        execute(&mut s, Action::SessionManager);
+        let entries = s.session_picker.as_ref().unwrap().entries.clone();
+        assert!(entries.contains(&renamed), "the manager lists it: {entries:?}");
+        s.session_picker = None;
+
+        execute(&mut s, Action::SessionNew);
+        let started = s.current_session.clone();
+        assert!(started.starts_with("session-"), "a new session is named, got {started}");
+        assert_eq!(toast(&s), format!("session: {started}"));
+        assert_eq!(s.tabs.len(), 1, "a fresh workspace");
+        assert_eq!(live_panes(&s), 1, "with one pane");
+        assert!(
+            ghostwave::session::load(&renamed).is_some(),
+            "the session switched away from was saved"
+        );
+
+        execute(&mut s, Action::SessionDelete);
+        assert_eq!(s.current_session, "default", "deleting opens the default session");
+        assert_eq!(toast(&s), format!("deleted session: {started}"));
+        assert!(
+            ghostwave::session::load(&started).is_none(),
+            "the deleted session is gone"
+        );
+
+        execute(&mut s, Action::Detach);
+        assert!(s.quit, "detach saves and quits");
+        assert_eq!(toast(&s), "session default saved — quitting");
+        assert!(
+            ghostwave::session::load("default").is_some(),
+            "the session was written on the way out"
+        );
+
+        ghostwave::session::delete(&renamed);
+        ghostwave::session::delete("default");
     }
 
     #[test]

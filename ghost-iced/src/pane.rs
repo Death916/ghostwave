@@ -66,6 +66,36 @@ pub struct Pane {
     pub cached_title: String,
 }
 
+/// What every live pane was spawned with, kept outside the pane's own lock.
+///
+/// The session format saves a pane's program, arguments, cwd, remote target and
+/// log name. Those never change after the pane is built, so they are recorded
+/// here at construction instead of being read back through the pane's mutex:
+/// that lock is also taken by the pty path, and a session save must never wait
+/// on it.
+static PANE_META: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PaneId, ghostwave::session::PaneState>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Records what a pane was spawned with, for the session format to read later.
+fn register_meta(id: PaneId, meta: ghostwave::session::PaneState) {
+    if let Ok(mut map) = PANE_META.lock() {
+        map.insert(id, meta);
+    }
+}
+
+/// Forgets a pane's recorded metadata once the pane is gone.
+pub fn forget_meta(id: PaneId) {
+    if let Ok(mut map) = PANE_META.lock() {
+        map.remove(&id);
+    }
+}
+
+/// Runs `f` over the recorded metadata of `id`, without taking the pane's lock.
+pub fn with_pane_meta<R>(id: PaneId, f: impl FnOnce(&ghostwave::session::PaneState) -> R) -> Option<R> {
+    PANE_META.lock().ok()?.get(&id).map(f)
+}
+
 impl Pane {
     /// Forks a pty running the user's login shell and starts its reader thread,
     /// priming the shell's startup terminal probes; the pty receiver moves to a bridge
@@ -109,6 +139,79 @@ impl Pane {
             .take()
             .expect("pty reader receiver (TermPane::new with spawn = true)");
         let id = PaneId::next();
+        register_meta(
+            id,
+            ghostwave::session::PaneState {
+                program: term.program.clone(),
+                args: term.args.clone(),
+                cwd: term.cwd.clone(),
+                remote: term.remote.clone(),
+                log: term.log_name.clone(),
+            },
+        );
+        Ok(Self {
+            id,
+            term,
+            scratch: RenderScratch::new()?,
+            dirty: true,
+            last_bounds: None,
+            rx: pty_bridge::spawn(id, rx),
+            cached_title: String::new(),
+        })
+    }
+
+    /// Restores a pane from a saved session: its scrollback log replayed, then a
+    /// fresh shell over it.
+    ///
+    /// The order matters and mirrors the reference: the terminal and its history
+    /// are built *before* the child starts. A shell started first would sit with
+    /// its startup terminal probes in the pty buffer while the replay ran, and
+    /// the answers arriving after its read timeout would be echoed back as
+    /// caret-escaped garbage. `log` names the saved log to replay; the replayed
+    /// bytes seed this pane's own new log, so the history outlives a second
+    /// restart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        cols: u16,
+        rows: u16,
+        cell: CellDims,
+        scrollback_lines: usize,
+        log_cap_bytes: u64,
+        program: Option<&str>,
+        args: &[&str],
+        cwd: Option<&str>,
+        log: &str,
+    ) -> Result<Self> {
+        let mut term = TermPane::new(
+            cols,
+            rows,
+            cell,
+            program,
+            args,
+            cwd,
+            scrollback_lines,
+            log_cap_bytes,
+            false,
+            None,
+        )?;
+        let seeded = ghostwave::session::replay_pane_log(log, &mut term.term, log_cap_bytes);
+        term.log_seed(&seeded);
+        term.spawn_child()?;
+        let rx = term
+            .pty_rx
+            .take()
+            .expect("pty reader receiver (spawn_child always takes one)");
+        let id = PaneId::next();
+        register_meta(
+            id,
+            ghostwave::session::PaneState {
+                program: term.program.clone(),
+                args: term.args.clone(),
+                cwd: term.cwd.clone(),
+                remote: term.remote.clone(),
+                log: term.log_name.clone(),
+            },
+        );
         Ok(Self {
             id,
             term,
