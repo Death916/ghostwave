@@ -1039,6 +1039,21 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   Lesson: when a framework's rendering surprises you, read the framework's own source and how its own
   widgets do the same job (iced's text editor renders its selection as rectangles; iced's canvas draws
   text above shapes) before guessing at colours, ordering or caching.
+- **What parity actually has left, checked against the reference rather than the toast list.** Three
+  arms in `ghost-iced/src/input.rs` still toast, but only two are real gaps:
+  `Action::EditScrollback` toasts in the **macroquad build too** (`src/app.rs:502`), so parity there is
+  already met and nothing needs porting.
+  *Floating panes* (`ToggleFloating`/`ToggleHideFloat`/`CycleFloat`) are a real gap. The pieces are all
+  present and no core work is needed: the reference stores floats on the tab (`tab.floating: Vec<…>`,
+  with `origin`/`hidden`) and swaps a pane between tree and float using the **shared** core helpers
+  `ghostwave::layout::path_to_pane` / `embed_at`; the port already has the float manager and its layer
+  (`ghost-iced/src/scratchpad.rs`, painted by `float_layer()` in `main.rs`) plus grid↔`Node` conversions
+  (`grid_session.rs`), so the port's job is to move the active pane between the grid and the float
+  manager and re-embed at its saved origin on toggle-off.
+  *Remote panes* (`ConnectSsh`/`ConnectDurableSsh`/`KillRemoteSession`) are the bigger gap: the reference
+  implements a whole subsystem (`ensure_remote_binary`, `remote_attach_cmd`, `connect_remote_pane`,
+  `kill_remote_pane`, `live_remote_specs`, plus the dsession naming) — roughly 250 lines, so it should be
+  ported as its own piece of work rather than bolted onto the input arms.
 - **The iced build is now the app you launch.** `~/.local/bin/ghostwave` was repointed from the macroquad
   release binary (`target/release/ghostwave`) to `ghost-iced/target/release/ghost-iced`, so rofi and
   everything else on `PATH` gets the port. It needs no environment setup: the binary carries its nix
