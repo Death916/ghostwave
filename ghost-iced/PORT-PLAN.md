@@ -399,10 +399,12 @@ mode, `Ctrl+o`/`Ctrl+g`/`Ctrl+q` must behave as in the app, and `Ctrl+p d` must 
   menu, preview/visualizer panes.
 - iced renders every text item above every shape in a `Frame`; that is why the frame/label pass
   is clipped to the content rect, and it also means the cursor sits behind its glyph.
-- **Decision checkpoint**: continue M3 + M4; if the keymap/Action port stays clean, M5 + M6; take
-  M7's numbers; flip the default binary only after M6-minus-kitty parity. The macroquad
-  front-end stays in the repo until then — a wipe-and-continue with macroquad remains a live
-  option and nothing here forecloses it.
+- **DIRECTION CHANGE (2026-09-16) — macroquad parity is no longer the acceptance criterion.**
+  The owner prefers iced's text rendering, knows iced better than macroquad, and wants the work to
+  use iced's built-ins instead of hand-rolling equivalents. See §16: panes move to `pane_grid`,
+  the chrome and overlays become real widgets, and `ghostwave::layout` stays only as the persisted
+  session representation. The macroquad front-end keeps working and stays in the repo as a
+  reference implementation, not as the target.
 
 ## 14. M1 / M2 notes (2026-09-16, later the same day)
 
@@ -452,4 +454,111 @@ sizes, format strings, wave parameters). Two port decisions:
   `TickRate::Slow` (125 ms) while the wave idles — matching the macroquad idle tier,
   at the cost of 8 presents/s instead of 0 — and `Off` (no tick at all) when
   `visual_wave = false`. Real durations replace the reference's frame counts.
+
+## 15. M3 — input parity (keymap modes + Action dispatch)
+
+Landed: the keymap modes are live. `Ctrl+p t n s h o g` enter modes, the status pill
+and hint line change with the mode, every mode's binds work, `Esc` exits a modal mode,
+`Ctrl+q` quits, and the temporary Alt binds are gone. The bind table itself is the app
+crate's `keymap` module — `ghost-iced/src/input.rs` is only the mapping from a
+`Dispatch` onto this front-end's state.
+
+    input.rs   key_press / repeat / key_release / execute  (mirrors App::handle_key,
+               handle_repeat, handle_key_release, execute)
+
+### Decisions worth knowing (they are not obvious from the code)
+
+- **Panes have an identity, not a position.** `pane::PaneId` is a process-wide counter,
+  and a pane's pty bridge is tagged with it. Index-based tags broke as soon as `close_tab`
+  (which shifts the tab vec down) and `break_pane` (which moves a pane into a new tab)
+  existed: a bridge subscription cannot be re-keyed after it has taken its receiver, so
+  an index tag would route a pane's output into whatever now sits at that index. Output
+  and exit messages therefore carry the id and route via `AppState::pane_by_id`.
+  Inside a tab, pane indices are still stable and never reused (closed panes leave
+  tombstones) — that part is only about the tree and the rects.
+- **Split direction semantics** (the one thing that is easy to mis-remember):
+  `SplitDir::Horizontal` = side-by-side, new pane to the right; `SplitDir::Vertical` =
+  one above the other, new pane below. Pane mode: `n` down, `d` down, `r` right,
+  `s` stacked. Global: `Ctrl+d` right, `Ctrl+Shift+d` down.
+- **Input is event-driven now.** iced delivers press / release / `repeat` and the
+  modifier state, so three things in the reference have no counterpart: the per-frame
+  `ALL_KEYS` poll, the synthetic repeat timer (400 ms initial / 40 ms interval) and the
+  polled `keymap::current_mods`. Releases are forwarded to a pane only for keys the app
+  did *not* consume on press (otherwise a modal bind spams the shell with stray
+  releases, which the reference's own comment warns about).
+- **Deliberate deviation — repeats in modal modes.** The reference forwards a held
+  key's repeats straight to the active pane without consulting the keymap, so holding a
+  key while the status bar says PANE types into the shell. Here repeats only flow in
+  Normal and Locked.
+- **Mouse reporting goes through the pane's own encoder.** The canvas resolves which
+  pane the event landed in, makes the position pane-local, and calls
+  `TermPane::handle_mouse`, which itself decides between application mouse reporting and
+  selection/viewport handling. The wheel uses that same path, so a pane that tracks the
+  mouse gets the wheel events and one that doesn't gets scrollback. Cursor motion is only
+  forwarded when a button is down or the pane tracks the mouse — iced reports every pixel
+  and the alternative is locking a pane per move. Modifiers for the mouse path come from
+  a listener snapshot (`keys::current_mods`) because iced's mouse events do not carry
+  them; `MouseEv::any_pressed` / `button_down` are accumulated in the canvas program's
+  `State`.
+- **Zoom** pins the active pane to the whole content rect and drops the other panes from
+  the layout while it lasts; they keep their tree slots and their processes.
+- **Unfinished features toast instead of doing nothing**, so a bound key is never
+  silently inert: floating panes, scratchpad, command palette, sessions (M4), search (M6),
+  preview/AI/visualizer panes, remote panes, edit-scrollback (which the reference also
+  toasts), and copy with no selection.
+- **Known reference quirks we mirror rather than fix**: `Ctrl+t b` (break-pane) on a
+  single-pane tab moves that pane into a new tab and leaves the old tab with the layout
+  crate's empty-tree sentinel (`Node::Leaf { pane: usize::MAX }`) — the tab survives with
+  nothing in it until you split into it again. `pane mode c` / `F2` rename of an empty
+  buffer is a no-op (Enter with an empty buffer keeps the current name), and the tab-cycle
+  actions (`n`/`p` in pane mode) walk the tree's leaf order rather than the visual one.
+
+### Verified
+
+`ghost-iced/src/input.rs` carries eight acceptance tests that press keys through the real
+dispatch path with real spawned panes and assert the resulting state (split direction,
+pane/tab counts, zoom, frames, rename, mode transitions, locked semantics, quit, the
+toasts). `fonts.rs` has three of its own. All 13 pass:
+
+    cd .../ghost && CARGO_TARGET_DIR=/tmp/icedspike-target XDG_DATA_HOME=/tmp/ghost-iced-test \
+      nix-shell /home/death916/.hermes/shell.nix --run \
+      "cd /home/death916/Documents/code/vibed/ghost/ghost-iced && cargo test --message-format=short"
+
+What the tests cannot cover: that winit actually delivers the chord to the window, and
+how any of it looks. Those need a human at the keyboard.
+
+### Convention: comments
+
+The port's Rust sources carry **only rustdoc** (`//!`, `///`) written for a caller of the
+API, plus the rare one-line note about a non-obvious mechanism. Nothing that cites another
+file, records history, explains a decision or addresses a future maintainer: this plan and
+`PROGRESS.md` are where that belongs.
+
+## 16. Direction change (2026-09-16): iced-native, not macroquad parity
+
+The owner's call, in substance: parity with the macroquad build no longer matters — they prefer
+iced's font rendering, know iced better, and want iced's built-ins used instead of hand-rolled
+equivalents.
+
+**Consequences.**
+
+1. **Stop hand-painting what iced has widgets for.** The tab bar, status bar and the overlays the
+   reference draws by hand (command palette, session manager, search bar, rename prompt) become
+   real widgets once their milestones land. The wave stays a `canvas`. `measure.rs` exists only
+   because canvas text cannot be measured; widget layout removes most of its reason to exist.
+2. **Panes move to `pane_grid`** — styled separator, hovered region, `on_click` focus,
+   `on_resize` drag-resize, and one canvas widget per pane. That deletes: the rect list shared by
+   painter and hit-testing (two copies of the same layout that can disagree), the per-pane
+   `with_clip` scissors, and the "a frame's own primitives flush after its drafts" hazard that
+   made every pane frame and label invisible today.
+3. **What pane_grid does not model stays ours**: zellij-style stacked panes and floating panes.
+   A stack becomes a pane whose content is a switcher; floats stay on an overlay layer.
+4. **`ghostwave::layout` survives** as the persisted session representation and as the budget for
+   stacks/floats, with a conversion to `pane_grid::State` at load/save while the macroquad build
+   reads the same session files.
+5. **Plan reshuffle**: M4 tabs + sessions, then **M5 = pane_grid migration**, M6 extras
+   (selection, search, palette, preview/visualizer, kitty graphics), M7 = perf numbers only.
+6. **Kept from the parity work**: the terminal-core seam (`TermPane` + the iced render scratch),
+   the font stack, the key encoder, the whole M3 input layer, and the geometry constants (cell
+   metrics, frame inset) even where the painter is replaced.
 

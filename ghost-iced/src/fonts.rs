@@ -1,27 +1,7 @@
 //! Font stack for the iced front-end: bundled primary face + system fallbacks.
 //!
-//! iced builds its `cosmic_text::FontSystem` from an *empty* font database plus
-//! its own Fira Sans (`iced_graphics/src/text.rs`), so without help it knows no
-//! system fonts and no fallback chain: box-drawing, braille, nerd-font and
-//! emoji glyphs all come out as tofu. The macroquad front-end (src/fonts.rs in
-//! the app crate) solves that by discovering system fonts with `fc-list` and
-//! scoring families into a preferred order; this module reproduces that
-//! discovery and priority so `main.rs` can hand the bytes to iced:
-//!
-//! ```ignore
-//! let mut app = iced::application(..).font(fonts::PRIMARY_BYTES);
-//! for (family, bytes) in fonts::fallback_bytes(12) {
-//!     eprintln!("[ghost-iced] font fallback {family}");
-//!     app = app.font(bytes); // repeatable: one call per font
-//! }
-//! ```
-//!
-//! Discovery is `fc-list` only (authoritative on NixOS, where font files live
-//! in `/nix/store` paths fontconfig knows). Colour bitmap fonts (CBDT/CBLC) are
-//! deliberately dropped: the renderer cannot rasterise them.
-//!
-//! Pure `std` on purpose (`std::process::Command`, `std::fs`, `std::collections`):
-//! no fontconfig bindings, no parser crates, no extra build dependencies.
+//! iced builds its font system from an *empty* database, so system families are
+//! discovered with `fc-list` and scored into a preferred fallback order.
 
 use std::collections::HashSet;
 use std::fs;
@@ -30,37 +10,35 @@ use std::process::Command;
 /// The face the cell metrics are measured from and the primary text font.
 pub const PRIMARY_BYTES: &[u8] = include_bytes!("../../assets/JetBrainsMono-Medium.ttf");
 
-/// Family name that resolves to [`PRIMARY_BYTES`] once it is registered.
-/// (Its nameID 1 is "JetBrains Mono Medium"; nameID 16 is "JetBrains Mono".
-/// The typographic family is what iced/cosmic_text resolves.)
+/// Returns the family name that resolves to [`PRIMARY_BYTES`] once it is registered.
+///
+/// iced/cosmic_text matches the typographic family (nameID 16, "JetBrains Mono"),
+/// not the file's nameID 1 ("JetBrains Mono Medium").
 pub fn primary() -> iced::Font {
     iced::Font::with_name("JetBrains Mono")
 }
 
-/// Skip enormous variable/collection fonts: memory + parse time. This box's
-/// `NotoSansMonoCJK-VF.otf.ttc` is 30.4 MiB and *does* pass — iced/cosmic_text
-/// can rasterise collections (unlike the macroquad stack), so CJK stays
-/// renderable at the cost of one ~30 MiB face per registered collection.
+/// Caps one file's size, bounding memory and parse time. A large variable or
+/// collection font still passes it: iced/cosmic_text rasterises collections, so
+/// CJK stays renderable at the cost of one face per collection.
 const MAX_FONT_BYTES: u64 = 32 * 1024 * 1024;
 
-/// `fc-list` locations, in probe order (PATH first, then the NixOS profile
-/// paths, which is where it actually lives on this box).
+/// `fc-list` locations, in probe order: `PATH` first, then the NixOS profile
+/// paths.
 const FC_LIST_BINARIES: [&str; 3] = [
     "fc-list",
     "/run/current-system/sw/bin/fc-list",
     "/usr/bin/fc-list",
 ];
 
-/// Family name of the bundled primary face. It is registered separately, so it
-/// must not also be loaded as a fallback.
+/// Registered separately, so it must not also be loaded as a fallback.
 const PRIMARY_FAMILY: &str = "jetbrains mono";
 
-/// Fallback faces, in priority order, as `(family_name, bytes)`.
+/// Loads at most `limit` system fallback faces, highest priority first.
 ///
-/// Returns at most `limit` faces, highest priority first, de-duplicated by
-/// family (all `JetBrainsMono*` designs collapse into one slot). Files that
-/// cannot be read, are larger than 32 MiB, or are not a TTF/OTF/TTC are
-/// skipped. Logs one summary line to stderr.
+/// De-duplicated by family (all `JetBrainsMono*` designs collapse into one slot);
+/// files that cannot be read, are larger than 32 MiB, or are not a TTF/OTF/TTC
+/// are skipped. Logs one summary line to stderr.
 pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
     let mut out: Vec<(String, Vec<u8>)> = Vec::new();
     if limit == 0 {
@@ -68,20 +46,19 @@ pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
         return out;
     }
 
-    // 1) Discover (path, family) pairs, then score + order them.
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen_paths: HashSet<String> = HashSet::new();
     for (order, (path, family)) in discover_fonts().into_iter().enumerate() {
         let score = score_family(&family);
         if score <= 0 {
-            continue; // "color": bitmap-only, unrenderable
+            continue;
         }
         if family.to_lowercase() == PRIMARY_FAMILY {
-            continue; // already registered as `primary()`
+            continue;
         }
         let path_l = path.to_lowercase();
         if path_l.contains("italic") || path_l.contains("oblique") {
-            continue; // no style synthesis for fallbacks
+            continue;
         }
         if !seen_paths.insert(path.clone()) {
             continue;
@@ -94,9 +71,6 @@ pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
         });
     }
 
-    // Highest score first; on ties prefer a single-face `.ttf`/`.otf` over a
-    // font collection, then a Regular/Medium/Book file, then the first
-    // `fc-list` entry. Mirrors `score_family` + the app's tie-breaking.
     candidates.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
@@ -105,8 +79,6 @@ pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
             .then_with(|| a.order.cmp(&b.order))
     });
 
-    // 2) Collapse one file per family ("the nerd-font package ships ~18 weights
-    // across 6 family NAMES"), keeping the highest-ranked one.
     let mut picked: Vec<&Candidate> = Vec::new();
     let mut picked_keys: HashSet<String> = HashSet::new();
     let mut picked_paths: HashSet<&str> = HashSet::new();
@@ -120,7 +92,6 @@ pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
         picked.push(c);
     }
 
-    // 3) Read bytes for the first `limit` that survive the sanity checks.
     for c in picked {
         if out.len() >= limit {
             break;
@@ -129,11 +100,9 @@ pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
             Some(bytes) => bytes,
             None => continue,
         };
-        // The same file shows up under several fc-list paths (the home-manager
-        // profile tree duplicates whole store paths), and registering a
-        // byte-identical face twice costs ~30 MiB per duplicate CJK collection
-        // while adding nothing: fontdb reads every face in a collection, so one
-        // copy already resolves all of its family names.
+        // The same file can appear under several fc-list paths, and a
+        // byte-identical face costs ~30 MiB per duplicate collection while
+        // adding nothing.
         if out.iter().any(|(_, seen): &(String, Vec<u8>)| seen == &bytes) {
             continue;
         }
@@ -149,7 +118,6 @@ pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// A scored font candidate: one file, one family.
 struct Candidate {
     score: i32,
     /// Position in `fc-list` output; the final tie-break so ordering is stable.
@@ -159,12 +127,14 @@ struct Candidate {
 }
 
 /// Priority score for a font family (higher = preferred fallback).
-/// `<= 0` means "do not load". Same table as the macroquad front-end.
+///
+/// `<= 0` means "do not load": colour bitmap fonts (CBDT/CBLC) score -1000,
+/// because the renderer cannot rasterise them.
 fn score_family(family: &str) -> i32 {
     let f = family.to_lowercase();
     let has = |s: &str| f.contains(s);
     if has("color") {
-        return -1000; // CBDT bitmap color fonts: cannot be rasterised
+        return -1000;
     }
     if f.starts_with("jetbrainsmono nerd font mono") {
         110 // same design as primary + nerd glyphs: identical metrics
@@ -191,9 +161,7 @@ fn score_family(family: &str) -> i32 {
     }
 }
 
-/// Grouping key: every `JetBrainsMono*` design collapses into one slot, the way
-/// the macroquad stack does — the nerd-font package ships ~18 weights across 6
-/// family names and loading them all would starve the symbol/emoji fonts.
+/// Every `JetBrainsMono*` design collapses into one slot.
 fn family_key(family: &str) -> String {
     let l = family.to_lowercase();
     if l.contains("jetbrainsmono") {
@@ -203,20 +171,19 @@ fn family_key(family: &str) -> String {
     }
 }
 
-/// True for the "normal" weight files, preferred on score ties.
+/// The "normal" weight files, preferred on score ties.
 fn regularish(path: &str) -> bool {
     let l = path.to_lowercase();
     l.contains("regular") || l.contains("-medium") || l.contains("book")
 }
 
-/// True for `TrueTypeCollection` files (`.ttc`). Losing a score tie against a
-/// single-face file keeps the cheap faces ahead of the multi-face monsters.
+/// `.ttc` files lose score ties to single-face ones, keeping the cheap faces
+/// ahead of the multi-face monsters.
 fn is_collection(path: &str) -> bool {
     path.to_lowercase().ends_with(".ttc")
 }
 
-/// Read a font file, returning `None` unless it is a plausible TTF/OTF/TTC and
-/// within the size cap.
+/// `None` unless it is a plausible TTF/OTF/TTC and within the size cap.
 fn load_font_bytes(path: &str) -> Option<Vec<u8>> {
     let meta = fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_FONT_BYTES {
@@ -229,8 +196,8 @@ fn load_font_bytes(path: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Cheap sanity check: TrueType/OpenType outline magic, CFF outlines (`OTTO`),
-/// or a TrueType collection (`ttcf`). No parser, no dependency.
+/// TrueType/OpenType outline magic, CFF outlines (`OTTO`), or a TrueType
+/// collection (`ttcf`).
 fn is_font_bytes(bytes: &[u8]) -> bool {
     match bytes.get(..4) {
         Some([0x00, 0x01, 0x00, 0x00]) => true,
@@ -239,7 +206,6 @@ fn is_font_bytes(bytes: &[u8]) -> bool {
     }
 }
 
-/// Discover `(path, family)` pairs by running `fc-list`.
 fn discover_fonts() -> Vec<(String, String)> {
     for bin in FC_LIST_BINARIES {
         match Command::new(bin).output() {
@@ -252,10 +218,9 @@ fn discover_fonts() -> Vec<(String, String)> {
     Vec::new()
 }
 
-/// Parse `fc-list` output. The default format is
-/// `"/path/font.ttf: Family:style=Regular"`, where the family field may be a
-/// comma-separated list (`"Family,Family Variant"`) and the style field may be
-/// absent (`"/path/font.ttf: Family"`).
+/// The default `fc-list` format is `"/path/font.ttf: Family:style=Regular"`,
+/// where the family field may be a comma-separated list (`"Family,Family
+/// Variant"`) and the style field may be absent (`"/path/font.ttf: Family"`).
 fn parse_fc_list(text: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -265,14 +230,14 @@ fn parse_fc_list(text: &str) -> Vec<(String, String)> {
         };
         let path = path.trim();
         let rest = rest.split_once(":style=").map(|(f, _)| f).unwrap_or(rest);
-        // Tolerate a bare `": <style>"` suffix as well.
+        // A line may also carry a bare `": <style>"` suffix.
         let family = rest.split(':').next().unwrap_or("").trim();
         let family = normalise_family(family.split(',').next().unwrap_or(""));
         if path.is_empty() || family.is_empty() {
             continue;
         }
         if !seen.insert(path.to_string()) {
-            continue; // one entry per file: fc-list repeats it per style
+            continue; // fc-list repeats a file once per style
         }
         out.push((path.to_string(), family));
     }
@@ -315,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn scores_match_the_macroquad_stack() {
+    fn scores_match_the_expected_priority() {
         assert_eq!(score_family("JetBrainsMono Nerd Font Mono"), 110);
         assert_eq!(score_family("JetBrainsMonoNL Nerd Font Mono"), 105);
         assert_eq!(score_family("DejaVu Sans Mono"), 100);

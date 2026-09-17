@@ -1,14 +1,8 @@
-//! iced-side pane wrapper.
-//!
-//! The terminal core stays in the app crate: `ghostwave::term::TermPane` owns
-//! the pty, the VT state, scrollback, selection, the pane log and the VT key
-//! encoder. iced needs two things the pane keeps to itself:
-//!
-//!   1. its own libghostty render scratch — the pane's copy is private and bound
-//!      to the macroquad draw path, so the iced painter owns a second one;
-//!   2. a lockable home for the pane, because `canvas::Program::draw` takes
-//!      `&self` while drawing has to mutate the render state.
+//! iced-side pane wrapper: `ghostwave::term::TermPane` in a lockable home, because
+//! `canvas::Program::draw` takes `&self` while drawing mutates render state, plus
+//! libghostty's per-draw render scratch.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ghostwave::keymap::KeyPress;
@@ -16,16 +10,16 @@ use ghostwave::term::{CellDims, TermPane};
 use libghostty_vt::key::{self, Mods};
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 
-use crate::pty_bridge::{self, PaneTag, PtyRxSlot};
+use crate::pty_bridge::{self, PtyRxSlot};
 
-/// Crate-wide error type (the app crate's `ghostwave::Result` shape).
+/// Crate-wide alias for results that box their error.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// A pane shared between the iced update loop (drains pty output, writes input)
-/// and the canvas painter (reads the screen).
+/// A pane handle shared by the update loop (drains pty output, writes input) and the
+/// canvas painter (reads the screen).
 pub type SharedPane = Arc<Mutex<Pane>>;
 
-/// libghostty's per-draw scratch space.
+/// Reusable libghostty render state and iterators, kept across draws.
 pub struct RenderScratch {
     pub render_state: RenderState<'static>,
     pub row_it: RowIterator<'static>,
@@ -42,31 +36,33 @@ impl RenderScratch {
     }
 }
 
+/// A pane's process-wide identity, independent of its position in a tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PaneId(pub usize);
+
+impl PaneId {
+    fn next() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 pub struct Pane {
+    pub id: PaneId,
     pub term: TermPane,
     pub scratch: RenderScratch,
-    /// Set when something changed that the canvas has to repaint.
     pub dirty: bool,
-    /// This pane's pty output stream, already bridged into iced. It travels with
-    /// the pane so a pane can never be separated from its output.
+    /// The pane's pty output stream, already bridged into iced.
     pub rx: PtyRxSlot,
 }
 
 impl Pane {
-    /// Spawn a pane whose child is the user's login shell.
+    /// Forks a pty running the user's login shell and starts its reader thread,
+    /// priming the shell's startup terminal probes; the pty receiver moves to a bridge
+    /// thread that turns its output into an iced event ([`crate::pty_bridge`]).
     ///
-    /// `spawn = true` already forks the pty, starts the reader thread and primes
-    /// the shell's startup terminal probes — do *not* call `spawn_child` on top
-    /// of it (that would fork a second child and orphan the first).
-    ///
-    /// `GHOST_ICED_FIXTURE` (like the spike's `SPIKE_FIXTURE`) runs `/bin/sh -c
-    /// <cmd>` instead of a shell, for benchmarks and scripted screenshots.
-    ///
-    /// The pane's pty receiver is moved to a bridge thread here, which is what
-    /// turns its output into an iced event (`crate::pty_bridge`); `tag` is the
-    /// pane id iced messages will carry.
+    /// `GHOST_ICED_FIXTURE` runs `/bin/sh -c <cmd>` in place of a shell.
     pub fn spawn(
-        tag: PaneTag,
         cols: u16,
         rows: u16,
         cell: CellDims,
@@ -102,18 +98,17 @@ impl Pane {
             .pty_rx
             .take()
             .expect("pty reader receiver (TermPane::new with spawn = true)");
+        let id = PaneId::next();
         Ok(Self {
+            id,
             term,
             scratch: RenderScratch::new()?,
             dirty: true,
-            rx: pty_bridge::spawn(tag, rx),
+            rx: pty_bridge::spawn(id, rx),
         })
     }
 
-    /// Apply the configured theme's default fg/bg to this pane — the same call
-    /// the macroquad app makes in `app.rs::apply_terminal_colors`. Without it a
-    /// fresh pane comes up with libghostty's near-black defaults instead of the
-    /// configured theme.
+    /// Sets this pane's default foreground and background from `theme`.
     pub fn apply_theme(&mut self, theme: &ghostwave::theme::Theme) {
         let to_rgb = |c: ghostwave::theme::Rgb| libghostty_vt::style::RgbColor {
             r: c.0,
@@ -129,9 +124,7 @@ impl Pane {
         self.dirty = true;
     }
 
-    /// Feed pty output into the terminal. This mirrors what `TermPane::poll_pty`
-    /// does for the macroquad build (log first, then the VT) — the receiver
-    /// itself lives on the iced side of the bridge, so `poll_pty` sees nothing.
+    /// Writes pty output to the pane log first, then to the VT.
     pub fn ingest(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -144,7 +137,7 @@ impl Pane {
         self.dirty = true;
     }
 
-    /// The child exited or the pty errored out.
+    /// Records that the child exited or the pty errored, reaping it for an exit code.
     pub fn exited(&mut self, reason: &str) {
         self.term.exited = Some(reason.to_string());
         self.term.last_exit_code = self.term.child.as_mut().and_then(|c| c.poll_reap());
@@ -152,9 +145,7 @@ impl Pane {
         self.dirty = true;
     }
 
-    /// Route a key press through the pane's existing VT key encoder — the same
-    /// call the macroquad app makes (`app.rs::handle_key`), so kitty keyboard
-    /// protocol, application-cursor mode and friends behave identically.
+    /// Encodes and sends `kp` to the child, then flushes any VT response.
     pub fn key_press(&mut self, kp: &KeyPress, action: key::Action) {
         let consumed = if kp.text.is_some() && kp.mods.contains(Mods::SHIFT) {
             Mods::SHIFT
@@ -174,9 +165,7 @@ impl Pane {
         self.dirty = true;
     }
 
-    /// Text input that is not a key press (IME commit, dead keys). Wired up
-    /// with the keymap modes in M3 — iced currently delivers typed text inside
-    /// the key press event, which `key_press` already handles.
+    /// Text input that is not a key press (IME commit, dead keys).
     #[allow(dead_code)]
     pub fn char_input(&mut self, c: char) {
         self.term.handle_char(c);
@@ -184,24 +173,79 @@ impl Pane {
         self.dirty = true;
     }
 
-    /// Grid resize. `TermPane::set_grid` is a no-op when the grid is unchanged.
+    /// Resizes the grid; a resize to the current size is a no-op.
     pub fn resize(&mut self, cols: u16, rows: u16, cell: CellDims) {
         let _ = self.term.set_grid(cols, rows, cell);
         self.dirty = true;
     }
 
-    /// Wheel scrollback (`TermPane::scroll`, which also leaves the pane in
-    /// "scrolled" state so output stops snapping it back to the bottom).
+    /// Scrolls the viewport by `lines` and leaves the pane in scrolled state.
     pub fn scroll(&mut self, lines: i32) {
         self.term.scroll(lines);
         self.dirty = true;
     }
+
+    /// Scrolls the viewport by whole pages, a page being the grid's row count.
+    pub fn scroll_page(&mut self, pages: i32) {
+        self.term.scroll_page(pages);
+        self.dirty = true;
+    }
+
+    pub fn scroll_half_page(&mut self, pages: i32) {
+        self.term.scroll_half_page(pages);
+        self.dirty = true;
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_to_bottom();
+        self.dirty = true;
+    }
+
+    /// Resets the terminal, clearing the screen and the scrollback.
+    pub fn clear_terminal(&mut self) -> Result<()> {
+        let r = self.term.clear_terminal();
+        self.dirty = true;
+        r
+    }
+
+    /// Copies the active selection to the clipboard; `Ok(false)` when there is nothing
+    /// to copy.
+    pub fn copy_selection(&mut self) -> Result<bool> {
+        self.term.copy_selection()
+    }
+
+    /// Pastes the clipboard into the pane.
+    pub fn paste_clipboard(&mut self) {
+        self.term.paste_clipboard();
+        self.term.flush_response();
+        self.dirty = true;
+    }
+
+    /// Whether the application in this pane tracks the mouse, which it asks for with a
+    /// VT sequence.
+    pub fn mouse_tracking(&self) -> bool {
+        self.term.term.is_mouse_tracking().unwrap_or(false)
+    }
+
+    /// Handles a mouse event inside this pane: forwarded to the application when it
+    /// tracks the mouse, otherwise it drives selection and viewport scrolling. `rect`
+    /// and `ev.x`/`ev.y` are pane-local logical px.
+    pub fn mouse_event(
+        &mut self,
+        rect: ghostwave::layout::Rect,
+        cell: CellDims,
+        padding: f32,
+        ev: ghostwave::term::MouseEv,
+        mods: Mods,
+    ) {
+        let _ = self.term.handle_mouse(rect, cell, padding, ev, mods);
+        self.term.flush_response();
+        self.dirty = true;
+    }
 }
 
-/// Cell metrics, computed exactly like the macroquad build (`app.rs`):
-/// `cell_w = ceil('M' advance)`, `cell_h = ceil(ascent + descent + row_gap)`,
-/// `baseline = ascent + row_gap / 2`. Same font, same fontdue call, so glyph
-/// positions line up with the reference build at the same pixel size.
+/// Cell metrics from the embedded font: `cell_w = ceil('M' advance)`,
+/// `cell_h = ceil(ascent + descent + row_gap)`, `baseline = ascent + row_gap / 2`.
 pub fn cell_dims(font_bytes: &[u8], font_px: f32, row_gap: f32) -> CellDims {
     let font = fontdue::Font::from_bytes(font_bytes, fontdue::FontSettings::default())
         .expect("fontdue: parse embedded font");

@@ -106,28 +106,60 @@ reference; both were captured at the same window size and compared.
   unlink the iced instance's LIVE logs (seen as `(deleted)` in `/proc/<pid>/fd`). Test
   the iced build with `XDG_DATA_HOME=/tmp/ghost-iced-data`; `GHOST_ICED_PANES=<n>` and
   `GHOST_ICED_FIXTURE=<cmd>` make layout/multi-pane/log behaviour testable without
-  typing. Temporary binds until M3: Alt+Shift+d/e split, Alt+Shift+w close, Alt+arrows
-  focus.
+  typing. (The M1-era Alt+Shift binds were deleted in M3 — see below.)
 
-**NEXT UP — M3, the keymap modes (this is the milestone that makes hotkeys real).** Yesterday's
-temporary Alt binds get deleted and replaced by the app's own `Ctrl+p`/`Ctrl+t`/`Ctrl+n`/
-`Ctrl+s`/`Ctrl+h`/`Ctrl+o`/`Ctrl+g`/`Ctrl+q` binds and its `Dispatch` → `Action` effects, so the
-status pill and hint line start changing with the mode. Steps, in order: (1) read
-`app.rs::handle_key` (~2149-2560) + `keymap::{handle, global_binds, entry_bind, is_quit}` and
-mirror the effects in `ghost-iced/app.rs` as `apply(action)`; (2) add the mode/pending-prefix
-state and delete the temp binds; (3) route keys mode-first, only a normal/unlocked key reaching
-the pane's VT encoder; (4) add key release + repeat (`key::Action::Press/Release/Repeat`, which
-kitty keyboard protocol needs — `keys.rs` currently emits presses only); (5) per-pane mouse
-reporting via the pub `TermPane::handle_mouse` (the selection gesture is M6). Verify: `Ctrl+p`
-changes pill + hints, `Esc` exits, `Ctrl+p d` splits, `Ctrl+g` locks, `Ctrl+q` quits.
-After M3: M4 tabs + sessions, M5 leftover config knobs + runtime theme switch, M6 extras
-(selection/copy, search, palette, session manager, preview/visualizer, kitty graphics last),
-M7 side-by-side parity + idle-perf numbers before any default-binary flip. Full detail in
-`ghost-iced/PORT-PLAN.md` §13.
+**M3 LANDED — the keymap modes are real (hotkeys work).** `Ctrl+p t n s h o g` enter modes,
+the status pill and hint line change with the mode, every mode's binds work, `Esc` exits a
+modal mode, `Ctrl+q` quits. The bind table is still the app crate's `keymap`; the new
+`ghost-iced/src/input.rs` is only the mapping from a `Dispatch` onto this front-end's state
+(`execute` mirrors `App::execute`). Three things decided on the way, all easy to trip over
+later:
 
-The user's read on the two builds: iced's text looks sharper and is preferred; they want the
-hotkeys working next (M3) and are deliberately keeping the port reversible — a wipe and
-continue with macroquad stays a live option until iced reaches parity.
+- **Panes now have an identity, not a position** (`pane::PaneId`, a process-wide counter,
+  carried by each pane's pty bridge; output/exit messages route through
+  `AppState::pane_by_id`). Index-based `(tab, pane)` tags broke the moment `close_tab`
+  (shifts the tab vec down) and `break_pane` (moves a pane to a new tab) existed, because a
+  bridge subscription cannot be re-keyed after it takes its receiver.
+- **Split semantics**, since this got misremembered in conversation: `SplitDir::Horizontal`
+  = side-by-side (new pane to the RIGHT), `Vertical` = one above the other (BELOW). Pane
+  mode `d`/`n` = down, `r` = right, `s` = stacked; global `Ctrl+d` = right,
+  `Ctrl+Shift+d` = down.
+- **Repeats are dropped in modal modes.** The reference forwards a held key's repeats
+  straight to the pane without consulting the keymap, which types into the shell while the
+  status bar says PANE; here repeats only flow in Normal and Locked.
+- Unfinished features now **toast** rather than silently doing nothing (floating panes,
+  scratchpad, palette, sessions, search, preview/AI/visualizer, remote panes).
+
+Verified by eight acceptance tests in `input.rs` that press the keys through the real
+dispatch path with real spawned panes and assert the resulting state, plus three in
+`fonts.rs` — 13/13 pass (`cargo test`, command in `ghost-iced/PORT-PLAN.md` §15). Not
+covered by tests: that winit delivers the chord to the window, and anything visual.
+
+**DIRECTION CHANGE (2026-09-16): iced-native, not macroquad parity.** The user's call — they prefer
+iced's text rendering, know iced better, and want iced's built-ins used instead of hand-rolled
+equivalents. So `pane_grid` replaces the hand-painted pane layer (divider styling, click focus,
+drag-resize, one canvas per pane, and no more "who paints on top" bugs — the invisible-frame
+regression fixed today was exactly that class), and the chrome/overlays move to real widgets,
+which retires most of `measure.rs`. `ghostwave::layout` stays as the persisted session
+representation and for stacks/floats, which pane_grid has no equivalent of. Plan reshuffle:
+M4 tabs + sessions, then **M5 = pane_grid migration**, M6 extras, M7 demoted to perf numbers only
+(visual parity is no longer a criterion). Detail: `ghost-iced/PORT-PLAN.md` §16.
+
+**NEXT UP — M4: tabs and sessions.** Tab ops are done (new/close/next/prev/goto/last/rename/
+move via `Ctrl+t` and the globals); what M4 adds is `session.rs`-backed save/restore, the
+`Ctrl+o` session manager overlay (list, switch, new, rename, delete), the last-session
+marker, and the save-on-quit path the quit action currently skips. Then M5 (leftover config
+knobs + runtime theme switch), M6 (selection/copy, search, palette, preview/visualizer,
+kitty graphics last), M7 (side-by-side parity + idle-perf numbers before any
+default-binary flip). Rationale and the module map: `ghost-iced/PORT-PLAN.md` §13 and §15.
+
+**Convention, applies to the whole port**: Rust sources carry only rustdoc (`//!`, `///`)
+written for a caller; everything that explains a decision, cites another file, records
+history or addresses a future maintainer goes in these markdown files instead.
+
+The user's read on the two builds: iced's text looks sharper and is preferred, and the port
+stays reversible — a wipe and continue with macroquad remains a live option until iced
+reaches parity.
 
 ### Idle GPU, part 2 (branch `perf/idle-gpu-2`) — idle frame tier 30 → 8 FPS
 User: "gpu usage is pretty high even when idle still" after the earlier adaptive

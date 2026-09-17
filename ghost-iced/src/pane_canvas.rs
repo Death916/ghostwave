@@ -1,22 +1,6 @@
-//! iced canvas painter for a tab of ghostwave terminal panes.
-//!
-//! This is the iced replacement for the app crate's `term.rs::render()` plus the
-//! pane-frame half of `main.rs` (macroquad): background, per-cell fg/bg, text,
-//! underline/strikethrough, cursor, then the 1px/2px pane frames and their
-//! labels.
-//!
-//! Geometry comes from `crate::app::AppState::rects`, which is
-//! `ghostwave::layout` + the same 2px inset the macroquad build applies — the
-//! painter never computes its own layout. Rects are canvas-local coordinates.
-//! Each pane is painted inside `Frame::with_clip`, so a line wider than its pane
-//! cannot bleed into its neighbour (the macroquad build uses a GL scissor for
-//! the same reason).
-//!
-//! Text notes (both were real bugs):
-//! * the canvas must draw with the face the cell metrics were measured from
-//!   (`crate::fonts::primary()`), not iced's default proportional Fira Sans;
-//! * `Shaping::Advanced`, because cosmic-text documents `Basic` as "shaping with
-//!   no font fallback", which turns every glyph the primary face lacks into tofu.
+//! iced canvas painter for a tab of ghostwave terminal panes: background,
+//! per-cell fg/bg, text, underline/strikethrough, cursor, then the pane frames
+//! and their labels. Rects are canvas-local coordinates.
 
 use ghostwave::app::TAB_BAR_H;
 use ghostwave::term::CellDims;
@@ -31,20 +15,23 @@ use libghostty_vt::style::{RgbColor, Underline};
 use crate::Message;
 use crate::chrome::{self, ChromeState, WaveParams};
 use crate::fonts;
+use crate::keys;
 use crate::pane::{Pane, SharedPane};
 
-/// Label text size, as in the macroquad build's pane labels (a literal 13 there).
+use ghostwave::term::{MouseEv, MouseEvKind};
+use libghostty_vt::mouse as vt_mouse;
+
 const LABEL_PX: f32 = 13.0;
-/// Advance of JetBrains Mono at `LABEL_PX` (12px advances 7.2px). Used only to
-/// size the label's background band — iced canvases cannot measure text.
+/// Advance of the label face at `LABEL_PX`, in px. Used only to size the label's
+/// background band, since the canvas cannot measure text.
 const LABEL_ADVANCE: f32 = 7.8;
 const LABEL_PAD: f32 = 8.0;
-/// Frame stroke widths, matching `main.rs`.
 const FRAME_ACTIVE_W: f32 = 2.0;
 const FRAME_INACTIVE_W: f32 = 1.0;
-/// Label band height above a pane rect.
+/// Label band height in px above a pane rect.
 const LABEL_H: f32 = 14.0;
 
+/// Paints one tab's terminal panes, their frames and the chrome.
 pub struct TerminalCanvas {
     /// Tab these panes belong to, so mouse events can be tagged.
     pub tab: usize,
@@ -60,15 +47,47 @@ pub struct TerminalCanvas {
     /// Content area (window minus the tab bar and status bar), in canvas
     /// coordinates. Pane frames and labels are clipped to it: iced renders every
     /// text item above every shape in a `Frame`, so without the clip a top-row
-    /// pane label would float over the tab bar instead of being covered by it
-    /// (which is what drawing chrome last achieves in the macroquad build).
+    /// pane label would float over the tab bar instead of being covered by it.
     pub content: Rectangle,
+    /// Panes whose application currently tracks the mouse.
+    ///
+    /// Cursor motion is delivered by iced continuously; forwarding every move
+    /// would mean locking every pane on every pixel, so motion is only handed to
+    /// a pane that either has a button down or is tracking the mouse. The list is
+    /// snapshotted when the view is rebuilt.
+    pub mouse_tracking: Vec<usize>,
     /// Everything the chrome needs, owned: the canvas is rebuilt every view.
     pub chrome: ChromeData,
 }
 
-/// Owned snapshot of the chrome's state, turned into a borrowed
-/// [`ChromeState`] at paint time (`crate::chrome::paint`).
+/// Accumulates the `any_pressed` / `button_down` fields of [`MouseEv`] from the
+/// event stream, which is what the app crate's mouse encoder reads.
+#[derive(Default)]
+pub struct CanvasState {
+    /// Buttons currently held, newest last (`button_down` is the most recent
+    /// press).
+    pressed: Vec<mouse::Button>,
+}
+
+impl CanvasState {
+    fn button_down(&self) -> Option<vt_mouse::Button> {
+        self.pressed.last().copied().and_then(vt_button)
+    }
+}
+
+/// Only the three real buttons exist in both; the wheel arrives as
+/// [`MouseEvKind::Wheel`].
+fn vt_button(button: mouse::Button) -> Option<vt_mouse::Button> {
+    match button {
+        mouse::Button::Left => Some(vt_mouse::Button::Left),
+        mouse::Button::Right => Some(vt_mouse::Button::Right),
+        mouse::Button::Middle => Some(vt_mouse::Button::Middle),
+        _ => None,
+    }
+}
+
+/// Holds an owned snapshot of the chrome's state, turned into a borrowed
+/// [`ChromeState`] at [`chrome::paint`] time.
 pub struct ChromeData {
     /// (label, is_active), in tab order.
     pub tabs: Vec<(String, bool)>,
@@ -78,12 +97,14 @@ pub struct ChromeData {
     pub sync_panes: bool,
     pub wave: Option<WaveParams>,
     pub toast: Option<String>,
+    /// `(what, buffer)` while a rename mode is active — "Tab" or "Pane", and the
+    /// text so far.
+    pub rename: Option<(String, String)>,
 }
 
 impl TerminalCanvas {
-    /// Tab bar hit test: the reference's `(mx / tab_w)` with the renderer's 130 px
-    /// chip width (`app.rs` uses 120 in its own hit test — a real 10 px
-    /// mis-selection bug the port does not copy).
+    /// Returns the tab whose `TAB_W` px chip contains `point.x`; `None` outside
+    /// the bar or past the last tab.
     fn tab_at(&self, point: Point) -> Option<usize> {
         const TAB_W: f32 = 130.0;
         if point.y >= TAB_BAR_H || point.x < 0.0 {
@@ -95,53 +116,86 @@ impl TerminalCanvas {
 }
 
 impl canvas::Program<Message> for TerminalCanvas {
-    type State = ();
+    type State = CanvasState;
 
     fn update(
         &self,
-        _state: &mut Self::State,
+        state: &mut Self::State,
         event: &Event,
         _bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<Action<Message>> {
         match event {
-            // Focus follows a click. The pane under the cursor is the one whose
-            // rect contains it — the same rects the painter draws.
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+            Event::Mouse(mouse::Event::ButtonPressed(button)) => {
                 let point = cursor.position()?;
-                // The tab bar is chrome drawn over the panes: it gets first claim.
+                // The tab bar is drawn over the panes, so it gets first claim on
+                // a press.
                 if let Some(index) = self.tab_at(point) {
                     return Some(Action::publish(Message::FocusTab(index)));
                 }
-                let pane = self.pane_at(point)?;
-                if pane == self.active {
-                    Some(Action::capture())
-                } else {
-                    Some(Action::publish(Message::FocusPane {
-                        tab: self.tab,
-                        pane,
-                    }))
+                let (pane, rect) = self.pane_at(point)?;
+                let pressed = vt_button(*button)?;
+                // Track the iced button, so release matching and the vt mapping
+                // stay one list.
+                state.pressed.push(*button);
+                Some(Action::publish(self.mouse_message(
+                    pane,
+                    rect,
+                    point,
+                    MouseEvKind::Press(pressed),
+                    state,
+                )))
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(button)) => {
+                let point = cursor.position()?;
+                let (pane, rect) = self.pane_at(point)?;
+                let released = vt_button(*button)?;
+                state.pressed.retain(|b| b != button);
+                Some(Action::publish(self.mouse_message(
+                    pane,
+                    rect,
+                    point,
+                    MouseEvKind::Release(released),
+                    state,
+                )))
+            }
+            // Motion is the hot path: iced reports every pixel, so it only goes
+            // to a pane that is tracking the mouse or has a button down.
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let point = cursor.position()?;
+                let (pane, rect) = self.pane_at(point)?;
+                if state.pressed.is_empty() && !self.mouse_tracking.contains(&pane) {
+                    return None;
                 }
+                Some(Action::publish(self.mouse_message(
+                    pane,
+                    rect,
+                    point,
+                    MouseEvKind::Motion,
+                    state,
+                )))
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let point = cursor.position()?;
-                let pane = self.pane_at(point)?;
-                // iced reports positive y for wheel-up; libghostty scrolls into
-                // history with a negative viewport delta (the app's mouse path
-                // does `dy * -2.5` for the same reason).
-                let (dy, per_line) = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => (*y, 3.0),
-                    mouse::ScrollDelta::Pixels { y, .. } => (*y, 0.15),
+                let (pane, rect) = self.pane_at(point)?;
+                // libghostty takes the wheel as a positive-up delta and decides
+                // for itself whether that is application mouse reporting or a
+                // viewport scroll; the app's own scale is one notch per line, so
+                // pixel deltas are divided down.
+                let dy = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => *y,
+                    mouse::ScrollDelta::Pixels { y, .. } => *y / 53.0,
                 };
-                let lines = (dy * per_line).round() as i32;
-                if lines == 0 {
+                if dy == 0.0 {
                     return None;
                 }
-                Some(Action::publish(Message::Scroll {
-                    tab: self.tab,
+                Some(Action::publish(self.mouse_message(
                     pane,
-                    lines: -lines,
-                }))
+                    rect,
+                    point,
+                    MouseEvKind::Wheel(dy),
+                    state,
+                )))
             }
             _ => None,
         }
@@ -158,13 +212,18 @@ impl canvas::Program<Message> for TerminalCanvas {
         let mut frame = Frame::new(renderer, bounds.size());
         let font = fonts::primary();
 
-        // Window background: everything the panes do not cover (the frame
-        // gutters) shows this, as in the macroquad build.
-        frame.fill_rectangle(
-            Point::new(bounds.x, bounds.y),
-            Size::new(bounds.width, bounds.height),
-            rgb(self.theme.bg),
-        );
+        // Window background: it shows through everywhere the panes do not cover,
+        // including the frame gutters. It is drawn inside its own region because
+        // a `Frame`'s own primitives are flushed after every draft, so a direct
+        // fill here would paint over the panes and their frames; `with_clip` is
+        // the only way to draw beneath them.
+        frame.with_clip(bounds, |f| {
+            f.fill_rectangle(
+                Point::new(bounds.x, bounds.y),
+                Size::new(bounds.width, bounds.height),
+                rgb(self.theme.bg),
+            );
+        });
 
         for (id, rect) in &self.rects {
             let Some(pane) = self.panes.iter().find(|(p, _)| p == id).map(|(_, p)| p) else {
@@ -183,8 +242,7 @@ impl canvas::Program<Message> for TerminalCanvas {
         }
 
         if self.show_frames {
-            // Clipped to the content area: see the `content` field's note about
-            // iced ordering text above shapes.
+            // Clipped to the content area, for the reason given on that field.
             let content = self.content;
             let rects = self.rects.clone();
             let active = self.active;
@@ -197,8 +255,11 @@ impl canvas::Program<Message> for TerminalCanvas {
             });
         }
 
-        // Chrome last: the reference draws tab bar → overlays → status bar after
-        // the panes, so chrome paints over pane content.
+        // Chrome last, so it paints over the pane content; the rename prompt is
+        // drawn with it, geometrically clear of both bars.
+        if let Some((what, buffer)) = &self.chrome.rename {
+            chrome::paint_rename_prompt(&mut frame, bounds.size(), what, buffer, &self.theme, font);
+        }
         chrome::paint(
             &mut frame,
             bounds.size(),
@@ -220,15 +281,42 @@ impl canvas::Program<Message> for TerminalCanvas {
 }
 
 impl TerminalCanvas {
-    /// Pane id under a window-space point, if any.
-    fn pane_at(&self, point: Point) -> Option<usize> {
+    /// Returns the pane id and rect under `point`, in canvas-local coordinates.
+    fn pane_at(&self, point: Point) -> Option<(usize, Rectangle)> {
         self.rects
             .iter()
             .find(|(_, rect)| rect.contains(point))
-            .map(|(id, _)| *id)
+            .map(|(id, rect)| (*id, *rect))
     }
 
-    /// Pane label, mirroring the macroquad build's `name index — title`.
+    fn mouse_message(
+        &self,
+        pane: usize,
+        rect: Rectangle,
+        point: Point,
+        kind: MouseEvKind,
+        state: &CanvasState,
+    ) -> Message {
+        Message::Mouse {
+            tab: self.tab,
+            pane,
+            // A click focuses what it lands on, and the same event is still fed
+            // to the pane under the cursor.
+            focus: pane != self.active,
+            ev: MouseEv {
+                kind,
+                // Pane-local logical px, which is what the mouse encoder takes.
+                x: point.x - rect.x,
+                y: point.y - rect.y,
+                any_pressed: !state.pressed.is_empty(),
+                button_down: state.button_down(),
+            },
+            mods: keys::current_mods(),
+        }
+    }
+
+    /// Returns the pane label as `name index — title`, with the title omitted
+    /// when empty.
     fn label_for(&self, id: usize) -> String {
         let Some(pane) = self.panes.iter().find(|(p, _)| *p == id).map(|(_, p)| p) else {
             return String::new();
@@ -241,7 +329,7 @@ impl TerminalCanvas {
             t.name.clone()
         };
         let title = t.title();
-        // Position in the tab's rect list, as the macroquad build enumerates it.
+        // 1-based position in the tab's rect list.
         let index = self
             .rects
             .iter()
@@ -256,7 +344,7 @@ impl TerminalCanvas {
     }
 }
 
-/// Paint one pane's terminal content into `rect` (canvas-local).
+/// Paints one pane's terminal content into `rect`, in canvas-local coordinates.
 fn paint_pane(
     frame: &mut Frame,
     pane: &mut Pane,
@@ -346,8 +434,7 @@ fn paint_pane(
                 && let Ok(style) = c.style()
             {
                 if style.inverse {
-                    // Inverse swaps the cell's own colours, as the macroquad
-                    // painter does.
+                    // Inverse swaps the cell's own colours.
                     let new_bg = fg;
                     fg = cell_bg.unwrap_or(default_bg);
                     cell_bg = if new_bg == default_bg {
@@ -442,7 +529,7 @@ fn paint_pane(
 
 /// A horizontal run of cells sharing one foreground colour, drawn as a single
 /// text item so glyphs advance by the font's own advance instead of being pinned
-/// to our rounded-up cell width.
+/// to the rounded-up cell width.
 struct TextRun {
     x: f32,
     baseline_y: f32,
@@ -450,9 +537,9 @@ struct TextRun {
     text: String,
 }
 
-/// Draw a pane's frame + label, exactly as the macroquad build does: the stroke
-/// is drawn 2px outside the pane rect (so it sits in the inset gutter), 2px wide
-/// when the pane is focused and 1px otherwise, with a filled label band above it.
+/// Draws a pane's frame and label: the stroke sits 2 px outside the pane rect,
+/// so it lands in the inset gutter, and is 2 px wide when the pane is focused
+/// and 1 px otherwise, with a filled label band above it.
 fn paint_frame(
     frame: &mut Frame,
     rect: Rectangle,
@@ -498,7 +585,6 @@ fn paint_frame(
     });
 }
 
-/// Draw one text run as a single canvas text item.
 fn draw_run(frame: &mut Frame, run: &TextRun, font_px: f32, font: Font) {
     if run.text.is_empty() {
         return;
@@ -511,28 +597,25 @@ fn draw_run(frame: &mut Frame, run: &TextRun, font_px: f32, font: Font) {
         font,
         align_x: alignment::Horizontal::Left.into(),
         align_y: alignment::Vertical::Top,
-        // Advanced, not Basic: cosmic-text documents Basic as "shaping with no
-        // font fallback" (`shape_fallback` is only reached on the advanced path),
-        // so with Basic every glyph missing from the primary face — ❯ in the
-        // starship prompt, braille, nerd-font private-use icons — is tofu no
-        // matter how many fallback fonts are registered. This is what iced's own
-        // text widgets use (iced_graphics/src/text/paragraph.rs).
+        // Advanced, not Basic: `Basic` shapes with no font fallback, so every
+        // glyph missing from the primary face — prompt glyphs, braille,
+        // private-use icons — would be tofu.
         shaping: text::Shaping::Advanced,
         ..CanvasText::default()
     });
 }
 
-/// libghostty RGB to iced colour (opaque).
+/// Converts a libghostty [`RgbColor`] to an opaque iced [`Color`].
 fn to_color(c: RgbColor) -> Color {
     Color::from_rgb8(c.r, c.g, c.b)
 }
 
-/// The app crate's theme colour to an iced colour.
+/// Converts the app crate's theme colour to an opaque iced [`Color`].
 fn rgb(c: ghostwave::theme::Rgb) -> Color {
     Color::from_rgb8(c.0, c.1, c.2)
 }
 
-/// Drop zero-width / join-control codepoints (variation selectors, ZWSP/ZWJ,
+/// Drops zero-width / join-control codepoints (variation selectors, ZWSP/ZWJ,
 /// word joiner, BOM) from a cell's grapheme cluster: they carry no ink and
 /// cosmic-text would advance the cursor for some of them.
 fn strip_ignorables(s: &mut String) {

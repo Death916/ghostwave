@@ -1,17 +1,7 @@
 //! iced-side session state: the tab's split tree, its panes, and pane geometry.
 //!
-//! Geometry is not re-derived here. `ghostwave::layout` owns the binary split
-//! tree and every operation on it (`split_at`, `close_at`, `focus_in_direction`,
-//! `stack_at`), exactly as the macroquad front-end uses them, and `Tab::pane_rects`
-//! reproduces `app.rs::pane_rects` including the 2px per-pane inset that makes
-//! room for the frame strokes. What lives here is only what iced needs: lockable
-//! pane handles, per-pane pty bridges, and the cached rects shared by the painter
-//! and mouse hit-testing.
-//!
-//! Pane ids are indices into `Tab::panes` and are **stable**: closing a pane
-//! leaves a tombstone instead of compacting the vec (unlike `App::remove_dangling_panes`,
-//! which renumbers). Renumbering would move a pane under the message tag its pty
-//! bridge already stamped on the stream, so messages would land on the wrong pane.
+//! Pane ids index `Tab::panes` and are never reused: closing a pane leaves a
+//! tombstone, so pty output cannot be routed into the pane that took its index.
 
 use std::sync::{Arc, Mutex};
 
@@ -22,11 +12,10 @@ use ghostwave::term::CellDims;
 use ghostwave::theme::{self, Theme};
 use iced::{Point, Rectangle, Size};
 
-use crate::pane::{Pane, SharedPane};
-use crate::pty_bridge::PaneTag;
+use crate::pane::{Pane, PaneId, SharedPane};
 
-/// Inset applied to every pane rect when frames are shown (`app.rs::pane_rects`).
-/// Leaves a 4px gutter between neighbours for the 1px/2px frame strokes.
+/// Inset applied to every pane rect when frames are shown, leaving a 4px gutter
+/// between neighbours for the frame strokes.
 const FRAME_INSET: f32 = 2.0;
 
 /// Grid a pane is born with; `relayout` corrects it before the first paint.
@@ -41,8 +30,9 @@ pub struct Tab {
     /// Index = pane id. `None` = closed (tombstone, id never reused).
     pub panes: Vec<Option<SharedPane>>,
     pub active: usize,
-    /// Status-bar SYNC chip (zellij-style synchronised input; the flag is here so
-    /// the chip renders, the broadcasting itself arrives with the keymap modes).
+    /// Panes pinned to the full content rect; holds at most the active pane.
+    pub zoomed: std::collections::HashSet<usize>,
+    /// Status-bar SYNC chip: synchronised input across the tab's panes.
     pub sync_panes: bool,
 }
 
@@ -53,13 +43,13 @@ impl Tab {
             root: Node::Leaf { pane: 0 },
             panes: vec![Some(pane)],
             active: 0,
+            zoomed: std::collections::HashSet::new(),
             sync_panes: false,
         }
     }
 
-    /// Tab-bar label. The reference shows `Tab::name` unless it is empty or still
-    /// the generated `"Tab N"`, in which case the ACTIVE pane's OSC title wins
-    /// (`app.rs:2961-2969`).
+    /// Tab-bar label: the tab's name, or the active pane's OSC title when the name
+    /// is unset or still the generated `"Tab N"`.
     pub fn label(&self, index: usize) -> String {
         let generated = format!("Tab {}", index + 1);
         if !self.name.is_empty() && !self.name.starts_with("Tab ") {
@@ -78,7 +68,7 @@ impl Tab {
         self.panes.get(id).and_then(|p| p.as_ref())
     }
 
-    /// Pane rects in content coordinates (`app.rs::pane_rects`).
+    /// Pane rects in content coordinates, inset when `frames` is set.
     pub fn pane_rects(&self, content: Rect, frames: bool) -> Vec<(usize, Rect)> {
         let mut rects = layout::layout(&self.root, content);
         if frames {
@@ -97,35 +87,38 @@ pub struct AppState {
     pub theme: Theme,
     pub cell: CellDims,
     pub show_frames: bool,
-    /// Keymap mode shown in the status bar (M3 gives it the real key handling).
     pub mode: ghostwave::keymap::Mode,
-    /// "ghostwave" wave animation state (`app.rs:182-183`, init 0.1 / 0.0).
+    /// Wave animation energy; never falls below 0.1.
     pub wave_energy: f32,
+    /// Wave animation phase, in radians.
     pub wave_phase: f32,
-    /// One message at a time, never stacked (`app.rs:147`, `toast()`).
+    /// The toast message and the instant it was shown; at most one at a time.
     pub toast: Option<(String, std::time::Instant)>,
-    /// Pty output since the last tick — each tick with activity costs +0.12
-    /// energy (`app.rs:2906-2908`).
+    /// Set when pty output arrived since the last tick; each tick with activity
+    /// adds energy to the wave.
     pub pty_activity: bool,
+    /// Set by the quit action; `update` closes the window.
+    pub quit: bool,
+    pub last_tab: Option<usize>,
+    pub rename_buf: String,
+    #[allow(dead_code)]
+    pub rename_target: String,
     last_tick: std::time::Instant,
     window: Size,
-    /// Cached rects for the active tab, in canvas coordinates. Shared by the
-    /// painter and mouse hit-testing so they can never disagree.
+    /// Cached rects for the active tab, in canvas coordinates, shared by the
+    /// painter and mouse hit-testing.
     pub rects: Vec<(usize, Rectangle)>,
 }
 
-/// How often the front-end needs to be ticked. The macroquad build paces its
-/// whole loop (120 FPS while output flows, 60 FPS active, 8 FPS idle); iced
-/// redraws on state change, so an equivalent tick is only needed while
-/// something is actually animating.
+/// How often the front-end needs to be ticked: iced redraws on state change, so a
+/// tick is only needed while something is animating.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TickRate {
-    /// ~60 FPS: wave is energized, or a toast is on screen.
+    /// ~60 FPS: the wave is energized or a toast is on screen.
     Fast,
-    /// 8 FPS: the wave idles (it never stops while `visual_wave` is on), matching
-    /// the macroquad idle tier.
+    /// 8 FPS: the wave idles.
     Slow,
-    /// Nothing animating: no tick, no presents.
+    /// Nothing is animating; effectively no ticks (the period is an hour).
     Off,
 }
 
@@ -133,7 +126,6 @@ impl AppState {
     pub fn new(config: Config, cell: CellDims, window: Size) -> Result<Self> {
         let theme = theme::by_name(&config.theme);
         let mut pane0 = Pane::spawn(
-            PaneTag { tab: 0, pane: 0 },
             SPAWN_COLS,
             SPAWN_ROWS,
             cell,
@@ -154,16 +146,16 @@ impl AppState {
             wave_phase: 0.0,
             toast: None,
             pty_activity: false,
+            quit: false,
+            last_tab: None,
+            rename_buf: String::new(),
+            rename_target: String::new(),
             last_tick: std::time::Instant::now(),
             window,
             rects: Vec::new(),
         };
         state.relayout();
 
-        // Dev knob: `GHOST_ICED_PANES=3` opens that many panes at startup (each
-        // split alternating right/down) so multi-pane layout, frames and the
-        // per-pane pty bridges can be exercised without typing into the window.
-        // Values < 2 are ignored.
         if let Ok(count) = std::env::var("GHOST_ICED_PANES").map(|v| v.parse::<usize>().unwrap_or(1))
         {
             for i in 1..count {
@@ -191,11 +183,8 @@ impl AppState {
         self.relayout();
     }
 
-    // ---- chrome state: wave animation + toast -------------------------------
-
-    /// Advance the wave by the real elapsed time. This is the macroquad build's
-    /// per-frame update (`app.rs:2902-2919`) with frame counts replaced by
-    /// durations, because iced's tick is not a fixed frame time.
+    /// Advances the wave animation by the real elapsed time since the last tick,
+    /// clamped to 1-100 ms.
     pub fn tick(&mut self) {
         let now = std::time::Instant::now();
         let dt = now
@@ -208,7 +197,7 @@ impl AppState {
             self.wave_energy = (self.wave_energy + 0.12).min(2.5);
             self.pty_activity = false;
         }
-        // Decay, floor 0.1: the wave never stops while visual_wave is on.
+        // Decay, floored at 0.1: the wave never stops while visual_wave is on.
         self.wave_energy = (self.wave_energy * (-3.713_f32 * dt).exp()).max(0.1);
 
         let speed_mult = if self.wave_energy > 0.15 {
@@ -222,16 +211,16 @@ impl AppState {
             self.wave_phase -= wrap;
         }
 
-        // Toast lifetime: the reference draws for 2.5 s but only clears at 3 s,
-        // leaving half a second of invisible-but-present state. One honest 2.5 s.
         if let Some((_, at)) = &self.toast {
+            // Toast lifetime: 2.5 s.
             if at.elapsed().as_secs_f32() >= 2.5 {
                 self.toast = None;
             }
         }
     }
 
-    /// What the tick loop should be doing right now.
+    /// `Fast` while a toast or an energized wave is on screen, `Slow` for an idle
+    /// wave, otherwise `Off`.
     pub fn tick_rate(&self) -> TickRate {
         if self.toast.is_some() || (self.config.visual_wave && self.wave_energy > 0.15) {
             TickRate::Fast
@@ -242,25 +231,20 @@ impl AppState {
         }
     }
 
-    /// Show a toast: one at a time, replacing any current one (`App::toast`).
-    /// Nothing raises one yet — the reference's triggers (theme switch, copy,
-    /// lock/unlock, session save) arrive with the actions in M3/M4.
+    /// Shows `message`, replacing any toast already on screen.
     #[allow(dead_code)]
     pub fn toast(&mut self, message: impl Into<String>) {
         self.toast = Some((message.into(), std::time::Instant::now()));
     }
 
-    /// Any key press energizes the wave (`app.rs:2153-2156`).
+    /// Energizes the wave; called on every key press.
     pub fn bump_wave(&mut self) {
         if self.config.visual_wave {
             self.wave_energy = (self.wave_energy + 0.25).min(2.5);
         }
     }
 
-    /// Content area: what is left of the window for panes. M2 paints the tab bar
-    /// and status bar into the reserved bands; reserving them now (with the app
-    /// crate's own constants) means pane rects already match the macroquad build,
-    /// and the top row's frame labels have somewhere to be drawn.
+    /// The content area: the window minus the tab-bar and status-bar bands.
     pub fn content(&self) -> Rect {
         Rect {
             x: 0.0,
@@ -270,8 +254,8 @@ impl AppState {
         }
     }
 
-    /// Recompute every pane's rect and grid. Call after any window resize or
-    /// tree change (the app's `layout_all`).
+    /// Recomputes every pane's rect and grid; must be called after any window resize
+    /// or tree change.
     pub fn relayout(&mut self) {
         let content = self.content();
         let frames = self.show_frames;
@@ -279,7 +263,15 @@ impl AppState {
         let pad = self.config.padding;
         let tab = &self.tabs[self.active_tab];
 
-        let rects = tab.pane_rects(content, frames);
+        let mut rects = tab.pane_rects(content, frames);
+        // Zoom: the active pane takes the whole content rect; the others are not laid out.
+        let active = tab.active;
+        if tab.zoomed.contains(&active) {
+            rects.retain(|(id, _)| *id == active);
+            for (_, r) in rects.iter_mut() {
+                *r = content;
+            }
+        }
         self.rects = rects
             .iter()
             .map(|(id, r)| {
@@ -292,7 +284,6 @@ impl AppState {
 
         for (id, r) in &rects {
             if let Some(pane) = tab.pane(*id) {
-                // Same formula as the app (`app.rs::layout_all`).
                 let cols = ((r.w - 2.0 * pad) / cell.w as f32).max(1.0) as u16;
                 let rows = ((r.h - 2.0 * pad) / cell.h as f32).max(1.0) as u16;
                 pane.lock().unwrap().resize(cols, rows, cell);
@@ -324,15 +315,11 @@ impl AppState {
         }
     }
 
-    /// Split the focused pane; the new pane becomes active (the app's `split`).
+    /// Splits the focused pane and focuses the new one.
     pub fn split(&mut self, dir: SplitDir) -> Result<usize> {
         let tab_idx = self.active_tab;
         let new_id = self.tabs[tab_idx].panes.len();
         let mut pane = Pane::spawn(
-            PaneTag {
-                tab: tab_idx,
-                pane: new_id,
-            },
             SPAWN_COLS,
             SPAWN_ROWS,
             self.cell,
@@ -344,7 +331,7 @@ impl AppState {
         let tab = &mut self.tabs[tab_idx];
         let path = layout::path_to_pane(&tab.root, tab.active).unwrap_or_default();
         if matches!(tab.root, Node::Leaf { pane: usize::MAX }) {
-            // Empty tree (no panes in it): the new pane becomes the root.
+            // Empty tree: the new pane becomes the root.
             tab.root = Node::Leaf { pane: new_id };
         } else {
             layout::split_at(&mut tab.root, &path, dir, new_id);
@@ -356,8 +343,36 @@ impl AppState {
         Ok(new_id)
     }
 
-    /// Close the focused pane. The last pane is never closed (that would be a
-    /// tab close, which is M4).
+    /// Splits the focused pane with a *stacked* pane sharing its cell and focuses the
+    /// new one.
+    pub fn split_stacked(&mut self) -> Result<usize> {
+        let tab_idx = self.active_tab;
+        let new_id = self.tabs[tab_idx].panes.len();
+        let mut pane = Pane::spawn(
+            SPAWN_COLS,
+            SPAWN_ROWS,
+            self.cell,
+            self.config.scrollback,
+            self.config.max_log_mb * 1024 * 1024,
+        )?;
+        pane.apply_theme(&self.theme);
+
+        let tab = &mut self.tabs[tab_idx];
+        let path = layout::path_to_pane(&tab.root, tab.active).unwrap_or_default();
+        if matches!(tab.root, Node::Leaf { pane: usize::MAX }) {
+            // Empty tree: a stack of one is just a leaf.
+            tab.root = Node::Leaf { pane: new_id };
+        } else {
+            layout::stack_at(&mut tab.root, &path, new_id);
+        }
+        tab.panes.push(Some(Arc::new(Mutex::new(pane))));
+        tab.active = new_id;
+
+        self.relayout();
+        Ok(new_id)
+    }
+
+    /// Closes the focused pane; the last pane in a tab is never closed.
     pub fn close_active(&mut self) {
         let tab_idx = self.active_tab;
         if self.tabs[tab_idx].panes.iter().filter(|p| p.is_some()).count() <= 1 {
@@ -369,8 +384,7 @@ impl AppState {
                 layout::close_at(&mut tab.root, &path);
             }
         }
-        // Tombstone the closed pane: the tree no longer references it, dropping
-        // the last Arc closes the pty child (SIGHUP) and its bridge thread.
+        // Tombstone it: dropping the last Arc closes the pty child and its bridge thread.
         let active = self.tabs[tab_idx].active;
         self.tabs[tab_idx].panes[active] = None;
 
@@ -383,5 +397,295 @@ impl AppState {
 
     pub fn pane_mut(&self, tab: usize, pane: usize) -> Option<SharedPane> {
         self.tabs.get(tab)?.pane(pane).cloned()
+    }
+
+    /// Finds the pane with this identity, wherever it currently lives.
+    ///
+    /// Pty messages arrive tagged with a [`PaneId`] rather than a location, so a pane
+    /// that has moved between tabs still receives its own output.
+    pub fn pane_by_id(&self, id: PaneId) -> Option<SharedPane> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter().flatten())
+            .find(|pane| pane.lock().unwrap().id == id)
+            .cloned()
+    }
+
+    /// Opens a fresh tab and focuses it; pane ids are per-tab, so its first pane is
+    /// id 0.
+    pub fn new_tab(&mut self) {
+        let mut pane = match Pane::spawn(
+            SPAWN_COLS,
+            SPAWN_ROWS,
+            self.cell,
+            self.config.scrollback,
+            self.config.max_log_mb * 1024 * 1024,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("ghostwave: failed to spawn shell: {e}");
+                return;
+            }
+        };
+        pane.apply_theme(&self.theme);
+
+        self.last_tab = Some(self.active_tab);
+        let name = format!("Tab {}", self.tabs.len() + 1);
+        self.tabs.push(Tab::new(name, Arc::new(Mutex::new(pane))));
+        self.active_tab = self.tabs.len() - 1;
+        self.relayout();
+    }
+
+    /// Closes the active tab; the last tab is never removed, it is reset to a single
+    /// fresh pane instead.
+    pub fn close_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            let mut pane = match Pane::spawn(
+                SPAWN_COLS,
+                SPAWN_ROWS,
+                self.cell,
+                self.config.scrollback,
+                self.config.max_log_mb * 1024 * 1024,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("ghostwave: failed to spawn shell: {e}");
+                    return;
+                }
+            };
+            pane.apply_theme(&self.theme);
+
+            // Dropping the last Arc closes each pty child.
+            let tab = &mut self.tabs[self.active_tab];
+            tab.panes.clear();
+            tab.panes.push(Some(Arc::new(Mutex::new(pane))));
+            tab.root = Node::Leaf { pane: 0 };
+            tab.active = 0;
+            tab.zoomed.clear();
+            self.relayout();
+            return;
+        }
+        // Surviving tabs shift down; pane output is tagged by identity, so it still routes.
+        self.tabs.remove(self.active_tab);
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        }
+        self.relayout();
+    }
+
+    /// Switches to tab `idx` and remembers the tab it came from.
+    pub fn goto_tab(&mut self, idx: usize) {
+        if idx < self.tabs.len() {
+            self.last_tab = Some(self.active_tab);
+            self.active_tab = idx;
+            self.relayout();
+        }
+    }
+
+    /// Switches back to the tab that was active before the last switch.
+    pub fn toggle_last_tab(&mut self) {
+        if let Some(last) = self.last_tab {
+            if last < self.tabs.len() {
+                self.goto_tab(last);
+            }
+        }
+    }
+
+    /// Swaps the active tab with its neighbour in `dir`; no relayout, since the tab
+    /// keeps its own rects.
+    pub fn move_tab(&mut self, dir: Dir) {
+        let n = self.tabs.len();
+        let next = match dir {
+            Dir::Left => (self.active_tab + n - 1) % n,
+            _ => (self.active_tab + 1) % n,
+        };
+        self.tabs.swap(self.active_tab, next);
+        self.active_tab = next;
+    }
+
+    /// Toggles the frame strokes; every pane rect is inset when frames are shown, so
+    /// the grids follow the new geometry.
+    pub fn toggle_frames(&mut self) {
+        self.show_frames = !self.show_frames;
+        self.relayout();
+    }
+
+    /// Flips the status bar's SYNC chip and returns its new value.
+    pub fn toggle_sync(&mut self) -> bool {
+        let tab = &mut self.tabs[self.active_tab];
+        tab.sync_panes = !tab.sync_panes;
+        tab.sync_panes
+    }
+
+    /// Pins the active pane to the full content rect, or unpins it.
+    pub fn toggle_zoom(&mut self) {
+        let tab = &mut self.tabs[self.active_tab];
+        if !tab.zoomed.insert(tab.active) {
+            tab.zoomed.remove(&tab.active);
+        }
+        self.relayout();
+    }
+
+    /// Cycles focus to the next pane in DFS order.
+    pub fn focus_next(&mut self) {
+        let tab = &mut self.tabs[self.active_tab];
+        if let Some(next) = layout::next_leaf(&tab.root, tab.active) {
+            tab.active = next;
+        }
+    }
+
+    /// Focuses the `i`-th leaf in DFS order; `i` is a leaf index, not a pane id.
+    pub fn focus_index(&mut self, i: usize) {
+        let tab = &mut self.tabs[self.active_tab];
+        if let Some((_, pane)) = tab.root.leaves().get(i) {
+            tab.active = *pane;
+        }
+    }
+
+    /// Grows or shrinks the active pane by moving the nearest ancestor split on
+    /// `dir`'s axis.
+    pub fn resize(&mut self, dir: Dir, delta: f32) {
+        let path = {
+            let tab = &self.tabs[self.active_tab];
+            match layout::path_to_pane(&tab.root, tab.active) {
+                Some(p) => p,
+                None => return,
+            }
+        };
+        // Ratios decide rects, so the panes are re-set before the next paint.
+        layout::resize_at(&mut self.tabs[self.active_tab].root, &path, dir, delta);
+        self.relayout();
+    }
+
+    /// Swaps the active pane with its neighbour in `dir`; the panes trade places in the
+    /// tree and the focus follows the moved pane.
+    pub fn move_pane(&mut self, dir: Dir) {
+        let (from, rects) = {
+            let tab = &self.tabs[self.active_tab];
+            (tab.active, tab.pane_rects(self.content(), self.show_frames))
+        };
+        let Some(target) = layout::focus_in_direction(&rects, from, dir) else {
+            return;
+        };
+        let tab = &mut self.tabs[self.active_tab];
+        let (pa, pb) = match (
+            layout::path_to_pane(&tab.root, from),
+            layout::path_to_pane(&tab.root, target),
+        ) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return,
+        };
+        layout::swap_panes(&mut tab.root, &pa, &pb);
+        tab.active = target;
+        self.relayout();
+    }
+
+    /// Swaps the active pane with the next leaf in DFS order.
+    pub fn move_pane_next(&mut self) {
+        let tab = &mut self.tabs[self.active_tab];
+        let from = tab.active;
+        let next = match layout::leaf_after(&tab.root, from) {
+            Some(n) => n,
+            None => return,
+        };
+        let (pa, pb) = match (
+            layout::path_to_pane(&tab.root, from),
+            layout::path_to_pane(&tab.root, next),
+        ) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return,
+        };
+        layout::swap_panes(&mut tab.root, &pa, &pb);
+        tab.active = next;
+        self.relayout();
+    }
+
+    /// Swaps the active pane with the previous leaf in DFS order, wrapping to the last
+    /// leaf.
+    pub fn move_pane_prev(&mut self) {
+        let tab = &mut self.tabs[self.active_tab];
+        let from = tab.active;
+        let leaves = tab.root.leaves();
+        let idx = leaves.iter().position(|(_, p)| *p == from).unwrap_or(0);
+        let prev = if idx == 0 {
+            leaves.last().map(|(_, p)| *p)
+        } else {
+            leaves.get(idx - 1).map(|(_, p)| *p)
+        };
+        let Some(prev) = prev else { return };
+        let (pa, pb) = match (
+            layout::path_to_pane(&tab.root, from),
+            layout::path_to_pane(&tab.root, prev),
+        ) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return,
+        };
+        layout::swap_panes(&mut tab.root, &pa, &pb);
+        tab.active = prev;
+        self.relayout();
+    }
+
+    /// Rotates the stack the active pane sits in and focuses the newly exposed pane;
+    /// stack panes share one cell.
+    pub fn cycle_stack(&mut self) {
+        let tab_idx = self.active_tab;
+        let cycled = {
+            let tab = &mut self.tabs[tab_idx];
+            let path = layout::path_to_pane(&tab.root, tab.active).unwrap_or_default();
+            if layout::cycle_stack(&mut tab.root, &path) {
+                // The stack is the same but its active pane is not: read the id back.
+                tab.active = tab.root.at(&path).pane_id();
+                true
+            } else {
+                false
+            }
+        };
+        if cycled {
+            self.relayout();
+        } else {
+            self.toast("not in a stack (create with pane-mode s)");
+        }
+    }
+
+    /// Moves the focused pane into a brand-new tab.
+    ///
+    /// The pane keeps its own `Arc` — and with it its pty, its scrollback log and its
+    /// bridge receiver, tagged with the pane's own [`PaneId`] — so moving it between
+    /// tabs cannot misroute its output. The vacated slot is left as a tombstone: ids
+    /// inside a tab are never reused.
+    pub fn break_pane(&mut self) {
+        let old_tab = self.active_tab;
+        let pane = {
+            let tab = &mut self.tabs[old_tab];
+            let id = tab.active;
+            let path = match layout::path_to_pane(&tab.root, id) {
+                Some(p) => p,
+                None => return,
+            };
+            layout::close_at(&mut tab.root, &path);
+            // Take the handle out, leave the tombstone: nothing may shift into this id.
+            tab.panes[id].take()
+        };
+        let Some(pane) = pane else { return };
+
+        self.last_tab = Some(old_tab);
+        let name = format!("Tab {}", self.tabs.len() + 1);
+        self.tabs.push(Tab::new(name, pane));
+        self.active_tab = self.tabs.len() - 1;
+        self.relayout();
+    }
+
+    /// Switches the theme by name, re-pointing every live pane's terminal at the new
+    /// palette and storing the choice in the config.
+    pub fn apply_theme(&mut self, name: &str) {
+        let theme = theme::by_name(name);
+        for tab in self.tabs.iter_mut() {
+            for pane in tab.panes.iter_mut().flatten() {
+                pane.lock().unwrap().apply_theme(&theme);
+            }
+        }
+        self.theme = theme;
+        self.config.theme = name.to_string();
+        self.toast(format!("theme: {name}"));
     }
 }

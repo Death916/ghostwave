@@ -1,15 +1,6 @@
-//! Text measurement for the chrome's geometry.
-//!
-//! An iced canvas cannot measure text (the long-open iced#478), but every chrome
-//! box in the macroquad build is sized `measure_text(label) + pad` — a fixed
-//! width would visibly misplace the right-aligned status items and move the
-//! wave's start/end x, which are derived from the hint string's width. So widths
-//! are measured here from the same font file with the same fontdue call macroquad
-//! uses (`measure_text` sums per-char advances), which makes the numbers match
-//! the reference for the monospace face we draw with.
-//!
-//! Also converts the reference's baselines to iced's top-left text origin:
-//! `top = baseline - ascent(px)`.
+//! Text measurement for the chrome's geometry: widths come from the embedded
+//! font's per-char advances (an iced canvas cannot measure text itself), and
+//! baselines convert to iced's top-left origin as `top = baseline - ascent(px)`.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -23,13 +14,14 @@ fn font() -> &'static Font {
     })
 }
 
-/// Width of `text` at `px`, in the same units as macroquad's `measure_text`.
+/// Returns the width of `text` at `px` in logical px, as the sum of the embedded
+/// font's per-char advances.
 pub fn text_width(text: &str, px: f32) -> f32 {
     text.chars().map(|c| advance(c, px)).sum()
 }
 
-/// Ascent of the face at `px` — the offset from a macroquad baseline (text y) to
-/// the top of the text box iced draws from.
+/// Returns the distance from a text baseline to the top of the box iced draws
+/// from, at `px`.
 pub fn ascent(px: f32) -> f32 {
     static CACHE: OnceLock<Mutex<HashMap<u32, f32>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -45,7 +37,8 @@ pub fn ascent(px: f32) -> f32 {
     ascent
 }
 
-/// Advance width of one char, cached (the lookup builds metrics per call).
+/// Returns the advance width of one char at `px`, cached because the fontdue
+/// lookup builds metrics per call.
 fn advance(c: char, px: f32) -> f32 {
     static CACHE: OnceLock<Mutex<HashMap<(u32, u32), f32>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));

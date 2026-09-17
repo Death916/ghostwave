@@ -1,11 +1,7 @@
-//! Periodic animation tick.
+//! Periodic animation tick: publishes a [`Message::Tick`] on a fixed period.
 //!
-//! iced has no `time::every` in 0.14 — its own time module only exposes `now()`,
-//! so the tick is a thread that publishes a message on a fixed period, exactly
-//! like the pty bridges do for output. A subscription's identity is its `Hash`,
-//! and [`TickSlot`] hashes by rate, so changing the rate (wave energized ↔ idling
-//! ↔ nothing animating) tears the old ticker down and starts a new one; when iced
-//! drops the receiver the send fails and the thread exits by itself.
+//! [`TickSlot`] hashes by rate, so a change of rate starts a new ticker, and the
+//! thread exits when iced drops the receiver.
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -16,7 +12,7 @@ use iced::futures::Stream;
 use crate::Message;
 use crate::app::TickRate;
 
-/// Subscription payload: which period to tick at.
+/// The period a ticker runs at, as a `Hash`able subscription identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TickSlot {
     pub rate: TickRate,
@@ -25,17 +21,14 @@ pub struct TickSlot {
 impl TickSlot {
     fn period(self) -> Duration {
         match self.rate {
-            // ~60 FPS while the wave is energized or a toast is on screen.
             TickRate::Fast => Duration::from_millis(16),
-            // 8 FPS while the wave idles, matching the macroquad idle tier.
             TickRate::Slow => Duration::from_millis(125),
-            // Nothing animating: iced should not be woken at all.
             TickRate::Off => Duration::from_secs(3600),
         }
     }
 }
 
-/// Start a ticker for this rate and stream its messages.
+/// Starts a ticker thread for `slot` and streams its [`Message::Tick`]s.
 pub fn stream(slot: &TickSlot) -> Pin<Box<dyn Stream<Item = Message> + Send>> {
     let period = slot.period();
     let (tx, rx) = fmpsc::unbounded::<Message>();

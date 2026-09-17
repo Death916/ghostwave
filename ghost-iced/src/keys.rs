@@ -1,35 +1,20 @@
 //! iced keyboard events -> the app crate's VT key encoding.
 //!
-//! The macroquad build gets a `ghostwave::keymap::KeyPress` from
-//! `keymap::from_macroquad(KeyCode, text)` (see the app crate's `src/keymap.rs`,
-//! which is the reference for this table). iced reports the *physical* key as a
-//! W3C code too (`keyboard::key::Physical::Code(keyboard::key::Code)`), and
-//! `libghostty_vt::key::Key` is the same W3C list, so this module is that same
-//! mapping table for iced. The resulting `KeyPress` is fed to `Pane::key_press`,
-//! which calls the pane's own `key::Encoder`.
-//!
-//! Two deliberate differences from `from_macroquad`:
-//!
-//! * Modifier-only codes (`ShiftLeft`, `ControlLeft`, `SuperRight`, ...) return
-//!   `None`. They exist in `libghostty_vt::key::Key`, but the encoder derives
-//!   modifier state from `Mods` (see [`mods_from`]) and treats a bare modifier
-//!   key press as "no output", so there is nothing for them to encode. (In the
-//!   macroquad build these arms are unreachable anyway: its `ALL_KEYS` list
-//!   drives the poll loop and never contains a modifier key.)
-//! * `Physical::Unidentified` returns `None`: the platform could not translate
-//!   the key to a W3C code, and the encoder is driven by the physical key, so
-//!   there is nothing to send.
+//! `libghostty_vt::key::Key` is a W3C key list and iced reports the *physical*
+//! key as a W3C code too, so this module is the mapping table between the two.
 
 use ghostwave::keymap::KeyPress;
 use libghostty_vt::key::{Key, Mods};
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use iced::keyboard;
 use keyboard::key::Code as C;
 
-/// Translate an iced key press into a `KeyPress`.
+/// Encodes an iced key press as the app crate's [`KeyPress`].
 ///
-/// Returns `None` when the press carries no VT-representable key: an
-/// unidentified physical key, a modifier-only press, or a W3C code that has no
+/// `None` when the press carries no VT-representable key: an unidentified
+/// physical key, a modifier-only press, or a W3C code that has no
 /// `libghostty_vt::key::Key` counterpart (see [`code_to_key`]).
 pub fn keypress(
     key: &keyboard::Key,
@@ -39,8 +24,6 @@ pub fn keypress(
 ) -> Option<KeyPress> {
     let code = match physical {
         keyboard::key::Physical::Code(code) => code,
-        // No W3C code: the encoder keys off the physical key, so there is
-        // nothing to encode.
         keyboard::key::Physical::Unidentified(_) => return None,
     };
 
@@ -63,13 +46,11 @@ pub fn keypress(
     })
 }
 
-/// iced's physical key code -> ghostty's W3C key code.
-///
 /// `None` for codes with no `Key` counterpart *and* for modifier-only keys,
-/// which never need a key event of their own.
+/// which the encoder never sees as key events: it derives the modifier state
+/// from [`Mods`] instead.
 fn code_to_key(code: C) -> Option<Key> {
     Some(match code {
-        // --- main block: punctuation, digits, letters (W3C order) ---------
         C::Backquote => Key::Backquote,
         C::Backslash => Key::Backslash,
         C::BracketLeft => Key::BracketLeft,
@@ -95,7 +76,6 @@ fn code_to_key(code: C) -> Option<Key> {
         C::Semicolon => Key::Semicolon,
         C::Slash => Key::Slash,
 
-        // --- whitespace, editing, IME -----------------------------------------
         C::Backspace => Key::Backspace,
         C::CapsLock => Key::CapsLock,
         C::ContextMenu => Key::ContextMenu,
@@ -106,7 +86,6 @@ fn code_to_key(code: C) -> Option<Key> {
         C::KanaMode => Key::KanaMode,
         C::NonConvert => Key::NonConvert,
 
-        // --- navigation --------------------------------------------------------
         C::Delete => Key::Delete,
         C::End => Key::End,
         C::Help => Key::Help,
@@ -119,7 +98,6 @@ fn code_to_key(code: C) -> Option<Key> {
         C::ArrowRight => Key::ArrowRight,
         C::ArrowUp => Key::ArrowUp,
 
-        // --- numeric keypad ----------------------------------------------------
         C::NumLock => Key::NumLock,
         C::Numpad0 => Key::Numpad0,
         C::Numpad1 => Key::Numpad1,
@@ -150,7 +128,6 @@ fn code_to_key(code: C) -> Option<Key> {
         C::NumpadParenRight => Key::NumpadParenRight,
         C::NumpadSubtract => Key::NumpadSubtract,
 
-        // --- function row and lock keys ---------------------------------------
         C::Escape => Key::Escape,
         C::F1 => Key::F1,
         C::F2 => Key::F2,
@@ -183,7 +160,6 @@ fn code_to_key(code: C) -> Option<Key> {
         C::ScrollLock => Key::ScrollLock,
         C::Pause => Key::Pause,
 
-        // --- media / browser / power / editing --------------------------------
         C::BrowserBack => Key::BrowserBack,
         C::BrowserFavorites => Key::BrowserFavorites,
         C::BrowserForward => Key::BrowserForward,
@@ -245,17 +221,12 @@ fn code_to_key(code: C) -> Option<Key> {
         | C::SuperLeft
         | C::SuperRight => return None,
 
-        // No counterpart in `libghostty_vt::key::Key`.
-        // F26-F35 (ghostty stops at F25):
         C::F26 | C::F27 | C::F28 | C::F29 | C::F30 | C::F31 | C::F32 | C::F33 | C::F34 | C::F35 => {
             return None
         }
-        // Legacy / Japanese / Korean keys ghostty does not model:
         C::Hiragana | C::Katakana | C::Lang1 | C::Lang2 | C::Lang3 | C::Lang4 | C::Lang5 => {
             return None
         }
-        // Sun/Android-style editing keys and the numeric-keypad keys found on
-        // phones/remotes rather than PC keyboards:
         C::Abort
         | C::Again
         | C::Find
@@ -271,13 +242,11 @@ fn code_to_key(code: C) -> Option<Key> {
         | C::NumpadHash
         | C::NumpadStar => return None,
 
-        // `Code` is `#[non_exhaustive]`: any code a future iced adds lands here.
+        // `Code` is `#[non_exhaustive]`: a code a future iced adds lands here.
         _ => return None,
     })
 }
 
-/// iced modifier state -> ghostty `Mods`.
-///
 /// iced calls the Windows/Command key `LOGO`; ghostty calls it `SUPER`.
 fn mods_from(modifiers: keyboard::Modifiers) -> Mods {
     use keyboard::Modifiers as M;
@@ -297,8 +266,6 @@ fn mods_from(modifiers: keyboard::Modifiers) -> Mods {
     m
 }
 
-/// The text payload, when it is exactly one printable (non-control) character.
-///
 /// iced hands over the produced text as a `&str`; a composed sequence (a
 /// dead-key pair, an IME pre-edit run) is more than one `char` and is dropped
 /// here rather than truncated into something the user did not type.
@@ -312,10 +279,57 @@ fn single_printable_char(text: &str) -> Option<char> {
     }
 }
 
-/// Fallback text source: the logical [`keyboard::Key::Character`] of the press.
 fn logical_char(key: &keyboard::Key) -> Option<char> {
     match key {
         keyboard::Key::Character(s) => single_printable_char(s.as_ref()),
         keyboard::Key::Named(_) | keyboard::Key::Unidentified => None,
     }
+}
+
+/// iced's mouse events do not repeat the modifiers, but `TermPane::handle_mouse`
+/// needs them: `selection_allowed` uses them to decide whether a drag selects
+/// text or goes to the application (Shift bypasses application mouse tracking).
+static MODS: AtomicU8 = AtomicU8::new(0);
+
+const SHIFT_B: u8 = 1 << 0;
+const CTRL_B: u8 = 1 << 1;
+const ALT_B: u8 = 1 << 2;
+const LOGO_B: u8 = 1 << 3;
+
+/// Records the newest modifier state, because iced's mouse events do not carry it.
+pub fn note_modifiers(modifiers: keyboard::Modifiers) {
+    use keyboard::Modifiers as M;
+    let mut bits = 0;
+    if modifiers.contains(M::SHIFT) {
+        bits |= SHIFT_B;
+    }
+    if modifiers.contains(M::CTRL) {
+        bits |= CTRL_B;
+    }
+    if modifiers.contains(M::ALT) {
+        bits |= ALT_B;
+    }
+    if modifiers.contains(M::LOGO) {
+        bits |= LOGO_B;
+    }
+    MODS.store(bits, Ordering::Relaxed);
+}
+
+/// Returns the recorded modifiers as the app crate's key encoder wants them.
+pub fn current_mods() -> Mods {
+    let bits = MODS.load(Ordering::Relaxed);
+    let mut m = Mods::empty();
+    if bits & SHIFT_B != 0 {
+        m |= Mods::SHIFT;
+    }
+    if bits & CTRL_B != 0 {
+        m |= Mods::CTRL;
+    }
+    if bits & ALT_B != 0 {
+        m |= Mods::ALT;
+    }
+    if bits & LOGO_B != 0 {
+        m |= Mods::SUPER;
+    }
+    m
 }
