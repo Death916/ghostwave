@@ -6,7 +6,7 @@ use ghostwave::config::Config;
 use ghostwave::keymap::Action;
 use iced::{
     keyboard,
-    widget::{pane_grid, Stack},
+    widget::{container, pane_grid, Stack},
     Background, Element, Fill, Length, Padding, Size, Subscription, Task,
 };
 use libghostty_vt::key;
@@ -614,16 +614,19 @@ impl App {
             },
         };
 
-        let base = panes_grid::view(&self.state, mouse_tracking, chrome);
+        let base = panes_grid::view(&self.state, mouse_tracking);
         let floats = self.float_layer();
-        if floats.is_none()
-            && self.state.search.is_none()
-            && self.state.palette.is_none()
-            && self.state.session_picker.is_none()
-        {
-            return base;
+        // The window is a column of bands — tab bar, panes, status bar. A Stack is
+        // only for what pops up over them: floats, overlays and the toast.
+        let main = iced::widget::Column::with_children(vec![
+            chrome_widgets::tab_bar_for_state(&self.state),
+            base,
+            chrome_widgets::status_bar_for_state(&self.state),
+        ]);
+        let mut layers: Vec<Element<'_, Message>> = Vec::new();
+        if let Some(toast) = chrome_widgets::toast_for_state(&self.state) {
+            layers.push(toast);
         }
-        let mut layers: Vec<Element<'_, Message>> = vec![base];
         if let Some(floats) = floats {
             layers.push(floats);
         }
@@ -645,6 +648,10 @@ impl App {
         if let Some(palette) = self.state.palette.as_ref() {
             layers.push(palette::view(palette, &self.state.theme).map(Message::Palette));
         }
+        if layers.is_empty() {
+            return main.into();
+        }
+        layers.insert(0, main.into());
         Stack::with_children(layers)
             .width(Length::Fill)
             .height(Length::Fill)

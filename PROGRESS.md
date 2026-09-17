@@ -1062,6 +1062,17 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   (de-macroquad the core) — the macroquad-typed surfaces in `term.rs`/`keymap.rs`/`fonts.rs` are still
   used by the macroquad `main.rs`/`app.rs` until those are deleted, so stripping them earlier breaks the
   build on this branch for no gain.
+- **Window chrome belongs in a column, not in layers — and that is what M5b actually needed.** The swap
+  is done in its proper form: `main.rs` builds a `Column` of tab bar → pane grid → status bar, and a
+  `Stack` appears only when something pops up (floats, search, palette, sessions, toast). That removes
+  the padding hack the grid used to reserve header/footer space, removes the canvas chrome layer from the
+  pane band entirely, and makes a bar overlapping a pane structurally impossible. Diff is two files,
+  22 insertions / 33 deletions, with `pane_canvas.rs` untouched. Owner-verified in a window.
+  Two lessons, both from being wrong first: the previous attempt's overlay came from edits *inside the
+  pane path*, not from the layering — the giveaway was that the overlap also appeared with the chrome
+  turned off, which should have killed the layering theory on the spot. And a canvas-drawn chrome cannot
+  be mixed with widget chrome in one stack: canvas fills paint above widget text (a canvas bar's
+  background covered the widget tab labels), while text drawn in a canvas paints above widget rectangles.
 - **M5b (widget chrome) was attempted and reverted — and it exposed the rule behind the "fills do not
   render" mystery.** Wiring `chrome_widgets` as its own layer did make the widget chrome live (tab bar,
   status bar, toast, rename prompt all built by widgets), and in doing so proved something the earlier

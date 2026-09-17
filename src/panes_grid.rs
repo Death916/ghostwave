@@ -111,33 +111,15 @@ pub fn dir_of(axis: Axis) -> SplitDir {
     }
 }
 
-/// The pane-grid layer's view: the grid over the content area, and the chrome
-/// canvas layered above it.
-pub fn view<'a>(
-    state: &'a AppState,
-    mouse_tracking: Vec<usize>,
-    chrome: ChromeData,
-) -> Element<'a, Message> {
-    let chrome_layer = Canvas::new(TerminalCanvas {
-        theme: state.theme,
-        chrome,
-    })
-    .width(Fill)
-    .height(Fill);
-
-    let layer = container(grid(state, mouse_tracking))
-        .padding(Padding {
-            top: TAB_BAR_H,
-            right: 0.0,
-            bottom: STATUS_BAR_H,
-            left: 0.0,
-        })
+/// The pane-grid band of the window: the grid, filling whatever the chrome bands
+/// do not take. It is laid out in a column with the bars (see `main.rs`), so
+/// nothing here reserves space for them and nothing here draws chrome.
+pub fn view<'a>(state: &'a AppState, mouse_tracking: Vec<usize>) -> Element<'a, Message> {
+    container(grid(state, mouse_tracking))
         .style(move |_theme| container::Style {
             background: Some(pane_canvas::rgb(state.theme.bg).into()),
             ..container::Style::default()
-        });
-
-    iced::widget::Stack::with_children(vec![layer.into(), chrome_layer.into()])
+        })
         .width(Fill)
         .height(Fill)
         .into()
