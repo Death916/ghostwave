@@ -167,7 +167,7 @@ fn rgb(c: Rgb) -> Color {
 /// Builds the modal: the list, the current entry marked, and the key hint.
 pub fn view<'a>(overlay: &'a SessionsOverlay, theme: &GhostTheme) -> Element<'a, SessionsMessage> {
     let theme = *theme;
-    let font = crate::fonts::primary();
+    let font = crate::ui_fonts::primary();
     let mut rows: Vec<Element<'a, SessionsMessage>> = Vec::new();
     for (index, name) in overlay.entries.iter().enumerate() {
         let selected = index == overlay.selected;

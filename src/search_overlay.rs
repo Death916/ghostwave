@@ -354,7 +354,7 @@ fn with_alpha(rgb: Rgb, alpha: f32) -> Color {
 /// Builds the compact search bar widget.
 pub fn search_bar<'a>(state: &'a SearchState, theme: &GhostTheme) -> Element<'a, SearchMessage> {
     let theme = *theme;
-    let font = crate::fonts::primary();
+    let font = crate::ui_fonts::primary();
 
     let input = text_input("Search scrollback...", &state.query)
         .on_input(SearchMessage::QueryChanged)

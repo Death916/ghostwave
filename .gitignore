@@ -5,3 +5,4 @@ ghostd/target/
 ghostd/.toolchain/
 perf.data*
 flamegraph.html
+target/

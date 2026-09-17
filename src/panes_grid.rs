@@ -23,7 +23,7 @@
 //! zellij-style stack, of which the active member is drawn and typed into.
 //! Floating panes are out of scope.
 
-use ghostwave::app::{STATUS_BAR_H, TAB_BAR_H};
+use ghostwave::theme::{STATUS_BAR_H, TAB_BAR_H};
 use ghostwave::layout::SplitDir;
 use ghostwave::term::{CellDims, MouseEv, MouseEvKind};
 use ghostwave::theme::Theme as GhostTheme;
@@ -37,7 +37,7 @@ use iced::{
 
 use crate::Message;
 use crate::app::{AppState, GridPane, Tab};
-use crate::fonts;
+use crate::ui_fonts;
 use crate::keys;
 use crate::pane::{ContentPane, PaneEntry, PaneId, SharedPane};
 use crate::pane_canvas::{self, CanvasState, ChromeData, TerminalCanvas};
@@ -154,8 +154,8 @@ fn grid<'a>(state: &'a AppState, mouse_tracking: Vec<usize>) -> PaneGrid<'a, Mes
     let theme = state.theme;
     let (cell, font_px, padding) = (state.cell, state.config.font_size, state.config.padding);
     let inset = inset(frames);
-    let font = fonts::primary();
-    let replace_title = state.config.dynamic_title != crate::config::DynamicTitleMode::Off;
+    let font = ui_fonts::primary();
+    let replace_title = state.config.dynamic_title != crate::ui_config::DynamicTitleMode::Off;
 
     PaneGrid::new(&tab.grid, move |_cell, payload: &GridPane, _maximized| {
         let index = payload.active_id().and_then(|id| tab.index_of(id));
@@ -476,7 +476,7 @@ impl canvas::Program<Message> for PaneCanvas {
             self.cell,
             self.padding,
             self.font_px,
-            fonts::primary(),
+            ui_fonts::primary(),
             &self.theme,
         );
         guard.dirty = false;

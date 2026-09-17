@@ -427,19 +427,19 @@ pub(crate) fn execute(state: &mut AppState, action: Action) {
         Action::Ghostwave => new_content(state, ContentPane::visualizer()),
         Action::NewAi => new_content(state, ContentPane::ai(state.config.ai.clone())),
         Action::OpenFile(path) => new_content(state, ContentPane::preview(path)),
-        Action::SessionManager => crate::session::open_picker(state),
+        Action::SessionManager => crate::ui_session::open_picker(state),
         Action::SessionNew => {
-            let name = crate::session::next_name();
-            crate::session::start(state, &name);
+            let name = crate::ui_session::next_name();
+            crate::ui_session::start(state, &name);
         }
         Action::SessionRename => {
             state.mode = Mode::RenameSession;
             state.rename_buf = state.current_session.clone();
             state.rename_target = state.current_session.clone();
         }
-        Action::SessionDelete => crate::session::delete_current(state),
+        Action::SessionDelete => crate::ui_session::delete_current(state),
         Action::Detach => {
-            crate::session::save(state);
+            crate::ui_session::save(state);
             let name = state.current_session.clone();
             state.toast(format!("session {name} saved — quitting"));
             state.quit = true;
@@ -473,7 +473,7 @@ pub(crate) fn execute(state: &mut AppState, action: Action) {
                 }
                 Mode::RenameSession => {
                     state.mode = Mode::Normal;
-                    crate::session::rename(state, &name);
+                    crate::ui_session::rename(state, &name);
                 }
                 _ => state.mode = Mode::Normal,
             }
@@ -764,7 +764,7 @@ mod tests {
         let key = iced::keyboard::Key::Character(text.into());
         let message = crate::sessions_overlay::handle_key(&key, iced::keyboard::Modifiers::default())
             .expect("a picker bind");
-        crate::session::picker_message(state, message);
+        crate::ui_session::picker_message(state, message);
     }
 
     #[test]
@@ -1023,7 +1023,7 @@ mod tests {
 
     #[test]
     fn the_session_actions_reach_the_session_state() {
-        let _guard = crate::session::test_lock();
+        let _guard = crate::ui_session::test_lock();
         let mut s = state();
         let before = unique_session("binds");
         s.current_session = before.clone();

@@ -2,7 +2,7 @@
 //! per-cell fg/bg, text, underline/strikethrough, cursor, then the pane frames
 //! and their labels. Rects are canvas-local coordinates.
 
-use ghostwave::app::TAB_BAR_H;
+use ghostwave::theme::TAB_BAR_H;
 use ghostwave::term::CellDims;
 use ghostwave::theme::Theme as GhostTheme;
 use iced::widget::canvas::{self, Action, Event, Frame, Geometry, Text as CanvasText};
@@ -14,7 +14,7 @@ use libghostty_vt::style::{RgbColor, Underline};
 
 use crate::Message;
 use crate::chrome::{self, ChromeState, WaveParams};
-use crate::fonts;
+use crate::ui_fonts;
 use crate::pane::{Pane, SharedPane};
 
 use libghostty_vt::mouse as vt_mouse;
@@ -152,7 +152,7 @@ impl canvas::Program<Message> for TerminalCanvas {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
-        let font = fonts::primary();
+        let font = ui_fonts::primary();
 
         if let Some((what, buffer)) = &self.chrome.rename {
             chrome::paint_rename_prompt(&mut frame, bounds.size(), what, buffer, &self.theme, font);

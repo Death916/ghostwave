@@ -4,7 +4,7 @@
 //! visualizer canvas), and floating toast overlay as native iced widgets,
 //! replacing hand-painted canvas chrome from `CHROME-REFERENCE.md`.
 
-use ghostwave::app::{STATUS_BAR_H, TAB_BAR_H};
+use ghostwave::theme::{STATUS_BAR_H, TAB_BAR_H};
 use ghostwave::theme::{Rgb, Theme as GhostTheme};
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::widget::{container, mouse_area, row, text, text_input, Canvas};
@@ -13,7 +13,7 @@ use iced::{
 };
 
 use crate::app::AppState;
-use crate::fonts;
+use crate::ui_fonts;
 use crate::Message;
 
 pub use crate::chrome::WaveParams;
@@ -108,7 +108,7 @@ pub fn tab_bar<'a>(
             let draft = rename_target.unwrap_or_default();
             let input = text_input("Tab name", draft)
                 .size(TAB_LABEL_PX)
-                .font(fonts::primary())
+                .font(ui_fonts::primary())
                 .padding(Padding {
                     top: 2.0,
                     bottom: 2.0,
@@ -167,7 +167,7 @@ pub fn tab_bar<'a>(
                 text(display_text)
                     .size(TAB_LABEL_PX)
                     .color(text_color)
-                    .font(fonts::primary()),
+                    .font(ui_fonts::primary()),
             )
             .width(Length::Fixed(TAB_CHIP_W))
             .height(Length::Fixed(TAB_BAR_H))
@@ -424,7 +424,7 @@ pub fn status_bar<'a>(
             .color(rgb(theme.bg))
             .font(Font {
                 weight: iced::font::Weight::Bold,
-                ..fonts::primary()
+                ..ui_fonts::primary()
             }),
     )
     .padding(Padding {
@@ -446,7 +446,7 @@ pub fn status_bar<'a>(
     let hints_text = text(hints)
         .size(STATUS_PX)
         .color(rgb(theme.status_fg))
-        .font(fonts::primary());
+        .font(ui_fonts::primary());
 
     let mut left_row = row![mode_pill]
         .spacing(HINTS_DX)
@@ -467,7 +467,7 @@ pub fn status_bar<'a>(
                 .color(rgb(theme.bg))
                 .font(Font {
                     weight: iced::font::Weight::Bold,
-                    ..fonts::primary()
+                    ..ui_fonts::primary()
                 }),
         )
         .padding(Padding {
@@ -493,7 +493,7 @@ pub fn status_bar<'a>(
             text(theme_name)
                 .size(STATUS_PX)
                 .color(rgb(theme.status_fg))
-                .font(fonts::primary()),
+                .font(ui_fonts::primary()),
         )
         .padding(Padding {
             top: 2.0,
@@ -635,7 +635,7 @@ pub fn toast_box<'a>(msg: &'a str, theme: &GhostTheme) -> Element<'a, Message> {
         text(msg)
             .size(STATUS_PX)
             .color(rgb(theme.bg))
-            .font(fonts::primary()),
+            .font(ui_fonts::primary()),
     )
     .padding(Padding {
         top: 4.0,

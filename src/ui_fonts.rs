@@ -8,7 +8,7 @@ use std::fs;
 use std::process::Command;
 
 /// The face the cell metrics are measured from and the primary text font.
-pub const PRIMARY_BYTES: &[u8] = include_bytes!("../../assets/JetBrainsMono-Medium.ttf");
+pub const PRIMARY_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono-Medium.ttf");
 
 /// Returns the family name that resolves to [`PRIMARY_BYTES`] once it is registered.
 ///

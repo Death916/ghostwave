@@ -13,7 +13,7 @@ use libghostty_vt::key::{self, Mods};
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 
 use crate::ai::AiPane;
-use crate::config::{DynamicTitleMode, PaneTitleFormat};
+use crate::ui_config::{DynamicTitleMode, PaneTitleFormat};
 use crate::preview::PreviewPane;
 use crate::pty_bridge::{self, PtyRxSlot};
 use crate::visualizer::VisualizerPane;

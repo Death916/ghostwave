@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ghostwave::app::{STATUS_BAR_H, TAB_BAR_H};
+use ghostwave::theme::{STATUS_BAR_H, TAB_BAR_H};
 pub use ghostwave::layout::FloatOrigin;
 use ghostwave::layout::SplitDir;
 use iced::{Point, Rectangle, Size};
