@@ -5,7 +5,7 @@
 use ghostwave::config::Config;
 use iced::{
     keyboard,
-    widget::canvas::Canvas,
+    widget::{canvas::Canvas, pane_grid},
     Element, Fill, Point, Rectangle, Size, Subscription, Task,
 };
 use libghostty_vt::key;
@@ -18,6 +18,7 @@ mod keys;
 mod measure;
 mod pane;
 mod pane_canvas;
+mod panes_grid;
 mod pty_bridge;
 mod tick;
 
@@ -82,6 +83,13 @@ pub enum Message {
         physical: keyboard::key::Physical,
         modifiers: keyboard::Modifiers,
     },
+    /// The pane-grid layer's split drag: the split's new ratio, in `[0, 1]`.
+    GridResize {
+        split: pane_grid::Split,
+        ratio: f32,
+    },
+    /// The pane-grid layer's pane drag: picked, dropped or cancelled.
+    GridDrag(pane_grid::DragEvent),
 }
 
 struct App {
@@ -146,6 +154,13 @@ impl App {
                 ev,
                 mods,
             } => {
+                if std::env::var_os("GHOST_ICED_DEBUG").is_some() {
+                    eprintln!(
+                        "[msg] Mouse pane={pane} focus={focus} kind={:?} active={}",
+                        ev.kind,
+                        self.state.current().active
+                    );
+                }
                 if focus && tab == self.state.active_tab {
                     self.state.focus(pane);
                 }
@@ -198,6 +213,12 @@ impl App {
                     input::key_release(&mut self.state, kp);
                 }
             }
+            // The pane-grid layer's own interactions; focus comes from the pane
+            // canvas that saw the press, not from pane_grid's click detection
+            // (its `contents` order does not line up with the layout children here,
+            // so it reports another pane).
+            Message::GridResize { split, ratio } => self.state.grid_resize(split, ratio),
+            Message::GridDrag(event) => self.state.grid_drag(event),
         }
         if self.state.quit {
             // `Ctrl+q` / `Action::Quit`.
@@ -219,6 +240,43 @@ impl App {
             .filter(|(_, pane)| pane.lock().unwrap().mouse_tracking())
             .map(|(id, _)| *id)
             .collect();
+        // Everything the chrome needs, owned: the layers are rebuilt every view.
+        let chrome = ChromeData {
+            tabs: self
+                .state
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (t.label(i), i == self.state.active_tab))
+                .collect(),
+            mode_label: self.state.mode.label().to_string(),
+            hints: self.state.mode.hints().to_string(),
+            // The configured theme name, not the resolved palette's.
+            theme_name: self.state.config.theme.clone(),
+            sync_panes: tab.sync_panes,
+            wave: self.state.config.visual_wave.then_some(chrome::WaveParams {
+                energy: self.state.wave_energy,
+                phase: self.state.wave_phase,
+                amplitude: self.state.config.wave_amplitude,
+            }),
+            toast: self.state.toast.as_ref().map(|(m, _)| m.clone()),
+            rename: match self.state.mode {
+                ghostwave::keymap::Mode::RenameTab => {
+                    Some(("Tab".to_string(), self.state.rename_buf.clone()))
+                }
+                ghostwave::keymap::Mode::RenamePane => {
+                    Some(("Pane".to_string(), self.state.rename_buf.clone()))
+                }
+                _ => None,
+            },
+        };
+
+        // Two pane layers over one session: the canvas layer paints the tab's panes
+        // and the chrome on one canvas, the pane-grid layer hands the panes to iced
+        // and keeps the canvas for the chrome alone.
+        if self.state.pane_grid {
+            return panes_grid::view(&self.state, panes, mouse_tracking, chrome);
+        }
 
         Canvas::new(TerminalCanvas {
             tab: self.state.active_tab,
@@ -229,43 +287,13 @@ impl App {
             font_px: self.state.config.font_size,
             padding: self.state.config.padding,
             show_frames: self.state.show_frames,
+            paint_background: true,
             theme: self.state.theme,
             content: {
                 let c = self.state.content();
-                Rectangle::new(
-                    Point::new(c.x, c.y),
-                    Size::new(c.w.max(1.0), c.h.max(1.0)),
-                )
+                Rectangle::new(Point::new(c.x, c.y), Size::new(c.w.max(1.0), c.h.max(1.0)))
             },
-            chrome: ChromeData {
-                tabs: self
-                    .state
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| (t.label(i), i == self.state.active_tab))
-                    .collect(),
-                mode_label: self.state.mode.label().to_string(),
-                hints: self.state.mode.hints().to_string(),
-                // The configured theme name, not the resolved palette's.
-                theme_name: self.state.config.theme.clone(),
-                sync_panes: tab.sync_panes,
-                wave: self.state.config.visual_wave.then_some(chrome::WaveParams {
-                    energy: self.state.wave_energy,
-                    phase: self.state.wave_phase,
-                    amplitude: self.state.config.wave_amplitude,
-                }),
-                toast: self.state.toast.as_ref().map(|(m, _)| m.clone()),
-                rename: match self.state.mode {
-                    ghostwave::keymap::Mode::RenameTab => {
-                        Some(("Tab".to_string(), self.state.rename_buf.clone()))
-                    }
-                    ghostwave::keymap::Mode::RenamePane => {
-                        Some(("Pane".to_string(), self.state.rename_buf.clone()))
-                    }
-                    _ => None,
-                },
-            },
+            chrome,
             mouse_tracking,
         })
         .width(Fill)

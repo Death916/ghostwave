@@ -21,13 +21,17 @@ use crate::pane::{Pane, SharedPane};
 use ghostwave::term::{MouseEv, MouseEvKind};
 use libghostty_vt::mouse as vt_mouse;
 
-const LABEL_PX: f32 = 13.0;
+/// Label font size in px; the pane-grid layer's title band uses it too.
+pub(crate) const LABEL_PX: f32 = 13.0;
 /// Advance of the label face at `LABEL_PX`, in px. Used only to size the label's
 /// background band, since the canvas cannot measure text.
 const LABEL_ADVANCE: f32 = 7.8;
-const LABEL_PAD: f32 = 8.0;
-const FRAME_ACTIVE_W: f32 = 2.0;
-const FRAME_INACTIVE_W: f32 = 1.0;
+/// Left/right inset of the label text inside its band, in px.
+pub(crate) const LABEL_PAD: f32 = 8.0;
+/// Width in px of the focused pane's frame stroke.
+pub(crate) const FRAME_ACTIVE_W: f32 = 2.0;
+/// Width in px of a frame stroke on a pane that is not focused.
+pub(crate) const FRAME_INACTIVE_W: f32 = 1.0;
 /// Label band height in px above a pane rect.
 const LABEL_H: f32 = 14.0;
 
@@ -43,6 +47,10 @@ pub struct TerminalCanvas {
     pub font_px: f32,
     pub padding: f32,
     pub show_frames: bool,
+    /// Whether this canvas paints the window background. False for the
+    /// chrome-only layer that sits above the pane grid, which would otherwise
+    /// cover every pane it is meant to overlay.
+    pub paint_background: bool,
     pub theme: GhostTheme,
     /// Content area (window minus the tab bar and status bar), in canvas
     /// coordinates. Pane frames and labels are clipped to it: iced renders every
@@ -70,14 +78,29 @@ pub struct CanvasState {
 }
 
 impl CanvasState {
-    fn button_down(&self) -> Option<vt_mouse::Button> {
+    /// Records a press; the newest press is the one `button_down` reports.
+    pub(crate) fn press(&mut self, button: mouse::Button) {
+        self.pressed.push(button);
+    }
+
+    /// Records a release.
+    pub(crate) fn release(&mut self, button: mouse::Button) {
+        self.pressed.retain(|b| *b != button);
+    }
+
+    /// Whether any button is held.
+    pub(crate) fn any_pressed(&self) -> bool {
+        !self.pressed.is_empty()
+    }
+
+    pub(crate) fn button_down(&self) -> Option<vt_mouse::Button> {
         self.pressed.last().copied().and_then(vt_button)
     }
 }
 
 /// Only the three real buttons exist in both; the wheel arrives as
 /// [`MouseEvKind::Wheel`].
-fn vt_button(button: mouse::Button) -> Option<vt_mouse::Button> {
+pub(crate) fn vt_button(button: mouse::Button) -> Option<vt_mouse::Button> {
     match button {
         mouse::Button::Left => Some(vt_mouse::Button::Left),
         mouse::Button::Right => Some(vt_mouse::Button::Right),
@@ -137,7 +160,7 @@ impl canvas::Program<Message> for TerminalCanvas {
                 let pressed = vt_button(*button)?;
                 // Track the iced button, so release matching and the vt mapping
                 // stay one list.
-                state.pressed.push(*button);
+                state.press(*button);
                 Some(Action::publish(self.mouse_message(
                     pane,
                     rect,
@@ -150,7 +173,7 @@ impl canvas::Program<Message> for TerminalCanvas {
                 let point = cursor.position()?;
                 let (pane, rect) = self.pane_at(point)?;
                 let released = vt_button(*button)?;
-                state.pressed.retain(|b| b != button);
+                state.release(*button);
                 Some(Action::publish(self.mouse_message(
                     pane,
                     rect,
@@ -164,7 +187,7 @@ impl canvas::Program<Message> for TerminalCanvas {
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let point = cursor.position()?;
                 let (pane, rect) = self.pane_at(point)?;
-                if state.pressed.is_empty() && !self.mouse_tracking.contains(&pane) {
+                if !state.any_pressed() && !self.mouse_tracking.contains(&pane) {
                     return None;
                 }
                 Some(Action::publish(self.mouse_message(
@@ -217,13 +240,15 @@ impl canvas::Program<Message> for TerminalCanvas {
         // a `Frame`'s own primitives are flushed after every draft, so a direct
         // fill here would paint over the panes and their frames; `with_clip` is
         // the only way to draw beneath them.
-        frame.with_clip(bounds, |f| {
-            f.fill_rectangle(
-                Point::new(bounds.x, bounds.y),
-                Size::new(bounds.width, bounds.height),
-                rgb(self.theme.bg),
-            );
-        });
+        if self.paint_background {
+            frame.with_clip(bounds, |f| {
+                f.fill_rectangle(
+                    Point::new(bounds.x, bounds.y),
+                    Size::new(bounds.width, bounds.height),
+                    rgb(self.theme.bg),
+                );
+            });
+        }
 
         for (id, rect) in &self.rects {
             let Some(pane) = self.panes.iter().find(|(p, _)| p == id).map(|(_, p)| p) else {
@@ -308,7 +333,7 @@ impl TerminalCanvas {
                 // Pane-local logical px, which is what the mouse encoder takes.
                 x: point.x - rect.x,
                 y: point.y - rect.y,
-                any_pressed: !state.pressed.is_empty(),
+                any_pressed: state.any_pressed(),
                 button_down: state.button_down(),
             },
             mods: keys::current_mods(),
@@ -321,14 +346,6 @@ impl TerminalCanvas {
         let Some(pane) = self.panes.iter().find(|(p, _)| *p == id).map(|(_, p)| p) else {
             return String::new();
         };
-        let guard = pane.lock().unwrap();
-        let t = &guard.term;
-        let name = if t.name.is_empty() {
-            "pane".to_string()
-        } else {
-            t.name.clone()
-        };
-        let title = t.title();
         // 1-based position in the tab's rect list.
         let index = self
             .rects
@@ -336,16 +353,30 @@ impl TerminalCanvas {
             .position(|(p, _)| *p == id)
             .map(|i| i + 1)
             .unwrap_or(id);
-        if title.is_empty() {
-            format!("{name} {index}")
-        } else {
-            format!("{name} {index} — {title}")
-        }
+        pane_label(pane, index)
     }
 }
 
-/// Paints one pane's terminal content into `rect`, in canvas-local coordinates.
-fn paint_pane(
+/// Returns a pane's label as `name index — title`, with the title omitted when it
+/// is empty and `index` the pane's 1-based position in the tab.
+pub(crate) fn pane_label(pane: &SharedPane, index: usize) -> String {
+    let guard = pane.lock().unwrap();
+    let t = &guard.term;
+    let name = if t.name.is_empty() {
+        "pane".to_string()
+    } else {
+        t.name.clone()
+    };
+    let title = t.title();
+    if title.is_empty() {
+        format!("{name} {index}")
+    } else {
+        format!("{name} {index} — {title}")
+    }
+}
+
+/// Paints one pane's terminal content into `rect`, in frame-local coordinates.
+pub(crate) fn paint_pane(
     frame: &mut Frame,
     pane: &mut Pane,
     rect: Rectangle,
@@ -611,7 +642,7 @@ fn to_color(c: RgbColor) -> Color {
 }
 
 /// Converts the app crate's theme colour to an opaque iced [`Color`].
-fn rgb(c: ghostwave::theme::Rgb) -> Color {
+pub(crate) fn rgb(c: ghostwave::theme::Rgb) -> Color {
     Color::from_rgb8(c.0, c.1, c.2)
 }
 

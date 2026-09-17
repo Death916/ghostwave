@@ -10,9 +10,11 @@ use ghostwave::config::Config;
 use ghostwave::layout::{self, Dir, Node, Rect, SplitDir};
 use ghostwave::term::CellDims;
 use ghostwave::theme::{self, Theme};
+use iced::widget::pane_grid::{self, Split};
 use iced::{Point, Rectangle, Size};
 
 use crate::pane::{Pane, PaneId, SharedPane};
+use crate::panes_grid::{self, DropTarget, GridCache};
 
 /// Inset applied to every pane rect when frames are shown, leaving a 4px gutter
 /// between neighbours for the frame strokes.
@@ -103,6 +105,17 @@ pub struct AppState {
     pub rename_buf: String,
     #[allow(dead_code)]
     pub rename_target: String,
+    /// `GHOST_ICED_PANEGRID`: the pane layer is iced's `pane_grid` rather than the
+    /// hand-rolled canvas.
+    pub pane_grid: bool,
+    /// The revision of the active tab's split tree, bumped by every
+    /// [`AppState::relayout`]. The pane-grid layer re-derives its state whenever it
+    /// lags this counter, and a re-derivation is safe mid-drag because pane and
+    /// split ids are a function of the tree's shape, not of its history.
+    pub tree_revision: u64,
+    /// The pane-grid state derived from the active tab's tree; kept only in the
+    /// pane-grid layer.
+    pub grid: Option<GridCache>,
     last_tick: std::time::Instant,
     window: Size,
     /// Cached rects for the active tab, in canvas coordinates, shared by the
@@ -150,6 +163,9 @@ impl AppState {
             last_tab: None,
             rename_buf: String::new(),
             rename_target: String::new(),
+            pane_grid: panes_grid::enabled(),
+            tree_revision: 0,
+            grid: None,
             last_tick: std::time::Instant::now(),
             window,
             rects: Vec::new(),
@@ -256,15 +272,30 @@ impl AppState {
 
     /// Recomputes every pane's rect and grid; must be called after any window resize
     /// or tree change.
+    ///
+    /// Also the tree's revision point: the pane-grid layer derives its state from the
+    /// tree as soon as it sees a revision it has not derived yet.
     pub fn relayout(&mut self) {
         let content = self.content();
         let frames = self.show_frames;
         let cell = self.cell;
         let pad = self.config.padding;
-        let tab = &self.tabs[self.active_tab];
+        self.tree_revision = self.tree_revision.wrapping_add(1);
 
-        let mut rects = tab.pane_rects(content, frames);
+        let mut rects = if self.pane_grid {
+            // The grid's own layout decides where panes are, so the ptys are sized
+            // from it rather than from the tree's rects.
+            self.sync_grid();
+            match &self.grid {
+                Some(cache) => panes_grid::pane_rects(cache, content, frames),
+                None => Vec::new(),
+            }
+        } else {
+            self.tabs[self.active_tab].pane_rects(content, frames)
+        };
+
         // Zoom: the active pane takes the whole content rect; the others are not laid out.
+        let tab = &self.tabs[self.active_tab];
         let active = tab.active;
         if tab.zoomed.contains(&active) {
             rects.retain(|(id, _)| *id == active);
@@ -289,6 +320,132 @@ impl AppState {
                 pane.lock().unwrap().resize(cols, rows, cell);
             }
         }
+    }
+
+    /// Re-derives the pane-grid layer's state when the tree has moved on since the
+    /// last derivation; a no-op in the canvas layer.
+    pub fn sync_grid(&mut self) {
+        if !self.pane_grid {
+            return;
+        }
+        let (tab, revision) = (self.active_tab, self.tree_revision);
+        let fresh = self
+            .grid
+            .as_ref()
+            .is_some_and(|cache| cache.is_fresh(tab, revision));
+        if !fresh {
+            self.grid = Some(GridCache::derive(tab, revision, &self.tabs[tab].root));
+        }
+    }
+
+    /// Writes a split drag back into the tree, and moves the same split in the
+    /// derived state so what is drawn follows the drag.
+    pub fn grid_resize(&mut self, split: Split, ratio: f32) {
+        let content = self.content();
+        let bounds = Size::new(content.w.max(1.0), content.h.max(1.0));
+        let spacing = panes_grid::spacing(self.show_frames);
+        let (tab, revision) = (self.active_tab, self.tree_revision);
+
+        let mut write_back = None;
+        if let Some(cache) = self.grid.as_mut() {
+            if !cache.is_fresh(tab, revision) {
+                return;
+            }
+            let Some(share) = panes_grid::tree_ratio(&cache.state, split, ratio, spacing, bounds)
+            else {
+                return;
+            };
+            cache.state.resize(split, ratio);
+            write_back = cache.splits.get(&split).cloned().map(|path| (path, share));
+        }
+        if let Some((path, share)) = write_back {
+            set_split_ratio(&mut self.tabs[tab].root, &path, share);
+        }
+        self.relayout();
+    }
+
+    /// Applies a pane drag from the pane grid: a pick focuses the pane, a drop moves
+    /// it, a cancel is nothing to do.
+    pub fn grid_drag(&mut self, event: pane_grid::DragEvent) {
+        if std::env::var_os("GHOST_ICED_DEBUG").is_some() {
+            eprintln!("[msg] GridDrag {event:?} active={}", self.current().active);
+        }
+        match event {
+            pane_grid::DragEvent::Picked { pane } => {
+                let picked = self
+                    .grid
+                    .as_ref()
+                    .and_then(|cache| panes_grid::pane_of(&cache.state, pane));
+                if let Some(pane) = picked {
+                    self.focus(pane);
+                }
+            }
+            pane_grid::DragEvent::Canceled { .. } => {}
+            pane_grid::DragEvent::Dropped { pane, target } => {
+                let moved = self
+                    .grid
+                    .as_ref()
+                    .and_then(|cache| panes_grid::pane_of(&cache.state, pane));
+                let drop = match (&self.grid, target) {
+                    (Some(cache), target) => panes_grid::drop_target(target, &cache.state),
+                    (None, _) => None,
+                };
+                if let (Some(moved), Some(drop)) = (moved, drop) {
+                    self.move_pane_to(moved, drop);
+                }
+            }
+        }
+    }
+
+    /// Moves `from` to `target` in the active tab's tree, keeping the pane's
+    /// identity, and focuses it where it landed.
+    ///
+    /// The tree's shape changes, which is what makes the pane-grid layer re-derive
+    /// its state; the pane's `Arc` — and with it its pty, scrollback and label — is
+    /// untouched, so output cannot be misrouted.
+    pub fn move_pane_to(&mut self, from: usize, target: DropTarget) {
+        let tab_idx = self.active_tab;
+        if self.tabs[tab_idx].panes.iter().filter(|p| p.is_some()).count() < 2 {
+            return;
+        }
+        let tab = &mut self.tabs[tab_idx];
+        let Some(path) = layout::path_to_pane(&tab.root, from) else {
+            return;
+        };
+        match target {
+            DropTarget::OnPane { pane, dir: None } => {
+                if pane == from {
+                    return;
+                }
+                let Some(other) = layout::path_to_pane(&tab.root, pane) else {
+                    return;
+                };
+                layout::swap_panes(&mut tab.root, &path, &other);
+            }
+            DropTarget::Grid(dir) => {
+                // Leave the cell first: the tree collapses, so the pane can take a
+                // side of what is left.
+                layout::close_at(&mut tab.root, &path);
+                if matches!(tab.root, Node::Leaf { pane: usize::MAX }) {
+                    tab.root = Node::Leaf { pane: from };
+                } else {
+                    let rest = std::mem::replace(&mut tab.root, Node::Leaf { pane: from });
+                    tab.root = split_around(rest, from, dir);
+                }
+            }
+            DropTarget::OnPane {
+                pane,
+                dir: Some(dir),
+            } => {
+                layout::close_at(&mut tab.root, &path);
+                let Some(other) = layout::path_to_pane(&tab.root, pane) else {
+                    return;
+                };
+                split_with_pane(&mut tab.root, &other, from, dir);
+            }
+        }
+        tab.active = from;
+        self.relayout();
     }
 
     pub fn active_pane(&self) -> Option<SharedPane> {
@@ -518,7 +675,14 @@ impl AppState {
     }
 
     /// Pins the active pane to the full content rect, or unpins it.
+    ///
+    /// The pane-grid layer has no such rect — its geometry is the grid's — so there it
+    /// says so instead of sizing the ptys for a rect that will not be drawn.
     pub fn toggle_zoom(&mut self) {
+        if self.pane_grid {
+            self.toast("zoom: not available in the pane grid layer");
+            return;
+        }
         let tab = &mut self.tabs[self.active_tab];
         if !tab.zoomed.insert(tab.active) {
             tab.zoomed.remove(&tab.active);
@@ -687,5 +851,64 @@ impl AppState {
         self.theme = theme;
         self.config.theme = name.to_string();
         self.toast(format!("theme: {name}"));
+    }
+}
+
+/// Sets the ratio of the split at `path`, walking the tree rather than indexing it:
+/// a stale pane-grid path then changes nothing instead of panicking.
+fn set_split_ratio(root: &mut Node, path: &[u8], ratio: f32) {
+    let mut node = root;
+    for &step in path {
+        node = match node {
+            Node::Split { a, b, .. } => {
+                if step == 0 {
+                    a
+                } else {
+                    b
+                }
+            }
+            _ => return,
+        };
+    }
+    if let Node::Split { ratio: r, .. } = node {
+        *r = ratio;
+    }
+}
+
+/// Splits the node at `path` between itself and a new leaf holding `pane`, on the
+/// side `dir` names: the node keeps its cell and the pane lands beside it.
+fn split_with_pane(root: &mut Node, path: &[u8], pane: usize, dir: Dir) {
+    let mut node = root;
+    for &step in path {
+        node = match node {
+            Node::Split { a, b, .. } => {
+                if step == 0 {
+                    a
+                } else {
+                    b
+                }
+            }
+            _ => return,
+        };
+    }
+    let rest = std::mem::replace(node, Node::Leaf { pane });
+    *node = split_around(rest, pane, dir);
+}
+
+/// A split of `rest` with a fresh leaf for `pane`; the direction places the pane on
+/// the side it names ([`Dir::grows_a`]: `Left`/`Up` are the `a` side).
+fn split_around(rest: Node, pane: usize, dir: Dir) -> Node {
+    let leaf = Box::new(Node::Leaf { pane });
+    let rest = Box::new(rest);
+    let (a, b) = if dir.grows_a() {
+        (leaf, rest)
+    } else {
+        (rest, leaf)
+    };
+    Node::Split {
+        dir: dir.axis(),
+        ratio: 0.5,
+        a,
+        b,
     }
 }

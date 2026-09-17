@@ -562,3 +562,56 @@ equivalents.
    the font stack, the key encoder, the whole M3 input layer, and the geometry constants (cell
    metrics, frame inset) even where the painter is replaced.
 
+## 17. Plan A: pane_grid owns the pane layer
+
+Decided after the M5 first cut (a derived `pane_grid::State` rebuilt from our tree) proved the
+hybrid is the broken part: measured with instrumentation, iced's `on_click` reported the wrong
+pane for every click (`press in pane 1 … / click on Pane(0)`), because iced pairs its panes with
+layout children positionally and a state derived from someone else's tree does not satisfy that.
+Rather than hand-roll focus around it, the layout moves into iced — the point of using iced.
+
+**Ownership.** A tab owns `pane_grid::State<GridPane>` as its layout authority.
+
+    struct GridPane { panes: Vec<PaneId>, active: usize }
+
+The payload is a list because zellij-style stacks (`Ctrl+p s`) are one cell holding several
+panes: a plain pane is a one-element list, a stack is several with one active. `PaneId` stays the
+process-wide identity that pty output is tagged with, so iced's opaque `Pane` handles never enter
+our routing.
+
+**What iced owns** (and therefore what we stop doing):
+- splits and ratios — `State::split(axis, target, payload)`, `State::resize(split, ratio)`.
+- closing — `State::close(pane)` returns the payload and the sibling to focus.
+- directional focus — `State::adjacent(pane, Direction)`, no rect math.
+- reordering — `State::swap`, `State::drop(pane, Target::Pane(other))`.
+- zoom — `State::maximize` / `restore` / `maximized`, instead of our `zoomed` set.
+- dividers, hover highlight, drag-to-resize, drag-to-move — `PaneGrid::on_resize` / `on_drag` /
+  `Style { hovered_region, picked_split, hovered_split }`.
+- click-to-focus — `PaneGrid::on_click`, which becomes trustworthy once the grid *is* the layout.
+
+**What stays ours** (iced has no equivalent):
+- the terminal canvas per pane (grid, cursor, glyph runs) and its mouse handling for terminal
+  mouse reporting and selection;
+- stacks, expressed in the payload above, with the switcher drawing the active member;
+- floating panes, as an overlay layer outside the grid (absolute rects, as today);
+- the persisted session format: `ghostwave::layout::Node` stays the on-disk shape, converted
+  1:1 to and from the grid at load/save (`GridPane` ↔ `Node::Leaf`/`Node::Stack`; floats as
+  today). The macroquad front-end keeps reading the same files.
+
+**Pane sizing.** The grid computes each pane's bounds, so the pty grid follows from what iced
+lays out rather than from rects we derive: each pane's canvas records the bounds it was drawn
+with, and the update path turns that into `cols`/`rows` (`TermPane::set_grid`, a no-op when
+unchanged) — our side adapts to iced, not the other way round.
+
+**What this deletes**: `panes_grid.rs`'s `GridCache` / `derive` / `collect_splits` / `tree_ratio` /
+`drop_target` / `pane_rects`, the multi-pane mode of `TerminalCanvas` (rects, per-pane clips,
+hit-testing, the press-to-focus flag), `AppState::relayout`'s rect computation and `focus_dir`'s
+rect math. Roughly the whole derived-state layer, i.e. everything that existed to make iced draw
+a tree it did not own.
+
+**Milestones**: M5a this pane layer (grid-owned layout, input layer rerouted through it, the A/B
+knob retired once the grid path is the only path); M5b chrome and overlays as widgets (`stack`,
+`container`, `text_input`, `pick_list`, `mouse_area`), which retires `measure.rs` and the
+hand-painted chrome geometry; M5c floats on the overlay layer. Stacks land with M5a since they
+are payload-shaped, not layout-shaped.
+
