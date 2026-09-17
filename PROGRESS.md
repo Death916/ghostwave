@@ -202,9 +202,16 @@ contained. 19/19 tests pass, `ghost-iced` compiles warning-free.
   line scrolling in Normal mode alongside `Shift+PageUp`/`PageDown` page scrolling.
 - Pure-function and integration unit tests: `bounds_to_cols_rows` (normal, fractional `556.80005`, degenerate/too-small),
   stack label string formatting, click→focused-pane mapping, and live scrollback viewport movement under keys. All 22/22 tests pass.
-- `ghost-iced` compiles completely warning-free.
+- Dark pane background quirk resolved: `paint_pane` now receives `&self.theme` and renders the default
+  terminal background using `rgb(theme.bg)` (`#1a1b26`), matching the container style and eliminating
+  the discrepancy where newly spawned panes showed pitch-black (`#000000`) backgrounds. `apply_theme`
+  now calls `set_default_fg_color` and `set_default_bg_color` as independent operations, and `AppState::apply_terminal_colors()`
+  re-syncs all live panes on split.
+- Dynamic process pane titles added to plan: added §18 to `PORT-PLAN.md` for foreground process tracking
+  (`tcgetpgrp` + `/proc/<pid>/comm`) and OSC title sequences, with `dynamic_title` / `pane_title_format` configuration.
+- `ghost-iced` compiles completely warning-free on both debug and release profiles.
 
-**Next**: M5b (chrome and overlays as widgets — tab bar, status bar, palette, toast) and M4 (tabs and sessions save/restore).
+**Next**: M5b (chrome and overlays as widgets — tab bar, status bar, palette, toast), dynamic process pane titles, and M4 (tabs and sessions save/restore).
 
 ### Idle GPU, part 2 (branch `perf/idle-gpu-2`) — idle frame tier 30 → 8 FPS
 User: "gpu usage is pretty high even when idle still" after the earlier adaptive

@@ -194,6 +194,7 @@ fn grid<'a>(
                     font_px,
                     padding,
                     tracking: index.is_some_and(|index| mouse_tracking.contains(&index)),
+                    theme,
                 })
                 .width(Fill)
                 .height(Fill),
@@ -322,6 +323,7 @@ pub struct PaneCanvas {
     /// The pane's application currently tracks the mouse; cursor motion is
     /// delivered to it continuously and only to it.
     pub tracking: bool,
+    pub theme: GhostTheme,
 }
 
 impl canvas::Program<Message> for PaneCanvas {
@@ -434,6 +436,7 @@ impl canvas::Program<Message> for PaneCanvas {
             self.padding,
             self.font_px,
             fonts::primary(),
+            &self.theme,
         );
         guard.dirty = false;
         vec![frame.into_geometry()]

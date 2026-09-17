@@ -656,3 +656,16 @@ Verification while the pane layer is rebuilt: the pane operations are driven thr
 focused via `State::adjacent`/`maximized`, and that a stack's payload cycles), plus a real-window
 run for the interactions a test cannot press: click focus, drag-resize, drag-move.
 
+## 18. Dynamic Pane Titles & Process Tracking (Upcoming)
+
+Modern terminal emulators dynamically reflect the currently executing foreground command in the pane's title band (e.g., `vim`, `cargo build`, `python`), with configurable formatting and fallback hierarchy.
+
+### Mechanisms
+1. **Foreground process tracking**: Query the pane's pty foreground process group using `libc::tcgetpgrp(pty_fd)` and read the command name from `/proc/<pid>/comm` (or `/proc/<pid>/cmdline`).
+2. **OSC 0 / OSC 2 Window Title Sequences**: Capture title changes emitted by interactive shells or CLI utilities via terminal escape sequences.
+3. **Fallback hierarchy**: Running process command → OSC title → current directory (`pwd`) → fallback label (`pane N`).
+
+### Configuration Options
+- `dynamic_title = true` (default: `true`).
+- `pane_title_format`: `"process"` | `"pwd"` | `"both"` (e.g., `pane 1 — vim [~/code]` vs `pane 1 — ~/code`).
+

@@ -196,6 +196,7 @@ pub(crate) fn paint_pane(
     padding: f32,
     font_px: f32,
     font: Font,
+    theme: &GhostTheme,
 ) {
     // Disjoint field borrows: `MutexGuard` derefs through a trait, so borrowing
     // `term` and `scratch` at once only works after destructuring.
@@ -222,7 +223,7 @@ pub(crate) fn paint_pane(
         Err(_) => return,
     };
 
-    let default_bg = to_color(colors.background);
+    let default_bg = rgb(theme.bg);
     let default_fg = to_color(colors.foreground);
     frame.fill_rectangle(
         Point::new(rect.x, rect.y),

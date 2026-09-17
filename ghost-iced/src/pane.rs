@@ -118,11 +118,8 @@ impl Pane {
             g: c.1,
             b: c.2,
         };
-        let _ = self
-            .term
-            .term
-            .set_default_fg_color(Some(to_rgb(theme.fg)))
-            .and_then(|t| t.set_default_bg_color(Some(to_rgb(theme.bg))));
+        let _ = self.term.term.set_default_fg_color(Some(to_rgb(theme.fg)));
+        let _ = self.term.term.set_default_bg_color(Some(to_rgb(theme.bg)));
         self.term.force_repaint = true;
         self.dirty = true;
     }

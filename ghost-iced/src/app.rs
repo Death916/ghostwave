@@ -569,6 +569,7 @@ impl AppState {
         let (id, pane) = self.spawn_pane()?;
         let tab = &mut self.tabs[self.active_tab];
         let index = tab.add_split(dir, id, pane);
+        self.apply_terminal_colors();
         self.relayout();
         Ok(index)
     }
@@ -579,6 +580,7 @@ impl AppState {
         let (id, pane) = self.spawn_pane()?;
         let tab = &mut self.tabs[self.active_tab];
         let index = tab.add_stacked(id, pane);
+        self.apply_terminal_colors();
         self.relayout();
         Ok(index)
     }
@@ -797,6 +799,15 @@ impl AppState {
         self.theme = theme;
         self.config.theme = name.to_string();
         self.toast(format!("theme: {name}"));
+    }
+
+    /// Re-applies the current theme colors across all live panes.
+    pub fn apply_terminal_colors(&self) {
+        for tab in &self.tabs {
+            for pane in tab.panes.iter().flatten() {
+                pane.lock().unwrap().apply_theme(&self.theme);
+            }
+        }
     }
 }
 
