@@ -317,20 +317,27 @@ to `~/.cache/ghost-iced/ld-path` (`/tmp/iced-spike-ldp` does not survive a boot)
 state, exact commands, the next task in order, the pitfalls already paid for, and the conventions
 the owner enforces. This section keeps the port's history and the detail behind it.
 
-Committed: `6b0807c` on `feat/iced-frontend` ("iced: pane_grid owns the pane layer (M5a part 1)").
-Not merged and not to be merged yet. master untouched, the macroquad front-end is still the
-default binary and the reference, and `src/**` + the top-level `Cargo.toml` have not been modified
-(verify with `git diff --stat -- src Cargo.toml`). Tests 19/19, `ghost-iced` warning-free, working
-tree clean, nothing running.
+Committed: `e8e7181` ("iced: fix text/cursor baseline alignment & add dynamic process titles") on top
+of `e29067d` (the pane_grid view) and `e492c2c` (pane background + title plan). Not merged, and not
+to be merged yet. `src/**` + the top-level `Cargo.toml` are still unmodified by the port (verify
+with `git diff --stat -- src Cargo.toml`), but the owner lifted the freeze on 2026-09-17: the shared
+core may now take **additive** changes for the port's needs, and the macroquad front-end is being
+archived — see §16 and `../RETIREMENT-PLAN.md`. Test suite green as of `e8e7181` (22 passing, the
+commit's own count); `ghost-iced` compiles warning-free.
 
 **Done: M0** (one pane) **M1** (N panes / frames / labels / focus / wheel scroll) **M2** (chrome:
 tab bar, status bar + wave, toast, conditional animation tick) **M3** (input parity: every keymap
-mode, every action routed or honestly toasted) **M5a part 1** (the pane layer: a tab owns
-`pane_grid::State<GridPane>`, the operations route through iced, `layout::Node` demoted to the
-session format with tested conversions — see §17).
-**Next: M5a part 2, the pane view** — the steps are in `HANDOFF.md` §6 and the acceptance target
-is the parity table in §17. Then M5b (chrome as widgets), M4 (sessions), M6 (selection), M7 (the
-numbers that decide whether the iced front-end replaces the macroquad one).
+mode, every action routed or honestly toasted — §15) **M5a parts 1 & 2** (the pane layer and its
+view: a tab owns `pane_grid::State<GridPane>` with iced owning split/close/adjacent/resize/maximize/
+swap/drop, the view is one `PaneGrid` borrowing that state with a per-cell canvas, a title bar and
+`on_click` focus, the legacy canvas layer and its A/B knob are gone, pty sizing follows the bounds
+iced lays out, and `layout::Node` is demoted to the session format with tested conversions — §17).
+**Next, in order: M5a polish** (the items §18 lists — baseline offset, cell backgrounds before text
+runs, title caching), **M5b** chrome and overlays as real widgets, **M6** selection/clipboard,
+search overlay, command palette, the preview / AI / visualizer panes and the F12 scratchpad,
+**M7** the numbers. Sessions and SSH are held by the owner for later. The pre-archive gate is the
+feature list in `../RETIREMENT-PLAN.md` §2: the macroquad build is no longer the *looks* reference,
+but its features are the gate until it is archived.
 
 ### Build / run / verify (exact commands)
 
@@ -360,40 +367,32 @@ the **visible** workspace — a window on another workspace yields the wallpaper
 Pane logs: `<XDG_DATA_HOME>/ghostwave/panes/pane-<pid>-<nanos>.log`, written through
 `pane.rs::ingest` (the `poll_pty` replacement).
 
-### ghost-iced module map
+### ghost-iced module map (14 files, ~5,000 lines)
 
-    main.rs        iced boot: Message, update, view, subscription, temporary binds, font registration
-    app.rs         AppState/Tab: tabs, split tree, cached rects, mode, wave energy/phase, toast,
-                   tick rates, split/close/focus (+ GHOST_ICED_PANES)
-    pane.rs        Pane { term, scratch, dirty, rx }: spawn, apply_theme, ingest/exited, key_press,
-                   scroll, resize, cell_dims
-    pty_bridge.rs  one bridge thread per pane, coalesces to 256 KiB, tags messages (tab, pane)
-    pane_canvas.rs one canvas for the window: panes (clipped per pane), frames+labels (clipped to
-                   the content rect), chrome call, tab + pane mouse hit tests
-    chrome.rs      tab bar, status bar + two-harmonic wave, toast — per CHROME-REFERENCE.md
-    measure.rs     text_width()/ascent() from fontdue (an iced canvas cannot measure text)
-    keys.rs        iced physical key -> ghostwave keymap::KeyPress (155 arms, mods, text)
-    fonts.rs       PRIMARY_BYTES + primary() + the fc-list fallback chain
-    tick.rs        conditional animation tick (iced 0.14 has no `time::every`)
+    main.rs         iced boot: Message, update, view, subscriptions, key listener, window title
+    app.rs          AppState/Tab: tabs, the tab-owned pane_grid::State<GridPane>, every pane op,
+                    mode, wave energy/phase, toast, tick rates, the title cache seam
+    input.rs        the M3 dispatch mirror (key_press/key_release/repeat) + its acceptance tests
+    pane.rs         Pane/SharedPane, PaneId, ingest/exited/key_press/resize, mouse tracking,
+                    foreground-process + cwd inspection for dynamic titles
+    pty_bridge.rs   one bridge thread per pane, coalesces to 256 KiB, tagged with a PaneId
+    panes_grid.rs   the PaneGrid view: one canvas per cell, title-bar label, on_click/on_resize/on_drag
+    pane_canvas.rs  the per-pane painter (paint_pane), run-merged text, label helpers, geometry
+                    constants
+    chrome.rs       tab bar, status bar + two-harmonic wave, toast — per CHROME-REFERENCE.md
+    config.rs       the port's config overlay (dynamic_title / pane_title_format)
+    measure.rs      text_width()/ascent() from fontdue (an iced canvas cannot measure text)
+    keys.rs         iced physical key -> ghostwave keymap::KeyPress (mods, text, press/release/repeat)
+    fonts.rs        PRIMARY_BYTES + primary() + the fc-list fallback chain
+    tick.rs         conditional animation tick (iced 0.14 has no `time::every`)
+    grid_session.rs Node <-> State<GridPane> conversions for session save/load (tested, no caller yet)
     CHROME-REFERENCE.md  line-cited chrome spec extracted from the macroquad render path
 
-### M3 plan (in order)
+### M3 plan (done — kept as history; §15 has what shipped)
 
-1. Read `app.rs::handle_key` (~2149-2560) plus `keymap::{handle, global_binds, entry_bind,
-   is_quit}` and mirror its `Dispatch` -> effects mapping in `ghost-iced/app.rs` as
-   `apply(action)`.
-2. Add the mode/pending-prefix state (the app enters PANE mode on the `Ctrl+p` prefix) and
-   DELETE the temporary Alt+Shift/Alt+arrow binds in main.rs.
-3. Route keys mode-first: mode dispatch -> Action -> apply; only a normal/unlocked key goes to
-   the pane's VT encoder (`Pane::key_press` already mirrors `app.rs::handle_key`).
-4. Key release + repeat: iced gives `KeyReleased` and `repeat: bool`, libghostty's `key::Action`
-   has Press/Release/Repeat — needed for kitty keyboard protocol parity (`keys.rs` currently
-   emits presses only).
-5. Per-pane mouse reporting (`TermPane::handle_mouse` is pub, takes rect/cell/padding/event);
-   the selection gesture itself is M6.
-
-Verification for M3: the status pill and hint line must change on `Ctrl+p`, `Esc` must exit a
-mode, `Ctrl+o`/`Ctrl+g`/`Ctrl+q` must behave as in the app, and `Ctrl+p d` must split.
+The five steps that produced `input.rs` are recorded in §15 ("M3 — input parity"). Do not re-do
+them: the dispatch mirror, the mode/pending-prefix state and the press/release/repeat mapping are in
+place and covered by the acceptance tests inside `input.rs`.
 
 ### Open items / risks
 
@@ -405,15 +404,21 @@ mode, `Ctrl+o`/`Ctrl+g`/`Ctrl+q` must behave as in the app, and `Ctrl+p d` must 
 - **Kitty graphics untried** (canvas image handling is iced's weak spot; open perf issue for
   large images). Highest-risk remaining item.
 - Not started: selection + copy, search overlay, command palette, session manager, tab context
-  menu, preview/visualizer panes.
+  menu, the preview / AI / visualizer panes, the F12 scratchpad (a float). Entry points count as
+  much as the panes: the visualizer and AI open from the palette, preview opens from `Ctrl+Click`
+  on a path, the scratchpad is `F12`/`Ctrl+~` (see `../RETIREMENT-PLAN.md` §2).
 - iced renders every text item above every shape in a `Frame`; that is why the frame/label pass
   is clipped to the content rect, and it also means the cursor sits behind its glyph.
 - **DIRECTION CHANGE (2026-09-16) — macroquad parity is no longer the acceptance criterion.**
   The owner prefers iced's text rendering, knows iced better than macroquad, and wants the work to
   use iced's built-ins instead of hand-rolling equivalents. See §16: panes move to `pane_grid`,
   the chrome and overlays become real widgets, and `ghostwave::layout` stays only as the persisted
-  session representation. The macroquad front-end keeps working and stays in the repo as a
-  reference implementation, not as the target.
+  session representation.
+- **DECISION (2026-09-17) — the macroquad front-end is being retired.** It is not a parallel build
+  and not the target: it gets archived to a `macroquad-archive` branch + tag and removed from the
+  ongoing branches. Until that cut, **its features are still the gate** — everything it can do must
+  exist in iced first, and the list is `../RETIREMENT-PLAN.md` §2. The direction of the port does
+  not change; this only fixes when the old build can go.
 
 ## 14. M1 / M2 notes (2026-09-16, later the same day)
 
@@ -563,11 +568,18 @@ equivalents.
 3. **What pane_grid does not model stays ours**: zellij-style stacked panes and floating panes.
    A stack becomes a pane whose content is a switcher; floats stay on an overlay layer.
 4. **`ghostwave::layout` survives** as the persisted session representation and as the budget for
-   stacks/floats, with a conversion to `pane_grid::State` at load/save while the macroquad build
-   reads the same session files.
-5. **Plan reshuffle**: M4 tabs + sessions, then **M5 = pane_grid migration**, M6 extras
-   (selection, search, palette, preview/visualizer, kitty graphics), M7 = perf numbers only.
-6. **Kept from the parity work**: the terminal-core seam (`TermPane` + the iced render scratch),
+   stacks/floats, with the conversion to `pane_grid::State` at load/save (`grid_session.rs`, tested
+   both ways). The file format is shared with the macroquad build, so it must keep loading what that
+   build wrote — until the retirement cut, after which the format is ours alone.
+5. **Plan, as it actually landed**: M3 input parity (§15), then **M5a** the pane layer *and* its
+   view (§17, done), **M5b** chrome and overlays as real widgets, **M6** extras (selection and
+   clipboard, search, palette, the preview / AI / visualizer panes, the F12 scratchpad),
+   **M7** perf numbers only. Tabs landed with M1/M2; **sessions and SSH are held by the owner**.
+6. **Retirement (2026-09-17)**: the macroquad front-end is archived (`macroquad-archive` branch +
+   `macroquad-final` tag) and removed from the ongoing branches once the iced build covers the
+   feature gate in `../RETIREMENT-PLAN.md` §2. Its features are the gate until then; its looks
+   stopped being the reference in §16/§17.
+7. **Kept from the parity work**: the terminal-core seam (`TermPane` + the iced render scratch),
    the font stack, the key encoder, the whole M3 input layer, and the geometry constants (cell
    metrics, frame inset) even where the painter is replaced.
 
@@ -619,7 +631,8 @@ rect math. Roughly the whole derived-state layer, i.e. everything that existed t
 a tree it did not own.
 
 **Milestones**: M5a this pane layer (grid-owned layout, input layer rerouted through it, the A/B
-knob retired once the grid path is the only path); M5b chrome and overlays as widgets (`stack`,
+knob retired — done in M5a part 2, the grid is the only pane path); M5b chrome and overlays as
+widgets (`stack`,
 `container`, `text_input`, `pick_list`, `mouse_area`), which retires `measure.rs` and the
 hand-painted chrome geometry; M5c floats on the overlay layer. Stacks land with M5a since they
 are payload-shaped, not layout-shaped.
@@ -679,7 +692,7 @@ Modern terminal emulators dynamically reflect the currently executing foreground
 ### Configuration Options (`~/.config/ghostwave/config.toml`)
 - `dynamic_title`: `"process"` (default), `"osc"` / `"osc_only"`, or `"off"` (boolean `true`/`false` also accepted).
 - `pane_title_format`: `"process"` (default: command name, fallback to directory/OSC), `"pwd"` (prioritize directory), or `"both"` (e.g. `lazygit (~/repo)`).
-- Loaded in iced front-end via `IcedConfig` overlay without modifying frozen `src/**`.
+- Lives in `ghost-iced/src/config.rs` (`IcedConfig`) today, read from the same `~/.config/ghostwave/config.toml`. **The `src/**` freeze was lifted by the owner on 2026-09-17**: move these keys into the shared `Config` as additive `#[serde(default)]` fields so the macroquad build still compiles and simply ignores them, keeping one config file as the source of truth. The iced-only overlay was a workaround for the freeze, not the target design.
 
 ### Next Milestones
 - **M5a Polish & Verification**: Text baseline offset fixed (`run.baseline_y - measure::ascent(font_px)`), cell backgrounds drawn before text runs, dynamic title caching.

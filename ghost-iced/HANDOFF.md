@@ -8,15 +8,23 @@ Written for whoever picks this up next (human or agent). Read this first, then
 
 `ghostwave` is a terminal emulator built on `libghostty-vt`, with a macroquad front-end in
 `src/**` (the original, complete, works) and a second front-end being ported onto **iced 0.14**
-in `ghost-iced/`. The iced front-end is a work in progress on a feature branch. It renders and
-runs; the pane layer is mid-refactor.
+in `ghost-iced/`. The iced front-end is a work in progress on a feature branch; it renders and runs,
+and its pane layer *and* pane view are on iced's `pane_grid` as of M5a.
 
 - repo: `~/Documents/code/vibed/ghost`
-- branch: `feat/iced-frontend`, tip `6b0807c` ("iced: pane_grid owns the pane layer (M5a part 1)")
+- branch: `feat/iced-frontend`, tip `e8e7181` ("fix text/cursor baseline alignment & add dynamic
+  process titles"), on top of `e29067d` (the pane_grid view) and `e492c2c` (pane background / title plan)
 - public mirror: `git.death916.xyz/death916/ghostwave` (`master` is protected; work goes on
   `feat/*` branches and merges only when the owner says so)
-- state: **tests 19/19 pass, `ghost-iced` compiles with zero warnings, working tree clean**
-- nothing of ours is running: no iced test windows, no macroquad instance, no subagents
+- state: **M5a parts 1 and 2 landed** — the pane layer *and* its view are on iced's `pane_grid`;
+  test suite green (22 passing as of that commit); `ghost-iced` compiles warning-free
+- the macroquad front-end is **being retired**: archived to a `macroquad-archive` branch plus a
+  `macroquad-final` tag and removed from the ongoing branches once the iced build covers the feature
+  gate in `../RETIREMENT-PLAN.md` §2. Its *features* are the gate until then; its looks stopped
+  being the reference (`PORT-PLAN.md` §16/§17)
+- the `src/**` freeze is **lifted** (owner's call, 2026-09-17): the shared core may take *additive*
+  changes for the port's needs. Do not rewrite shared code the macroquad build still depends on
+  until that build is actually removed.
 
 ## 2. What "done" means here (read before proposing work)
 
@@ -25,6 +33,9 @@ owner prefers iced's text rendering and knows iced better, so the rule is: **use
 built-ins wherever possible; hand-roll only where a widget makes the look worse.** Aesthetics
 matter (the current look is liked), and the acceptance target for the pane work is the feature
 table in `PORT-PLAN.md` §17 ("Parity checklist for M5a").
+
+Past the pane work, the gate for **archiving the macroquad build** is the feature list in
+`../RETIREMENT-PLAN.md` §2: everything that build can do has to exist in the iced front-end first.
 
 ## 3. Never touch
 
@@ -53,10 +64,14 @@ never a bare tool invocation, never download packages.
     # run the macroquad front-end (the reference to compare behaviour against)
     cd ~/Documents/code/vibed/ghost && nix-shell ~/.hermes/shell.nix --run "cargo run"
 
-Env knobs the iced binary understands today: `GHOST_ICED_PANES=N` (spawn N panes instead of one),
-`GHOST_ICED_FIXTURE="<command>"` (shell command to run in each pane), `GHOST_ICED_PANEGRID=1`
-(use the pane-grid path instead of the hand-painted canvas path — **this knob is scheduled for
-deletion by the next task**, see §6).
+Env knobs: `GHOST_ICED_PANES=N` (spawn N panes at startup instead of one) and
+`GHOST_ICED_FIXTURE="<command>"` (a shell command to run in each pane). The old `GHOST_ICED_PANEGRID`
+A/B knob is **gone** — the grid is the only pane path.
+
+Config: `~/.config/ghostwave/config.toml`. The port reads its title options through its own overlay
+(`ghost-iced/src/config.rs`): `dynamic_title` = `"process"` (default) / `"osc"` / `"off"`, and
+`pane_title_format` = `"process"` / `"pwd"` / `"both"` (`PORT-PLAN.md` §18). Those keys belong in the
+shared `Config` now that `src/**` is unfrozen.
 
 Versions: rustc 1.95.0; iced 0.14.0 (`iced_widget` 0.14.2, `iced_wgpu` 0.14.0, wgpu 27.0.x,
 cosmic-text 0.15.0); libghostty-vt 0.2.1. Crate sources for reading (not the docs site, which
@@ -76,42 +91,38 @@ Environment: Hyprland/Wayland, monitor scale 1.25, iced windows have an empty wi
   "not implemented yet" toasts for unported features (palette, search, sessions)
 - tabs: new/close/goto/rename/move/last-tab; pane ops: split down/right, stack, close, zoom,
   frames toggle, sync, break-to-tab — **these route through iced's `pane_grid::State` now**
-- 19 tests: 13 M3 acceptance tests driving `input::key_press`, 5 session-conversion round-trips,
-  1 grid-ops test (all in-crate, no display needed)
+- the pane view is one `PaneGrid` borrowing the tab's own state: a canvas per cell showing the
+  cell's active member, a stack-aware title-bar label, `on_click` focus, `on_resize`/`on_drag`
+  wired, ptys sized from the bounds iced actually lays out, and pane origins rounded so glyphs stay
+  sharp on fractional split ratios
+- dynamic pane/tab/window titles from the running foreground process (`tcgetpgrp` + `/proc`),
+  cached on the tick so the view path stays syscall-free — configurable, see §4
+- text and cursor baseline alignment fixed (`run.baseline_y - measure::ascent(font_px)`)
+- suite green (22 tests as of `e8e7181`): M3 acceptance tests driving `input::key_press` against
+  real panes, session-conversion round-trips, grid-op tests, font tests — all in-crate, no display
 
-## 6. The next task: M5a part 2, the pane view
+## 6. The next task: M5a polish, then M5b
 
-Part 1 (landed) made `pane_grid::State<GridPane>` the layout authority in `app.rs`; the *view* is
-still the first cut, so the pane layer is not yet at parity. Do this, in order:
+M5a parts 1 and 2 have landed — the pane layer in `app.rs` and the view in `panes_grid.rs` — so the
+steps that used to live here are done. What is left, in the order `PORT-PLAN.md` §18 lists it:
 
-1. `panes_grid.rs`: build the `PaneGrid` from the tab's own `State` (borrow it — no cache, no
-   re-derivation). Per cell: one canvas painting the cell's **active member** via
-   `pane_canvas::paint_pane` (already `pub(crate)`), plus a `TitleBar::new` label. Wire
-   `.on_click` → focus the clicked cell's active `PaneId` (map through `Tab::index_of`),
-   `.on_resize`/`.on_drag` → the existing `Message::GridResize`/`GridDrag` (already routed to
-   `State::resize`/`State::drop`). Style: 1px `theme.frame` / 2px `theme.frame_active` outline,
-   16px label band in the frame colour with `theme.tab_bg` text, 4px gutter showing the window
-   background. A stack's label says which member is shown and that there are more.
-2. Delete the legacy layer: the multi-pane mode of `TerminalCanvas` (per-pane rect list, the
-   `Frame::with_clip` loop, hit-testing, the press-to-focus flag) and the `GHOST_ICED_PANEGRID`
-   knob. Keep `paint_pane`, the label helpers, the geometry constants, and the chrome painter
-   (tab bar/status bar/wave/toast) as a separate canvas layered **above** the grid as the second
-   `Stack` child with `paint_background: false`.
-3. Pty sizing follows iced's layout: the pane's canvas records the bounds it was drawn with, the
-   update path turns that into cols/rows with the existing cell metrics and calls
-   `TermPane::set_grid` (no-op when unchanged). Remove the remaining `AppState::pane_rects()`
-   callers so nothing derives rects in parallel.
-4. Paint each pane from a **rounded origin** (`bounds.x.round()`): ratio-based splits produce
-   fractional bounds (observed `556.80005`) and un-rounded origins blur the glyphs. This is the
-   visible sharpness difference between the two windows.
-5. Tests: keep all 19 passing; add pure-function tests for bounds→cols/rows (including fractional
-   and too-small), the stack label string, and the click→focused-pane mapping. Nothing that needs
-   a display.
-6. Verify: `cargo test` per §4, then a real-window run and the §17 parity table row by row.
+1. **M5a polish** — the items §18 names: cell backgrounds painted before the text runs of the same
+   pass, the title cache maintained on the tick, and a pass over the pane chrome (frames toggle,
+   active highlight) now that the hand-painted canvas layer is gone.
+2. **Reconcile the config** — move `dynamic_title` / `pane_title_format` out of the port's overlay
+   (`ghost-iced/src/config.rs`) into the shared `Config` as additive `#[serde(default)]` fields; the
+   `src/**` freeze is lifted.
+3. **Walk the §17 parity table in a real window** and fix what fails — above all the interactions a
+   test cannot press (click focus, drag-resize, drag-move) and the pane features never exercised
+   (frames toggle, sync, break-to-tab).
+4. **M5b** — chrome and overlays as iced widgets (`stack`, `container`, `text_input`, `pick_list`,
+   `mouse_area`), which retires `measure.rs` and the hand-painted chrome geometry.
+5. Then **M6** (selection/clipboard, search overlay, command palette, the preview / AI / visualizer
+   panes, the F12 scratchpad) and **M7** (the numbers). Sessions and SSH are held by the owner.
 
 `ghost-iced/src/grid_session.rs` (Node ↔ `State<GridPane>`, 5 round-trip tests) exists for the
 session milestone and has no live caller yet — its `#[allow(dead_code)] mod` in `main.rs` is
-deliberate. After this task the grid is the only pane path (the A/B period ends).
+deliberate. The grid is the only pane path; the A/B period ended with part 2.
 
 ## 7. Pitfalls already paid for (do not rediscover these)
 
@@ -136,6 +147,10 @@ deliberate. After this task the grid is the only pane path (the A/B period ends)
 - **Canvas text needs three explicit choices**: register the font via
   `iced::application(..).font(bytes)` and name it, use `Shaping::Advanced` (Basic = no fallback =
   tofu), and draw runs of same-colour cells rather than one text item per cell.
+- **Canvas text draws from the top of the run, not from a baseline.** Every row sat a few pixels low
+  until the offset was applied explicitly: `run.baseline_y - measure::ascent(font_px)`.
+- **Cell backgrounds must be painted before the text runs of the same pass.** All text renders above
+  all shapes inside a frame, so a background drawn afterwards hides the glyphs it belongs to.
 - **Do not trust a vision reading of a screenshot over the owner's eyes**, and check for
   colour-shifted captures before concluding anything from pixels.
 
@@ -160,19 +175,22 @@ deliberate. After this task the grid is the only pane path (the A/B period ends)
 - Stacks exist as a payload shape (`GridPane { panes, active }`); rendering their non-active
   members, and floating panes, are unimplemented (floats are M5c).
 - iced 0.14's API moved twice during this port (keyboard, time, canvas); expect churn.
-- Later milestones: M5b chrome/overlays as widgets (`stack`, `container`, `text_input`,
-  `pick_list`, `mouse_area`), M6 selection, M7 the parity numbers that decide whether the iced
-  front-end replaces the macroquad one.
+- Later milestones, now a single roadmap in `PORT-PLAN.md` §13/§18: M5b chrome and overlays as
+  iced widgets, M6 selection/clipboard, search, palette, the preview / AI / visualizer panes and the
+  F12 scratchpad, M7 the numbers. The macroquad front-end is archived once the
+  `../RETIREMENT-PLAN.md` §2 gate is met — that decision is made, not voted on by a perf number.
 
 ## 10. File map (`ghost-iced/src/`)
 
     main.rs         boot, message loop, key listener, chrome data, grid + chrome assembly
     app.rs          AppState/Tab, the tab-owned pane_grid::State<GridPane>, every state op
     input.rs        the M3 dispatch mirror (key_press/key_release/repeat) + acceptance tests
-    pane.rs         Pane/SharedPane, PaneId, ingest/exited/key_press/resize, mouse-tracking flag
-    pane_canvas.rs  per-pane painter (paint_pane), label helpers, geometry constants, chrome painter
-    panes_grid.rs   the PaneGrid view (first cut; the rewrite target of §6)
+    pane.rs         Pane/SharedPane, PaneId, ingest/exited/key_press/resize, mouse-tracking flag,
+                    foreground-process + cwd inspection for dynamic titles
+    pane_canvas.rs  per-pane painter (paint_pane), run-merged text, label helpers, geometry constants
+    panes_grid.rs   the PaneGrid view: one canvas per cell, title-bar label, on_click/on_resize/on_drag
     chrome.rs       tab bar / status bar / wave / toast painting
+    config.rs       the port's config overlay (dynamic_title / pane_title_format)
     keys.rs         iced Key/Physical/Mods → libghostty KeyPress
     pty_bridge.rs   pty reader → iced stream, tagged per PaneId
     tick.rs         animation tick thread (no iced::time::every in 0.14)

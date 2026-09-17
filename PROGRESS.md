@@ -16,8 +16,11 @@ Binary name: `ghostwave`
 `ghost-iced/` renders a full tab (panes, frames, tab bar, status bar, wave, toast) from the same
 terminal core, drives every keymap mode, and — as of M5a (parts 1 & 2) — keeps its layout and view
 in iced's own `pane_grid::PaneGrid`, with per-cell canvas, rounded-origin subpixel anti-blur,
-stack-aware title bars, dynamic sizing from iced bounds, and warning-free compilation (22/22
-tests pass). Not merged; the macroquad build is still the default binary and the reference.
+stack-aware title bars, dynamic sizing from iced bounds, and warning-free compilation (suite green;
+the count is recorded per commit in the sections below). Not merged yet.
+**The macroquad front-end is being retired**: archived to a `macroquad-archive` branch plus a
+`macroquad-final` tag and removed from the ongoing branches once the iced build covers its feature
+set (`RETIREMENT-PLAN.md` §2). Its features are the gate until then; its looks are not the reference.
 **Start with `ghost-iced/HANDOFF.md`** (brief for the next session), then
 `ghost-iced/PORT-PLAN.md` §13 (status), §16 (direction change), §17 (Plan A + the M5a parity
 table).
