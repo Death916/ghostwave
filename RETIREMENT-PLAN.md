@@ -46,6 +46,14 @@ especially. Note that they have never been exercised by hand — the F12 pane th
 - **AI**: mostly text and a worker thread — the smallest port; it becomes a widget tree plus the
   existing blocking-HTTP-in-a-thread pattern.
 
+How each is reached today, since the iced build has to reproduce the entry points as well as the
+panes: the visualizer and the AI pane open from the command palette (`Ctrl+Shift+P` → "Ghostwave
+(Screensaver Visualizer)" and "New AI Chat"); the preview pane has no palette entry and opens from
+`Ctrl+Click` on a file path; the scratchpad is `F12` / `Ctrl+~`. The AI pane reads `[ai]` from
+`~/.config/ghostwave/config.toml` (`base_url` / `model` / `api_key_env` / `system_prompt`, any
+OpenAI-compatible endpoint) and takes a copy of it at pane creation, so config edits need a restart
+plus a new pane.
+
 If porting the visualizer proves too costly at cut time, the standing fallback is to keep a minimal
 macroquad binary for that pane alone. Its costs should be weighed then, not assumed: macroquad stays
 in the dependency graph, that binary needs the terminal core, and the core would either stay shared
