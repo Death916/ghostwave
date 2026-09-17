@@ -1032,4 +1032,12 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   (`Pane::refresh_search`, gated on `search.active() && search.dirty` exactly like the core) and
   paints matches the way the reference does: a matched cell inverts to `theme.search_match` with the
   glyph in `theme.bg`, plus the reference's 2 px row marker at the pane's left edge.
+- **The F12 scratchpad was invisible** because its pane is spawned into the tab but given no grid
+  cell, so the pane-grid layer had nothing to paint. `main.rs` now has a float layer between the
+  chrome and the modal overlays: every `visible_floats()` entry, bottom-to-top by z-index, as a
+  sized box at the float's own rect (padding-positioned, since iced has no absolute positioning)
+  carrying the same `PaneCanvas` the grid uses — so its painting, its recorded bounds and its mouse
+  forwarding are identical to a docked pane — with a title band taken from the pane's cached title
+  and a click target that focuses the pane. `the_scratchpad_float_is_visible_to_the_layer` pins the
+  layer's inputs (one visible float, its pane in the tab, a non-zero rect, and hidden after F12).
 

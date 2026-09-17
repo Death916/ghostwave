@@ -7,7 +7,7 @@ use ghostwave::keymap::Action;
 use iced::{
     keyboard,
     widget::{pane_grid, Stack},
-    Element, Length, Size, Subscription, Task,
+    Element, Fill, Length, Padding, Size, Subscription, Task,
 };
 use libghostty_vt::key;
 
@@ -392,6 +392,85 @@ impl App {
         }
     }
 
+    /// Every visible float, bottom-to-top, each positioned at its own rect.
+    ///
+    /// A float's pane lives in the tab (so its pty, its identity and the mouse path all
+    /// work) but has no grid cell, which is why this layer paints it: iced has no
+    /// absolute positioning, so a full-size layer carries the float at `position()` via
+    /// padding.
+    fn float_layer(&self) -> Option<Element<'_, Message>> {
+        use iced::widget::{Canvas, Column, container, mouse_area, text};
+
+        let tab = self.state.current();
+        let tab_index = self.state.active_tab;
+        let theme = self.state.theme;
+        let mut floats: Vec<_> = self.state.scratchpad.visible_floats().collect();
+        floats.sort_by_key(|float| float.z_index);
+
+        let mut layers: Vec<Element<'_, Message>> = Vec::new();
+        for float in floats {
+            let Some(index) = tab.index_of(float.id()) else {
+                continue;
+            };
+            let Some(handle) = tab.pane(index).cloned() else {
+                continue;
+            };
+            let tracking = handle.lock().unwrap().mouse_tracking();
+            let title = {
+                let guard = handle.lock().unwrap();
+                let cached = guard.cached_title();
+                if cached.is_empty() {
+                    "float".to_string()
+                } else {
+                    cached.to_string()
+                }
+            };
+            let (pos, size) = (float.position(), float.size());
+            let canvas = Canvas::new(panes_grid::PaneCanvas {
+                tab: tab_index,
+                pane: index,
+                handle,
+                cell: self.state.cell,
+                font_px: self.state.config.font_size,
+                padding: self.state.config.padding,
+                tracking,
+                theme,
+            })
+            .width(Fill)
+            .height(Fill);
+            let window = Column::with_children(vec![
+                text(title).size(12.0).font(fonts::primary()).into(),
+                container(canvas)
+                    .width(Fill)
+                    .height(Fill)
+                    .style(move |_theme| container::Style {
+                        border: iced::Border {
+                            color: pane_canvas::rgb(theme.frame_active),
+                            width: 1.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .into(),
+            ])
+            .width(size.width)
+            .height(size.height);
+            layers.push(
+                container(mouse_area(window).on_press(Message::FocusPane(index)))
+                    .width(Fill)
+                    .height(Fill)
+                    .padding(Padding {
+                        top: pos.y,
+                        left: pos.x,
+                        ..Padding::ZERO
+                    })
+                    .into(),
+            );
+        }
+
+        (!layers.is_empty()).then(|| Stack::with_children(layers).into())
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let tab = self.state.current();
         let mouse_tracking: Vec<usize> = tab
@@ -433,10 +512,14 @@ impl App {
         };
 
         let base = panes_grid::view(&self.state, mouse_tracking, chrome);
-        if self.state.search.is_none() && self.state.palette.is_none() {
+        let floats = self.float_layer();
+        if floats.is_none() && self.state.search.is_none() && self.state.palette.is_none() {
             return base;
         }
         let mut layers: Vec<Element<'_, Message>> = vec![base];
+        if let Some(floats) = floats {
+            layers.push(floats);
+        }
         if let Some(search) = self.state.search.as_ref() {
             layers.push(search_overlay::search_overlay_mapped(
                 search,

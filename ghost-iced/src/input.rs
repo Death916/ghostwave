@@ -993,6 +993,33 @@ mod tests {
     }
 
     #[test]
+    fn the_scratchpad_float_is_visible_to_the_layer() {
+        let mut s = state();
+        execute(&mut s, Action::ToggleScratchpad);
+        assert!(s.scratchpad.is_open(), "F12 opens the scratchpad");
+
+        let floats: Vec<_> = s.scratchpad.visible_floats().collect();
+        assert_eq!(floats.len(), 1, "the layer has one float to paint");
+        let float = &floats[0];
+        assert!(
+            s.current().index_of(float.id()).is_some(),
+            "the float's pane is in the tab, so the layer can build its canvas"
+        );
+        let size = float.size();
+        assert!(
+            size.width > 0.0 && size.height > 0.0,
+            "the float has a rect to paint at"
+        );
+
+        execute(&mut s, Action::ToggleScratchpad);
+        assert_eq!(
+            s.scratchpad.visible_floats().count(),
+            0,
+            "hiding the scratchpad removes it from the layer"
+        );
+    }
+
+    #[test]
     fn a_search_query_finds_text_the_pane_has_written() {
         let mut s = state();
         let active = s.current().active;
