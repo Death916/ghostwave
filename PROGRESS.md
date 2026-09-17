@@ -12,6 +12,12 @@ Binary name: `ghostwave`
 
 ## STATUS: main terminal features solid — render/mouse/keybinds fixed, parity work in progress
 
+**iced front-end WIP (branch `feat/iced-frontend`, commit `7d143e4`)**: a second front-end in
+`ghost-iced/` now renders a full tab (panes, frames, tab bar, status bar, wave, toast) from the
+same terminal core. Not merged; the macroquad build is still the default binary and the
+reference. Port state, module map, exact build/run commands and the M3 plan live in
+`ghost-iced/PORT-PLAN.md` §13 — read that first.
+
 ### iced front-end, M0 (branch `feat/iced-frontend`) — second front-end builds and runs, one pane
 New crate `ghost-iced/` (iced 0.14 + libghostty-vt, path-dep on the app lib, `[workspace]`
 marker so it never joins the app package; `ghost-iced/PORT-PLAN.md` is the port plan).
@@ -102,6 +108,26 @@ reference; both were captured at the same window size and compared.
   `GHOST_ICED_FIXTURE=<cmd>` make layout/multi-pane/log behaviour testable without
   typing. Temporary binds until M3: Alt+Shift+d/e split, Alt+Shift+w close, Alt+arrows
   focus.
+
+**NEXT UP — M3, the keymap modes (this is the milestone that makes hotkeys real).** Yesterday's
+temporary Alt binds get deleted and replaced by the app's own `Ctrl+p`/`Ctrl+t`/`Ctrl+n`/
+`Ctrl+s`/`Ctrl+h`/`Ctrl+o`/`Ctrl+g`/`Ctrl+q` binds and its `Dispatch` → `Action` effects, so the
+status pill and hint line start changing with the mode. Steps, in order: (1) read
+`app.rs::handle_key` (~2149-2560) + `keymap::{handle, global_binds, entry_bind, is_quit}` and
+mirror the effects in `ghost-iced/app.rs` as `apply(action)`; (2) add the mode/pending-prefix
+state and delete the temp binds; (3) route keys mode-first, only a normal/unlocked key reaching
+the pane's VT encoder; (4) add key release + repeat (`key::Action::Press/Release/Repeat`, which
+kitty keyboard protocol needs — `keys.rs` currently emits presses only); (5) per-pane mouse
+reporting via the pub `TermPane::handle_mouse` (the selection gesture is M6). Verify: `Ctrl+p`
+changes pill + hints, `Esc` exits, `Ctrl+p d` splits, `Ctrl+g` locks, `Ctrl+q` quits.
+After M3: M4 tabs + sessions, M5 leftover config knobs + runtime theme switch, M6 extras
+(selection/copy, search, palette, session manager, preview/visualizer, kitty graphics last),
+M7 side-by-side parity + idle-perf numbers before any default-binary flip. Full detail in
+`ghost-iced/PORT-PLAN.md` §13.
+
+The user's read on the two builds: iced's text looks sharper and is preferred; they want the
+hotkeys working next (M3) and are deliberately keeping the port reversible — a wipe and
+continue with macroquad stays a live option until iced reaches parity.
 
 ### Idle GPU, part 2 (branch `perf/idle-gpu-2`) — idle frame tier 30 → 8 FPS
 User: "gpu usage is pretty high even when idle still" after the earlier adaptive

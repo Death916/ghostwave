@@ -311,7 +311,100 @@ Reboot note: `/tmp/icedspike-target` (2.5 G warm deps; a cold rebuild is ~10 min
 was copied to `~/.cache/ghost-iced/target`, and the `LD_LIBRARY_PATH` for launching
 to `~/.cache/ghost-iced/ld-path` (`/tmp/iced-spike-ldp` does not survive a boot).
 
-## 13. M1 / M2 notes (2026-09-16, later the same day)
+## 13. Status + next up (2026-09-16, cold-start handoff — read this first)
+
+Committed: `7d143e4` on `feat/iced-frontend` ("WIP iced front-end: second front-end renders a
+full tab (M0-M2)"). Not merged and not to be merged yet. master untouched, the macroquad
+front-end is still the default binary and the reference, and `src/**` + the top-level
+`Cargo.toml` have not been modified (verify with `git diff --stat -- src Cargo.toml`).
+
+**Done: M0** (one pane) **M1** (N panes / frames / labels / click focus / wheel scroll)
+**M2** (tab bar, status bar + wave, toast, conditional animation tick).
+**Next: M3 input parity** — the keymap modes and Action dispatch. Then M4 (tabs + sessions),
+M5 (leftover knobs + runtime theme switch), M6 (extras), M7 (parity + perf).
+
+### Build / run / verify (exact commands)
+
+    # build (deps warm in /tmp/icedspike-target; a cold dir is ~10 min)
+    cd /home/death916/Documents/code/vibed/ghost && \
+      CARGO_TARGET_DIR=/tmp/icedspike-target nix-shell /home/death916/.hermes/shell.nix \
+      --run "cd /home/death916/Documents/code/vibed/ghost/ghost-iced && cargo check --message-format=short"
+
+    # binary
+    /tmp/icedspike-target/release/ghost-iced
+
+    # run (NEVER share the data dir with a running macroquad instance — see the prune hazard in §14)
+    XDG_DATA_HOME=/tmp/ghost-iced-data LD_LIBRARY_PATH="$(cat /tmp/iced-spike-ldp)" \
+      /tmp/icedspike-target/release/ghost-iced
+    # regenerate the ld path if /tmp was wiped:
+    #   cd .../ghost && nix-shell ./shell.nix --run 'printf %s "$LD_LIBRARY_PATH"' 2>/dev/null | tail -1 > /tmp/iced-spike-ldp
+
+Environment knobs: `GHOST_ICED_PANES=<n>` (open n panes at startup, alternating right/down
+splits), `GHOST_ICED_FIXTURE='<cmd>'` (run `/bin/sh -c <cmd>` instead of a shell).
+
+Screenshots: the iced window's **class is empty** and its title is the shell's OSC title
+(so `jq 'select(.title|test(...))'` on "ghostwave" misses it — match the empty class or the
+geometry). Two grim quirks: `-g` takes the logical rect but the PNG comes back at the
+monitor's scale (1.25 here ⇒ a 1133x1382 request yields 1416x1727), and grim only captures
+the **visible** workspace — a window on another workspace yields the wallpaper/other windows.
+
+Pane logs: `<XDG_DATA_HOME>/ghostwave/panes/pane-<pid>-<nanos>.log`, written through
+`pane.rs::ingest` (the `poll_pty` replacement).
+
+### ghost-iced module map
+
+    main.rs        iced boot: Message, update, view, subscription, temporary binds, font registration
+    app.rs         AppState/Tab: tabs, split tree, cached rects, mode, wave energy/phase, toast,
+                   tick rates, split/close/focus (+ GHOST_ICED_PANES)
+    pane.rs        Pane { term, scratch, dirty, rx }: spawn, apply_theme, ingest/exited, key_press,
+                   scroll, resize, cell_dims
+    pty_bridge.rs  one bridge thread per pane, coalesces to 256 KiB, tags messages (tab, pane)
+    pane_canvas.rs one canvas for the window: panes (clipped per pane), frames+labels (clipped to
+                   the content rect), chrome call, tab + pane mouse hit tests
+    chrome.rs      tab bar, status bar + two-harmonic wave, toast — per CHROME-REFERENCE.md
+    measure.rs     text_width()/ascent() from fontdue (an iced canvas cannot measure text)
+    keys.rs        iced physical key -> ghostwave keymap::KeyPress (155 arms, mods, text)
+    fonts.rs       PRIMARY_BYTES + primary() + the fc-list fallback chain
+    tick.rs        conditional animation tick (iced 0.14 has no `time::every`)
+    CHROME-REFERENCE.md  line-cited chrome spec extracted from the macroquad render path
+
+### M3 plan (in order)
+
+1. Read `app.rs::handle_key` (~2149-2560) plus `keymap::{handle, global_binds, entry_bind,
+   is_quit}` and mirror its `Dispatch` -> effects mapping in `ghost-iced/app.rs` as
+   `apply(action)`.
+2. Add the mode/pending-prefix state (the app enters PANE mode on the `Ctrl+p` prefix) and
+   DELETE the temporary Alt+Shift/Alt+arrow binds in main.rs.
+3. Route keys mode-first: mode dispatch -> Action -> apply; only a normal/unlocked key goes to
+   the pane's VT encoder (`Pane::key_press` already mirrors `app.rs::handle_key`).
+4. Key release + repeat: iced gives `KeyReleased` and `repeat: bool`, libghostty's `key::Action`
+   has Press/Release/Repeat — needed for kitty keyboard protocol parity (`keys.rs` currently
+   emits presses only).
+5. Per-pane mouse reporting (`TermPane::handle_mouse` is pub, takes rect/cell/padding/event);
+   the selection gesture itself is M6.
+
+Verification for M3: the status pill and hint line must change on `Ctrl+p`, `Esc` must exit a
+mode, `Ctrl+o`/`Ctrl+g`/`Ctrl+q` must behave as in the app, and `Ctrl+p d` must split.
+
+### Open items / risks
+
+- **The wave's drawing is unexercised.** At 1133px the reference's own guard
+  (`wave_end_x > wave_start_x + 50` after the 115-char NORMAL hints ~897px) skips it — in BOTH
+  builds, verified by capture. Exercise it on a maximized window.
+- **Idle perf unmeasured.** The 8 FPS idle wave tick means iced has not yet been *shown* to beat
+  the macroquad 8 FPS idle tier; M7 measures before any default-binary flip.
+- **Kitty graphics untried** (canvas image handling is iced's weak spot; open perf issue for
+  large images). Highest-risk remaining item.
+- Not started: selection + copy, search overlay, command palette, session manager, tab context
+  menu, preview/visualizer panes.
+- iced renders every text item above every shape in a `Frame`; that is why the frame/label pass
+  is clipped to the content rect, and it also means the cursor sits behind its glyph.
+- **Decision checkpoint**: continue M3 + M4; if the keymap/Action port stays clean, M5 + M6; take
+  M7's numbers; flip the default binary only after M6-minus-kitty parity. The macroquad
+  front-end stays in the repo until then — a wipe-and-continue with macroquad remains a live
+  option and nothing here forecloses it.
+
+## 14. M1 / M2 notes (2026-09-16, later the same day)
 
 M1 landed: `ghost-iced/src/app.rs` is the iced-side session state (tabs, the split
 tree from `ghostwave::layout`, cached pane rects). Verified on the live pty: three
