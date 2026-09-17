@@ -132,7 +132,7 @@ beside it are the iced front-end.
 - `src/app.rs` — app state: tabs, panes, layout, floats
 - `src/ui_session.rs` — named sessions wired into the front-end
 - `src/pane.rs`, `src/pane_canvas.rs`, `src/panes_grid.rs` — panes and their painting
-- `src/chrome.rs`, `src/chrome_widgets.rs`, `src/measure.rs` — tab bar, status bar, toasts
+- `src/chrome_widgets.rs` — tab bar, status bar, toasts, built as widgets (`src/measure.rs` serves the pane painter)
 - `src/input.rs`, `src/keys.rs` — key/mouse dispatch
 - `src/scratchpad.rs` — the F12 scratchpad and the float list
 - `src/visualizer.rs`, `src/ai.rs`, `src/preview.rs` — content panes

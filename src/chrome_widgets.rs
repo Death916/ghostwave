@@ -16,7 +16,18 @@ use crate::app::AppState;
 use crate::ui_fonts;
 use crate::Message;
 
-pub use crate::chrome::WaveParams;
+/// Parameters for the status-bar wave, so the widget does not need the state.
+#[derive(Clone, Copy, Debug)]
+pub struct WaveParams {
+    /// Wave energy, expected between 0.1 and 2.5. Drives the amplitude and,
+    /// through `min(energy / 2.0, 1.0)`, the stroke alpha.
+    pub energy: f32,
+    /// Phase in radians; the caller advances and wraps it.
+    pub phase: f32,
+    /// Amplitude scale for the ribbons (1.0 is the default):
+    /// `max_amp = sh * 0.35 * amplitude`, clamped to 2..=10 px.
+    pub amplitude: f32,
+}
 
 /// Tab label font size in px.
 pub const TAB_LABEL_PX: f32 = 14.0;

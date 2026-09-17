@@ -23,7 +23,6 @@
 //! zellij-style stack, of which the active member is drawn and typed into.
 //! Floating panes are out of scope.
 
-use ghostwave::theme::{STATUS_BAR_H, TAB_BAR_H};
 use ghostwave::layout::SplitDir;
 use ghostwave::term::{CellDims, MouseEv, MouseEvKind};
 use ghostwave::theme::Theme as GhostTheme;
@@ -40,7 +39,7 @@ use crate::app::{AppState, GridPane, Tab};
 use crate::ui_fonts;
 use crate::keys;
 use crate::pane::{ContentPane, PaneEntry, PaneId, SharedPane};
-use crate::pane_canvas::{self, CanvasState, ChromeData, TerminalCanvas};
+use crate::pane_canvas::{self, CanvasState};
 
 /// Gutter between neighbouring cells, in px.
 pub const SPACING: f32 = 4.0;

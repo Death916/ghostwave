@@ -6,14 +6,13 @@ use ghostwave::config::Config;
 use ghostwave::keymap::Action;
 use iced::{
     keyboard,
-    widget::{container, pane_grid, Stack},
+    widget::{pane_grid, Stack},
     Background, Element, Fill, Length, Padding, Size, Subscription, Task,
 };
 use libghostty_vt::key;
 
 mod app;
 pub mod ai;
-mod chrome;
 pub mod chrome_widgets;
 mod ui_config;
 mod ui_fonts;
@@ -38,7 +37,6 @@ pub mod visualizer;
 
 use app::AppState;
 use pane::PaneEntry;
-use pane_canvas::ChromeData;
 
 /// Cell metrics are measured from it and the canvas draws text with it.
 const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono-Medium.ttf");
@@ -582,38 +580,6 @@ impl App {
                 handle.lock().unwrap().mouse_tracking().then_some(index)
             })
             .collect();
-        let chrome = ChromeData {
-            tabs: self
-                .state
-                .tabs
-                .iter()
-                .enumerate()
-                .map(|(i, t)| (t.label(i), i == self.state.active_tab))
-                .collect(),
-            mode_label: self.state.mode.label().to_string(),
-            hints: self.state.mode.hints().to_string(),
-            theme_name: self.state.config.theme.clone(),
-            sync_panes: tab.sync_panes,
-            wave: self.state.config.visual_wave.then_some(chrome::WaveParams {
-                energy: self.state.wave_energy,
-                phase: self.state.wave_phase,
-                amplitude: self.state.config.wave_amplitude,
-            }),
-            toast: self.state.toast.as_ref().map(|(m, _)| m.clone()),
-            rename: match self.state.mode {
-                ghostwave::keymap::Mode::RenameTab => {
-                    Some(("Tab".to_string(), self.state.rename_buf.clone()))
-                }
-                ghostwave::keymap::Mode::RenamePane => {
-                    Some(("Pane".to_string(), self.state.rename_buf.clone()))
-                }
-                ghostwave::keymap::Mode::RenameSession => {
-                    Some(("Session".to_string(), self.state.rename_buf.clone()))
-                }
-                _ => None,
-            },
-        };
-
         let base = panes_grid::view(&self.state, mouse_tracking);
         let floats = self.float_layer();
         // The window is a column of bands — tab bar, panes, status bar. A Stack is

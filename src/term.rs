@@ -15,11 +15,10 @@ use libghostty_vt::{
     Terminal, TerminalOptions,
     alloc::Bytes,
     key::{self, Key, Mods},
-    kitty::graphics::{self, Graphics, Layer, PlacementIterator},
+    kitty::graphics::{self},
     mouse,
-    render::{CellIterator, Dirty, RenderState, RowIterator},
+    render::{CellIterator, RenderState, RowIterator},
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
-    style::RgbColor,
     terminal::{
         ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
         PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
@@ -32,9 +31,8 @@ use libghostty_vt::{
 use crate::{
     clipboard,
     layout::Rect,
-    pty::{Child, Pty, PtyError, WinSize},
+    pty::{Child, Pty, WinSize},
     search::SearchState,
-    theme::Theme,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -86,7 +84,6 @@ pub struct TermPane {
     render_state: RenderState<'static>,
     row_it: RowIterator<'static>,
     cell_it: CellIterator<'static>,
-    placement_it: PlacementIterator<'static>,
     key_encoder: key::Encoder<'static>,
     key_event: key::Event<'static>,
     mouse_encoder: mouse::Encoder<'static>,
@@ -107,12 +104,8 @@ pub struct TermPane {
     pub exited: Option<String>,
     /// Force full repaint next frame (selection/search/scroll changes).
     pub force_repaint: bool,
-    last_rect: Option<Rect>,
     last_mouse: (f32, f32),
     scroll_active: bool,
-    /// Cursor blink phase (terminal reports cursor_blinking from modes).
-    blink_on: bool,
-    last_blink: std::time::Instant,
     /// Spawn info (for session restore).
     pub program: Option<String>,
     pub args: Vec<String>,
@@ -283,14 +276,12 @@ impl TermPane {
         let render_state = RenderState::new()?;
         let row_it = RowIterator::new()?;
         let cell_it = CellIterator::new()?;
-        let placement_it = PlacementIterator::new()?;
 
         Ok(Self {
             term,
             render_state,
             row_it,
             cell_it,
-            placement_it,
             key_encoder,
             key_event,
             mouse_encoder,
@@ -308,11 +299,8 @@ impl TermPane {
             search: SearchState::default(),
             exited: None,
             force_repaint: true,
-            last_rect: None,
             last_mouse: (0.0, 0.0),
             scroll_active: false,
-            blink_on: true,
-            last_blink: std::time::Instant::now(),
             program: shell.map(String::from),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.map(String::from),

@@ -293,18 +293,15 @@ impl AsyncPaneLog {
             .spawn(move || {
                 use std::io::Write;
                 let mut writer = std::io::BufWriter::with_capacity(65536, file);
-                let mut bytes_since_trunc = 0u64;
 
                 while let Ok(msg) = rx.recv() {
                     match msg {
                         LogMsg::Write(data) => {
                             let _ = writer.write_all(&data);
-                            bytes_since_trunc += data.len() as u64;
                         }
                         LogMsg::Seed(data) => {
                             let _ = writer.write_all(&data);
                             let _ = writer.flush();
-                            bytes_since_trunc += data.len() as u64;
                         }
                         LogMsg::Truncate(cap) => {
                             let _ = writer.flush();
@@ -312,7 +309,6 @@ impl AsyncPaneLog {
                             if let Ok(f) = std::fs::OpenOptions::new().append(true).open(&path) {
                                 writer = std::io::BufWriter::with_capacity(65536, f);
                             }
-                            bytes_since_trunc = cap;
                         }
                         LogMsg::Flush => {
                             let _ = writer.flush();

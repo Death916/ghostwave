@@ -184,6 +184,9 @@ impl SearchState {
     }
 }
 
+/// Whether the match at `start..end` sits on a word boundary. Exercised by the
+/// tests below; the search path itself does not use it.
+#[cfg(test)]
 fn is_word_boundary(text: &str, start: usize, end: usize) -> bool {
     let before = text[..start].chars().next_back();
     let after = text[end..].chars().next();

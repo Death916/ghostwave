@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{channel, RecvTimeoutError};
+use std::sync::mpsc::channel;
 use std::sync::Mutex;
 use std::time::Duration;
 use arboard::{Clipboard, GetExtLinux, LinuxClipboardKind, SetExtLinux};

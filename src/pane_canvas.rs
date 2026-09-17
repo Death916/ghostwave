@@ -2,19 +2,15 @@
 //! per-cell fg/bg, text, underline/strikethrough, cursor, then the pane frames
 //! and their labels. Rects are canvas-local coordinates.
 
-use ghostwave::theme::TAB_BAR_H;
 use ghostwave::term::CellDims;
 use ghostwave::theme::Theme as GhostTheme;
-use iced::widget::canvas::{self, Action, Event, Frame, Geometry, Text as CanvasText};
+use iced::widget::canvas::{Frame, Text as CanvasText};
 use iced::widget::text;
-use iced::{Color, Font, Pixels, Point, Rectangle, Renderer, Size, Theme, alignment, mouse};
+use iced::{Color, Font, Pixels, Point, Rectangle, Size, alignment, mouse};
 
 use libghostty_vt::render::{CursorVisualStyle, Dirty};
 use libghostty_vt::style::{RgbColor, Underline};
 
-use crate::Message;
-use crate::chrome::{self, ChromeState, WaveParams};
-use crate::ui_fonts;
 use crate::pane::{Pane, SharedPane};
 
 use libghostty_vt::mouse as vt_mouse;
@@ -43,12 +39,6 @@ const BAR_GLYPH: char = '\u{258F}';
 const UNDERLINE_GLYPH: char = '\u{2581}';
 /// The glyph for struck-through cells.
 const STRIKE_GLYPH: char = '\u{2500}';
-
-/// Paints the window chrome: tab bar, status bar, wave, toast and overlays.
-pub struct TerminalCanvas {
-    pub theme: GhostTheme,
-    pub chrome: ChromeData,
-}
 
 /// Accumulates the `any_pressed` / `button_down` fields of [`MouseEv`] from the
 /// event stream, which is what the app crate's mouse encoder reads.
@@ -88,92 +78,6 @@ pub(crate) fn vt_button(button: mouse::Button) -> Option<vt_mouse::Button> {
         mouse::Button::Right => Some(vt_mouse::Button::Right),
         mouse::Button::Middle => Some(vt_mouse::Button::Middle),
         _ => None,
-    }
-}
-
-/// Holds an owned snapshot of the chrome's state, turned into a borrowed
-/// [`ChromeState`] at [`chrome::paint`] time.
-pub struct ChromeData {
-    /// (label, is_active), in tab order.
-    pub tabs: Vec<(String, bool)>,
-    pub mode_label: String,
-    pub hints: String,
-    pub theme_name: String,
-    pub sync_panes: bool,
-    pub wave: Option<WaveParams>,
-    pub toast: Option<String>,
-    /// `(what, buffer)` while a rename mode is active — "Tab" or "Pane", and the
-    /// text so far.
-    pub rename: Option<(String, String)>,
-}
-
-impl TerminalCanvas {
-    /// Returns the tab whose `TAB_W` px chip contains `point.x`; `None` outside
-    /// the bar or past the last tab.
-    fn tab_at(&self, point: Point) -> Option<usize> {
-        const TAB_W: f32 = 130.0;
-        if point.y >= TAB_BAR_H || point.x < 0.0 {
-            return None;
-        }
-        let index = (point.x / TAB_W) as usize;
-        (index < self.chrome.tabs.len()).then_some(index)
-    }
-}
-
-impl canvas::Program<Message> for TerminalCanvas {
-    type State = CanvasState;
-
-    fn update(
-        &self,
-        _state: &mut Self::State,
-        event: &Event,
-        _bounds: Rectangle,
-        cursor: mouse::Cursor,
-    ) -> Option<Action<Message>> {
-        match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let point = cursor.position()?;
-                if let Some(index) = self.tab_at(point) {
-                    Some(Action::publish(Message::FocusTab(index)))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn draw(
-        &self,
-        _state: &Self::State,
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        let font = ui_fonts::primary();
-
-        if let Some((what, buffer)) = &self.chrome.rename {
-            chrome::paint_rename_prompt(&mut frame, bounds.size(), what, buffer, &self.theme, font);
-        }
-        chrome::paint(
-            &mut frame,
-            bounds.size(),
-            font,
-            &self.theme,
-            &ChromeState {
-                tabs: &self.chrome.tabs,
-                mode_label: &self.chrome.mode_label,
-                hints: &self.chrome.hints,
-                theme_name: &self.chrome.theme_name,
-                sync_panes: self.chrome.sync_panes,
-                wave: self.chrome.wave,
-                toast: self.chrome.toast.as_deref(),
-            },
-        );
-
-        vec![frame.into_geometry()]
     }
 }
 

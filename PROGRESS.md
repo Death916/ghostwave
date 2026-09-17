@@ -12,7 +12,13 @@ Binary name: `ghostwave`
 
 ## STATUS: main terminal features solid — render/mouse/keybinds fixed, parity work in progress
 
+> **Where the front-end lives now (2026-09-17):** the iced build *is* the root crate — `src/main.rs`
+> and the modules beside it — and `ghost-iced/` no longer exists. The journal below is ordered
+> oldest-first, so entries refer to paths as they were when written. The retired macroquad front-end
+> is archived on branch `macroquad-archive` / tag `macroquad-final`.
+
 **iced front-end WIP (branch `feat/iced-frontend`)**: a second front-end in
+
 `ghost-iced/` renders a full tab (panes, frames, tab bar, status bar, wave, toast) from the same
 terminal core, drives every keymap mode, and — as of M5a (parts 1 & 2) — keeps its layout and view
 in iced's own `pane_grid::PaneGrid`, with per-cell canvas, rounded-origin subpixel anti-blur,
