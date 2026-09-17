@@ -52,6 +52,8 @@ pub struct Pane {
     pub term: TermPane,
     pub scratch: RenderScratch,
     pub dirty: bool,
+    /// Last bounds laid out and painted by iced.
+    pub last_bounds: Option<iced::Rectangle>,
     /// The pane's pty output stream, already bridged into iced.
     pub rx: PtyRxSlot,
 }
@@ -104,6 +106,7 @@ impl Pane {
             term,
             scratch: RenderScratch::new()?,
             dirty: true,
+            last_bounds: None,
             rx: pty_bridge::spawn(id, rx),
         })
     }

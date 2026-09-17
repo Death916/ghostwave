@@ -12,10 +12,11 @@ Binary name: `ghostwave`
 
 ## STATUS: main terminal features solid — render/mouse/keybinds fixed, parity work in progress
 
-**iced front-end WIP (branch `feat/iced-frontend`, commit `6b0807c`)**: a second front-end in
+**iced front-end WIP (branch `feat/iced-frontend`)**: a second front-end in
 `ghost-iced/` renders a full tab (panes, frames, tab bar, status bar, wave, toast) from the same
-terminal core, drives every keymap mode, and — as of M5a part 1 — keeps its layout in iced's own
-`pane_grid::State`, with the macroquad tree format demoted to the session save/load shape (19/19
+terminal core, drives every keymap mode, and — as of M5a (parts 1 & 2) — keeps its layout and view
+in iced's own `pane_grid::PaneGrid`, with per-cell canvas, rounded-origin subpixel anti-blur,
+stack-aware title bars, dynamic sizing from iced bounds, and warning-free compilation (22/22
 tests pass). Not merged; the macroquad build is still the default binary and the reference.
 **Start with `ghost-iced/HANDOFF.md`** (brief for the next session), then
 `ghost-iced/PORT-PLAN.md` §13 (status), §16 (direction change), §17 (Plan A + the M5a parity
@@ -164,7 +165,7 @@ The user's read on the two builds: iced's text looks sharper and is preferred, a
 stays reversible — a wipe and continue with macroquad remains a live option until iced
 reaches parity.
 
-### iced front-end, M3 + M5a part 1 (branch `feat/iced-frontend`) — input parity, then the pane layer moved into iced
+### iced front-end, M3 + M5a (branch `feat/iced-frontend`) — input parity, pane layer, and pane view in iced
 
 **M3 (input parity)** — `input.rs` mirrors the reference's `keymap::handle`/`execute` as an iced
 message handler: pane/tab/resize/move/scroll/lock modes, the globals, `Ctrl+q`, and a toast for
@@ -183,15 +184,27 @@ the way: closing a stacked pane left the focus on the closed pane, because `pop_
 mutated the cell's payload before `focused_id()` looked the cell up by the pane it no longer
 contained. 19/19 tests pass, `ghost-iced` compiles warning-free.
 
-**Why the pane layer moved**: the first cut derived a `pane_grid::State` from our tree and kept the
-tree authoritative; iced pairs its panes with layout children positionally, so in that state
-`on_click` reported the first pane for every click (measured: a press in the right cell published
-`Pane(0)`) and focus snapped to the wrong pane. Using the widget as a renderer for a tree it does
-not own was the bug — the grid owns the layout now (PORT-PLAN §17).
+**M5a part 2 (the pane view)** — the pane layer view is now fully iced-native:
+- `panes_grid.rs`: borrows `tab.grid` directly, iterating over cells and building `pane_grid::PaneGrid`
+  without an intermediate cache.
+- Title bar with 16px label band when frames are enabled (`theme.frame`/`theme.frame_active` outline,
+  `theme.tab_bg` text), stack count indication `[active/total]`.
+- 4px gutter, `.on_click` wired to focus active `PaneId`, `.on_resize`/`.on_drag` wired to `GridResize`/`GridDrag`.
+- Legacy multi-pane layer from `TerminalCanvas` and `GHOST_ICED_PANEGRID` knob deleted. `TerminalCanvas`
+  reduced to background/chrome rendering layered above the grid.
+- Dynamic sizing from iced layout: canvas records bounds drawn with, update path converts bounds to
+  cols/rows via `bounds_to_cols_rows` and calls `resize(cols, rows, cell)`. `AppState::pane_rects()` deleted.
+- Subpixel offset origin rounding: canvas paints each pane from rounded origin `(bounds.x.round(), bounds.y.round())`
+  by passing subpixel offset `Point::new(bounds.x.round() - bounds.x, bounds.y.round() - bounds.y)` into
+  `paint_pane` to eliminate subpixel glyph blur.
+- Mouse wheel & key scrolling fixed: normalized Wayland winit pixel scroll delta so discrete ~15px clicks
+  never truncate to 0, added `cursor.position_over(bounds)` hit testing per pane, and added `Shift+Up`/`Down`
+  line scrolling in Normal mode alongside `Shift+PageUp`/`PageDown` page scrolling.
+- Pure-function and integration unit tests: `bounds_to_cols_rows` (normal, fractional `556.80005`, degenerate/too-small),
+  stack label string formatting, click→focused-pane mapping, and live scrollback viewport movement under keys. All 22/22 tests pass.
+- `ghost-iced` compiles completely warning-free.
 
-**Next**: M5a part 2, the pane view — per-cell canvas of the active member, stack-aware title bars,
-`on_click` focus, drag-resize and drag-move, ptys sized from the bounds iced actually lays out, and
-rounded pane origins for sharp text. Brief and exact commands: `ghost-iced/HANDOFF.md`.
+**Next**: M5b (chrome and overlays as widgets — tab bar, status bar, palette, toast) and M4 (tabs and sessions save/restore).
 
 ### Idle GPU, part 2 (branch `perf/idle-gpu-2`) — idle frame tier 30 → 8 FPS
 User: "gpu usage is pretty high even when idle still" after the earlier adaptive

@@ -15,56 +15,22 @@ use libghostty_vt::style::{RgbColor, Underline};
 use crate::Message;
 use crate::chrome::{self, ChromeState, WaveParams};
 use crate::fonts;
-use crate::keys;
 use crate::pane::{Pane, SharedPane};
 
-use ghostwave::term::{MouseEv, MouseEvKind};
 use libghostty_vt::mouse as vt_mouse;
 
 /// Label font size in px; the pane-grid layer's title band uses it too.
 pub(crate) const LABEL_PX: f32 = 13.0;
-/// Advance of the label face at `LABEL_PX`, in px. Used only to size the label's
-/// background band, since the canvas cannot measure text.
-const LABEL_ADVANCE: f32 = 7.8;
 /// Left/right inset of the label text inside its band, in px.
 pub(crate) const LABEL_PAD: f32 = 8.0;
 /// Width in px of the focused pane's frame stroke.
 pub(crate) const FRAME_ACTIVE_W: f32 = 2.0;
 /// Width in px of a frame stroke on a pane that is not focused.
 pub(crate) const FRAME_INACTIVE_W: f32 = 1.0;
-/// Label band height in px above a pane rect.
-const LABEL_H: f32 = 14.0;
 
-/// Paints one tab's terminal panes, their frames and the chrome.
+/// Paints the window chrome: tab bar, status bar, wave, toast and overlays.
 pub struct TerminalCanvas {
-    /// Tab these panes belong to, so mouse events can be tagged.
-    pub tab: usize,
-    pub panes: Vec<(usize, SharedPane)>,
-    /// Pane rects (the active tab's), in canvas-local coordinates.
-    pub rects: Vec<(usize, Rectangle)>,
-    pub active: usize,
-    pub cell: CellDims,
-    pub font_px: f32,
-    pub padding: f32,
-    pub show_frames: bool,
-    /// Whether this canvas paints the window background. False for the
-    /// chrome-only layer that sits above the pane grid, which would otherwise
-    /// cover every pane it is meant to overlay.
-    pub paint_background: bool,
     pub theme: GhostTheme,
-    /// Content area (window minus the tab bar and status bar), in canvas
-    /// coordinates. Pane frames and labels are clipped to it: iced renders every
-    /// text item above every shape in a `Frame`, so without the clip a top-row
-    /// pane label would float over the tab bar instead of being covered by it.
-    pub content: Rectangle,
-    /// Panes whose application currently tracks the mouse.
-    ///
-    /// Cursor motion is delivered by iced continuously; forwarding every move
-    /// would mean locking every pane on every pixel, so motion is only handed to
-    /// a pane that either has a button down or is tracking the mouse. The list is
-    /// snapshotted when the view is rebuilt.
-    pub mouse_tracking: Vec<usize>,
-    /// Everything the chrome needs, owned: the canvas is rebuilt every view.
     pub chrome: ChromeData,
 }
 
@@ -143,82 +109,19 @@ impl canvas::Program<Message> for TerminalCanvas {
 
     fn update(
         &self,
-        state: &mut Self::State,
+        _state: &mut Self::State,
         event: &Event,
         _bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<Action<Message>> {
         match event {
-            Event::Mouse(mouse::Event::ButtonPressed(button)) => {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let point = cursor.position()?;
-                // The tab bar is drawn over the panes, so it gets first claim on
-                // a press.
                 if let Some(index) = self.tab_at(point) {
-                    return Some(Action::publish(Message::FocusTab(index)));
+                    Some(Action::publish(Message::FocusTab(index)))
+                } else {
+                    None
                 }
-                let (pane, rect) = self.pane_at(point)?;
-                let pressed = vt_button(*button)?;
-                // Track the iced button, so release matching and the vt mapping
-                // stay one list.
-                state.press(*button);
-                Some(Action::publish(self.mouse_message(
-                    pane,
-                    rect,
-                    point,
-                    MouseEvKind::Press(pressed),
-                    state,
-                )))
-            }
-            Event::Mouse(mouse::Event::ButtonReleased(button)) => {
-                let point = cursor.position()?;
-                let (pane, rect) = self.pane_at(point)?;
-                let released = vt_button(*button)?;
-                state.release(*button);
-                Some(Action::publish(self.mouse_message(
-                    pane,
-                    rect,
-                    point,
-                    MouseEvKind::Release(released),
-                    state,
-                )))
-            }
-            // Motion is the hot path: iced reports every pixel, so it only goes
-            // to a pane that is tracking the mouse or has a button down.
-            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                let point = cursor.position()?;
-                let (pane, rect) = self.pane_at(point)?;
-                if !state.any_pressed() && !self.mouse_tracking.contains(&pane) {
-                    return None;
-                }
-                Some(Action::publish(self.mouse_message(
-                    pane,
-                    rect,
-                    point,
-                    MouseEvKind::Motion,
-                    state,
-                )))
-            }
-            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                let point = cursor.position()?;
-                let (pane, rect) = self.pane_at(point)?;
-                // libghostty takes the wheel as a positive-up delta and decides
-                // for itself whether that is application mouse reporting or a
-                // viewport scroll; the app's own scale is one notch per line, so
-                // pixel deltas are divided down.
-                let dy = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => *y,
-                    mouse::ScrollDelta::Pixels { y, .. } => *y / 53.0,
-                };
-                if dy == 0.0 {
-                    return None;
-                }
-                Some(Action::publish(self.mouse_message(
-                    pane,
-                    rect,
-                    point,
-                    MouseEvKind::Wheel(dy),
-                    state,
-                )))
             }
             _ => None,
         }
@@ -235,53 +138,6 @@ impl canvas::Program<Message> for TerminalCanvas {
         let mut frame = Frame::new(renderer, bounds.size());
         let font = fonts::primary();
 
-        // Window background: it shows through everywhere the panes do not cover,
-        // including the frame gutters. It is drawn inside its own region because
-        // a `Frame`'s own primitives are flushed after every draft, so a direct
-        // fill here would paint over the panes and their frames; `with_clip` is
-        // the only way to draw beneath them.
-        if self.paint_background {
-            frame.with_clip(bounds, |f| {
-                f.fill_rectangle(
-                    Point::new(bounds.x, bounds.y),
-                    Size::new(bounds.width, bounds.height),
-                    rgb(self.theme.bg),
-                );
-            });
-        }
-
-        for (id, rect) in &self.rects {
-            let Some(pane) = self.panes.iter().find(|(p, _)| p == id).map(|(_, p)| p) else {
-                continue;
-            };
-            let mut guard = pane.lock().unwrap();
-            let pane: &mut Pane = &mut guard;
-            let rect = *rect;
-            let cell = self.cell;
-            let padding = self.padding;
-            let font_px = self.font_px;
-            frame.with_clip(rect, |f| {
-                paint_pane(f, pane, rect, cell, padding, font_px, font);
-            });
-            guard.dirty = false;
-        }
-
-        if self.show_frames {
-            // Clipped to the content area, for the reason given on that field.
-            let content = self.content;
-            let rects = self.rects.clone();
-            let active = self.active;
-            let theme = self.theme;
-            let labels: Vec<String> = rects.iter().map(|(id, _)| self.label_for(*id)).collect();
-            frame.with_clip(content, |f| {
-                for ((id, rect), label) in rects.iter().zip(labels.iter()) {
-                    paint_frame(f, *rect, *id == active, &theme, label, font);
-                }
-            });
-        }
-
-        // Chrome last, so it paints over the pane content; the rename prompt is
-        // drawn with it, geometrically clear of both bars.
         if let Some((what, buffer)) = &self.chrome.rename {
             chrome::paint_rename_prompt(&mut frame, bounds.size(), what, buffer, &self.theme, font);
         }
@@ -305,74 +161,30 @@ impl canvas::Program<Message> for TerminalCanvas {
     }
 }
 
-impl TerminalCanvas {
-    /// Returns the pane id and rect under `point`, in canvas-local coordinates.
-    fn pane_at(&self, point: Point) -> Option<(usize, Rectangle)> {
-        self.rects
-            .iter()
-            .find(|(_, rect)| rect.contains(point))
-            .map(|(id, rect)| (*id, *rect))
-    }
-
-    fn mouse_message(
-        &self,
-        pane: usize,
-        rect: Rectangle,
-        point: Point,
-        kind: MouseEvKind,
-        state: &CanvasState,
-    ) -> Message {
-        Message::Mouse {
-            tab: self.tab,
-            pane,
-            // A click focuses what it lands on, and the same event is still fed
-            // to the pane under the cursor.
-            focus: pane != self.active,
-            ev: MouseEv {
-                kind,
-                // Pane-local logical px, which is what the mouse encoder takes.
-                x: point.x - rect.x,
-                y: point.y - rect.y,
-                any_pressed: state.any_pressed(),
-                button_down: state.button_down(),
-            },
-            mods: keys::current_mods(),
-        }
-    }
-
-    /// Returns the pane label as `name index — title`, with the title omitted
-    /// when empty.
-    fn label_for(&self, id: usize) -> String {
-        let Some(pane) = self.panes.iter().find(|(p, _)| *p == id).map(|(_, p)| p) else {
-            return String::new();
-        };
-        // 1-based position in the tab's rect list.
-        let index = self
-            .rects
-            .iter()
-            .position(|(p, _)| *p == id)
-            .map(|i| i + 1)
-            .unwrap_or(id);
-        pane_label(pane, index)
+/// Formats a pane or stack cell label with 1-based index and optional stack info.
+pub fn format_pane_label(
+    name: &str,
+    index: usize,
+    title: &str,
+    stack: Option<(usize, usize)>,
+) -> String {
+    let base_name = if name.is_empty() { "pane" } else { name };
+    let stack_suffix = match stack {
+        Some((active, total)) if total > 1 => format!(" [{}/{}]", active + 1, total),
+        _ => String::new(),
+    };
+    if title.is_empty() {
+        format!("{base_name} {index}{stack_suffix}")
+    } else {
+        format!("{base_name} {index}{stack_suffix} — {title}")
     }
 }
 
-/// Returns a pane's label as `name index — title`, with the title omitted when it
-/// is empty and `index` the pane's 1-based position in the tab.
-pub(crate) fn pane_label(pane: &SharedPane, index: usize) -> String {
+/// Returns a cell's label string from its pane handle, 1-based position and optional stack info.
+pub fn cell_label(pane: &SharedPane, index: usize, stack: Option<(usize, usize)>) -> String {
     let guard = pane.lock().unwrap();
     let t = &guard.term;
-    let name = if t.name.is_empty() {
-        "pane".to_string()
-    } else {
-        t.name.clone()
-    };
-    let title = t.title();
-    if title.is_empty() {
-        format!("{name} {index}")
-    } else {
-        format!("{name} {index} — {title}")
-    }
+    format_pane_label(&t.name, index, &t.title(), stack)
 }
 
 /// Paints one pane's terminal content into `rect`, in frame-local coordinates.
@@ -568,53 +380,6 @@ struct TextRun {
     text: String,
 }
 
-/// Draws a pane's frame and label: the stroke sits 2 px outside the pane rect,
-/// so it lands in the inset gutter, and is 2 px wide when the pane is focused
-/// and 1 px otherwise, with a filled label band above it.
-fn paint_frame(
-    frame: &mut Frame,
-    rect: Rectangle,
-    active: bool,
-    theme: &GhostTheme,
-    label: &str,
-    font: Font,
-) {
-    if label.is_empty() {
-        return;
-    }
-    let color = rgb(if active {
-        theme.frame_active
-    } else {
-        theme.frame
-    });
-    let width = if active {
-        FRAME_ACTIVE_W
-    } else {
-        FRAME_INACTIVE_W
-    };
-
-    frame.stroke_rectangle(
-        Point::new(rect.x - 2.0, rect.y - 2.0),
-        Size::new(rect.width + 4.0, rect.height + 4.0),
-        canvas::Stroke::default().with_color(color).with_width(width),
-    );
-
-    let text = format!(" {label} ");
-    let band_w = text.chars().count() as f32 * LABEL_ADVANCE + LABEL_PAD;
-    let band_y = rect.y - LABEL_H;
-    frame.fill_rectangle(Point::new(rect.x - 2.0, band_y), Size::new(band_w, LABEL_H), color);
-    frame.fill_text(CanvasText {
-        content: text,
-        position: Point::new(rect.x, band_y + 2.0),
-        color: rgb(theme.tab_bg),
-        size: Pixels(LABEL_PX),
-        font,
-        align_x: alignment::Horizontal::Left.into(),
-        align_y: alignment::Vertical::Top,
-        shaping: text::Shaping::Advanced,
-        ..CanvasText::default()
-    });
-}
 
 fn draw_run(frame: &mut Frame, run: &TextRun, font_px: f32, font: Font) {
     if run.text.is_empty() {

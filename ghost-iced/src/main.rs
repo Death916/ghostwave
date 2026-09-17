@@ -5,8 +5,8 @@
 use ghostwave::config::Config;
 use iced::{
     keyboard,
-    widget::{canvas::Canvas, pane_grid},
-    Element, Fill, Point, Rectangle, Size, Subscription, Task,
+    widget::pane_grid,
+    Element, Size, Subscription, Task,
 };
 use libghostty_vt::key;
 
@@ -26,7 +26,7 @@ mod tick;
 
 use app::AppState;
 use pane::SharedPane;
-use pane_canvas::{ChromeData, TerminalCanvas};
+use pane_canvas::ChromeData;
 
 /// Cell metrics are measured from it and the canvas draws text with it.
 const FONT_BYTES: &[u8] = include_bytes!("../../assets/JetBrainsMono-Medium.ttf");
@@ -55,14 +55,13 @@ pub enum Message {
     Tick,
     /// Focuses the tab whose chip was clicked in the tab bar.
     FocusTab(usize),
-    /// A pane-local mouse event: the canvas resolved which pane it landed in. The
-    /// pane's own mouse encoder then decides whether it goes to the application
-    /// (when it tracks the mouse) or into selection / viewport scrolling.
+    /// Focuses a pane by its tab-local index.
+    FocusPane(usize),
+    /// A pane-local mouse event: forwarded into the application (when it tracks
+    /// the mouse) or into selection / viewport scrolling.
     Mouse {
         tab: usize,
         pane: usize,
-        /// Focus this pane before feeding it the event.
-        focus: bool,
         ev: ghostwave::term::MouseEv,
         /// Modifier state for the pane's encoder; iced's mouse events do not
         /// carry it.
@@ -149,24 +148,31 @@ impl App {
                     self.state.relayout();
                 }
             }
+            Message::FocusPane(index) => self.state.focus(index),
             Message::Mouse {
                 tab,
                 pane,
-                focus,
                 ev,
                 mods,
             } => {
-                if focus && tab == self.state.active_tab {
-                    self.state.focus(pane);
-                }
-                let rect = self
-                    .state
-                    .pane_rects()
-                    .into_iter()
-                    .find(|(id, _)| *id == pane)
-                    .map(|(_, rect)| rect);
-                if let (Some(rect), Some(pane)) = (rect, self.state.pane_mut(tab, pane)) {
-                    pane.lock().unwrap().mouse_event(
+                if let Some(pane_ref) = self.state.pane_mut(tab, pane) {
+                    let mut guard = pane_ref.lock().unwrap();
+                    let (w, h) = guard
+                        .last_bounds
+                        .map(|b| (b.width, b.height))
+                        .unwrap_or_else(|| {
+                            (
+                                (guard.term.cols as u32 * self.state.cell.w) as f32,
+                                (guard.term.rows as u32 * self.state.cell.h) as f32,
+                            )
+                        });
+                    let rect = ghostwave::layout::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w,
+                        h,
+                    };
+                    guard.mouse_event(
                         rect,
                         self.state.cell,
                         self.state.config.padding,
@@ -259,49 +265,7 @@ impl App {
             },
         };
 
-        // Two pane layers over one session: the canvas layer paints the tab's panes
-        // and the chrome on one canvas, the pane-grid layer hands the panes to iced
-        // and keeps the canvas for the chrome alone.
-        if self.state.pane_grid {
-            return panes_grid::view(&self.state, panes, mouse_tracking, chrome);
-        }
-
-        Canvas::new(TerminalCanvas {
-            tab: self.state.active_tab,
-            panes,
-            // The canvas layer draws its own frames around these, so they are the
-            // pane layer's rects for the active tab's grid.
-            rects: self
-                .state
-                .pane_rects()
-                .into_iter()
-                .map(|(id, rect)| {
-                    (
-                        id,
-                        Rectangle::new(
-                            Point::new(rect.x, rect.y),
-                            Size::new(rect.w.max(1.0), rect.h.max(1.0)),
-                        ),
-                    )
-                })
-                .collect(),
-            active: tab.active,
-            cell: self.state.cell,
-            font_px: self.state.config.font_size,
-            padding: self.state.config.padding,
-            show_frames: self.state.show_frames,
-            paint_background: true,
-            theme: self.state.theme,
-            content: {
-                let c = self.state.content();
-                Rectangle::new(Point::new(c.x, c.y), Size::new(c.w.max(1.0), c.h.max(1.0)))
-            },
-            chrome,
-            mouse_tracking,
-        })
-        .width(Fill)
-        .height(Fill)
-        .into()
+        panes_grid::view(&self.state, panes, mouse_tracking, chrome)
     }
 
     fn subscription(&self) -> Subscription<Message> {

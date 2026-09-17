@@ -10,9 +10,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use ghostwave::app::{STATUS_BAR_H, TAB_BAR_H};
 use ghostwave::config::Config;
-use ghostwave::layout::{Dir, Rect, SplitDir};
+use ghostwave::layout::{Dir, SplitDir};
 use ghostwave::term::CellDims;
 use ghostwave::theme::{self, Theme};
 use iced::Size;
@@ -20,10 +19,6 @@ use iced::widget::pane_grid::{self, Axis, Split};
 
 use crate::pane::{Pane, PaneId, SharedPane};
 use crate::panes_grid;
-
-/// Inset, in px, of a pane's terminal area inside its grid cell in the canvas
-/// pane layer, which draws the frame stroke around the rect itself.
-const FRAME_INSET: f32 = 2.0;
 
 /// Ratios a resize keeps a split within, the same limits the canvas pane layer
 /// applies when it moves one.
@@ -150,11 +145,6 @@ impl Tab {
     /// The grid cell holding the focused pane.
     pub fn focused(&self) -> Option<pane_grid::Pane> {
         self.handle(self.active)
-    }
-
-    /// Identity of the pane the focused cell shows.
-    fn focused_id(&self) -> Option<PaneId> {
-        self.grid.get(self.focused()?).and_then(GridPane::active_id)
     }
 
     /// Focuses the pane with identity `id`, when the tab still holds it.
@@ -334,9 +324,6 @@ pub struct AppState {
     pub rename_buf: String,
     #[allow(dead_code)]
     pub rename_target: String,
-    /// `GHOST_ICED_PANEGRID`: the pane layer is iced's `pane_grid` rather than the
-    /// hand-rolled canvas.
-    pub pane_grid: bool,
     last_tick: std::time::Instant,
     window: Size,
 }
@@ -372,7 +359,6 @@ impl AppState {
             last_tab: None,
             rename_buf: String::new(),
             rename_target: String::new(),
-            pane_grid: panes_grid::enabled(),
             last_tick: std::time::Instant::now(),
             window,
         };
@@ -482,80 +468,16 @@ impl AppState {
         }
     }
 
-    /// The content area: the window minus the tab-bar and status-bar bands. It is
-    /// the area the active tab's grid is laid out in.
-    pub fn content(&self) -> Rect {
-        Rect {
-            x: 0.0,
-            y: TAB_BAR_H,
-            w: self.window.width.max(1.0),
-            h: (self.window.height - TAB_BAR_H - STATUS_BAR_H).max(1.0),
-        }
-    }
-
-    /// The rect every pane of the active tab occupies, in window coordinates.
-    ///
-    /// The grid decides, so this only reads its layout back. The inset is the
-    /// active pane layer's own: the `pane_grid` layer draws each terminal inside
-    /// the cell's frame gutter and below its title band, the canvas layer draws
-    /// its frame stroke around the rect itself. A zoomed pane takes the whole
-    /// content area; the other panes are not laid out while it is.
-    pub fn pane_rects(&self) -> Vec<(usize, Rect)> {
-        let content = self.content();
-        let frames = self.show_frames;
-        let tab = self.current();
-
-        if let Some(maximized) = tab.grid.maximized() {
-            let index = tab
-                .grid
-                .get(maximized)
-                .and_then(GridPane::active_id)
-                .and_then(|id| tab.index_of(id));
-            return index.map(|index| (index, content)).into_iter().collect();
-        }
-
-        let regions = tab.grid.layout().pane_regions(
-            panes_grid::spacing(frames),
-            panes_grid::MIN_SIZE,
-            Size::new(content.w.max(1.0), content.h.max(1.0)),
-        );
-        let (dx, dy) = if self.pane_grid {
-            let inset = panes_grid::inset(frames);
-            (inset, panes_grid::title_h(frames) + inset)
-        } else if frames {
-            (FRAME_INSET, FRAME_INSET)
-        } else {
-            (0.0, 0.0)
-        };
-
-        regions
-            .iter()
-            .filter_map(|(cell, region)| {
-                let id = tab.grid.get(*cell)?.active_id()?;
-                let index = tab.index_of(id)?;
-                Some((
-                    index,
-                    Rect {
-                        x: content.x + region.x + dx,
-                        y: content.y + region.y + dy,
-                        w: (region.width - 2.0 * dx).max(1.0),
-                        h: (region.height - 2.0 * dy).max(1.0),
-                    },
-                ))
-            })
-            .collect()
-    }
-
-    /// Sizes every pane's terminal from the grid's own layout; must be called
-    /// after any window resize or change to the grid.
+    /// Sizes every pane's terminal from its recorded bounds; a no-op when unchanged.
     pub fn relayout(&mut self) {
         let cell = self.cell;
         let pad = self.config.padding;
-        for (index, rect) in self.pane_rects() {
-            if let Some(pane) = self.tabs[self.active_tab].pane(index) {
-                let cols = ((rect.w - 2.0 * pad) / cell.w as f32).max(1.0) as u16;
-                let rows = ((rect.h - 2.0 * pad) / cell.h as f32).max(1.0) as u16;
-                pane.lock().unwrap().resize(cols, rows, cell);
+        for pane in self.current().panes.iter().flatten() {
+            let mut guard = pane.lock().unwrap();
+            if let Some(bounds) = guard.last_bounds {
+                let (cols, rows) =
+                    panes_grid::bounds_to_cols_rows(bounds.width, bounds.height, cell, pad);
+                guard.resize(cols, rows, cell);
             }
         }
     }

@@ -59,7 +59,19 @@ pub fn key_press(state: &mut AppState, kp: KeyPress, action: key::Action) {
                 state.mode = Mode::Normal;
             }
         }
-        Dispatch::Pass => send(state, &kp, action),
+        Dispatch::Pass => {
+            if state.mode == Mode::Normal {
+                if kp.key == key::Key::ArrowUp && kp.mods == Mods::SHIFT {
+                    execute(state, Action::ScrollUp(1));
+                    return;
+                }
+                if kp.key == key::Key::ArrowDown && kp.mods == Mods::SHIFT {
+                    execute(state, Action::ScrollDown(1));
+                    return;
+                }
+            }
+            send(state, &kp, action);
+        }
         Dispatch::Char(c) => match state.mode {
             Mode::RenameTab | Mode::RenamePane | Mode::RenameSession => {
                 state.rename_buf.push(c);
@@ -550,6 +562,27 @@ mod tests {
         assert_eq!(s.mode, Mode::Scroll);
         press(&mut s, Key::Escape, Mods::empty());
         assert_eq!(s.mode, Mode::Normal);
+
+        // Populate scrollback and verify Shift+PageUp / Shift+ArrowUp scroll viewport:
+        if let Some(pane) = s.active_pane() {
+            let mut guard = pane.lock().unwrap();
+            for i in 0..100 {
+                let _ = guard.term.term.vt_write(format!("line {}\r\n", i).as_bytes());
+            }
+        }
+        let sb_before = s.active_pane().unwrap().lock().unwrap().term.term.scrollbar().unwrap();
+        press(&mut s, Key::PageUp, Mods::SHIFT);
+        let sb_after = s.active_pane().unwrap().lock().unwrap().term.term.scrollbar().unwrap();
+        assert!(sb_after.offset < sb_before.offset, "Shift+PageUp must scroll upward");
+
+        press(&mut s, Key::ArrowUp, Mods::SHIFT);
+        let sb_line = s.active_pane().unwrap().lock().unwrap().term.term.scrollbar().unwrap();
+        assert!(sb_line.offset < sb_after.offset, "Shift+ArrowUp must scroll 1 line upward");
+
+        press(&mut s, Key::ArrowDown, Mods::SHIFT);
+        let sb_down = s.active_pane().unwrap().lock().unwrap().term.term.scrollbar().unwrap();
+        assert_eq!(sb_down.offset, sb_after.offset, "Shift+ArrowDown must scroll 1 line downward");
+
         // Ctrl+k clears the terminal; Ctrl+Shift+C has no selection to copy yet.
         ctrl(&mut s, Key::K);
         press(&mut s, Key::C, Mods::CTRL | Mods::SHIFT);
@@ -641,7 +674,7 @@ mod tests {
         let cell = s.current().focused().expect("a focused cell");
         ctrl(&mut s, Key::P);
         typed(&mut s, Key::X, 'x');
-        let ids: Vec<_> = s
+        let _ids: Vec<_> = s
             .current()
             .panes
             .iter()
