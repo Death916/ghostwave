@@ -129,6 +129,9 @@ struct App {
 static SELF_TEST_DRAG_DONE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the visualizer pane has already been opened by the debug hook.
+static VIZ_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl App {
     fn new() -> (Self, Task<Message>) {
         let config = Config::load();
@@ -227,6 +230,18 @@ impl App {
         }
     }
 
+    /// Opens the visualizer pane once, so its canvas can be exercised without a
+    /// pointer or key injection at the window. Enabled by `GHOST_ICED_VIZ`.
+    fn open_visualizer_once(&mut self) {
+        if std::env::var_os("GHOST_ICED_VIZ").is_none()
+            || VIZ_OPENED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        input::execute(&mut self.state, Action::Ghostwave);
+        eprintln!("[ghostwave] viz hook: visualizer pane opened");
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Output { id, data } => {
@@ -244,6 +259,7 @@ impl App {
             }
             Message::Resized(size) => self.state.set_window(size),
             Message::Tick => {
+                self.open_visualizer_once();
                 self.self_test_drag();
                 self.state.tick()
             }
@@ -588,7 +604,9 @@ impl App {
             chrome_widgets::tab_bar_for_state(&self.state),
             base,
             chrome_widgets::status_bar_for_state(&self.state),
-        ]);
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill);
         let mut layers: Vec<Element<'_, Message>> = Vec::new();
         if let Some(toast) = chrome_widgets::toast_for_state(&self.state) {
             layers.push(toast);

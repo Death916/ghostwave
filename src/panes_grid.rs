@@ -234,7 +234,7 @@ fn content_body<'a>(content: &'a ContentPane, inset: f32, theme: GhostTheme) -> 
                 msg => Message::Ai { id, msg },
             })
         }
-        ContentPane::Visualizer { pane, .. } => Canvas::new(pane).width(Fill).height(Fill).into(),
+        ContentPane::Visualizer { pane, .. } => pane.view::<Message>(&theme),
     };
     container(body)
         .width(Fill)

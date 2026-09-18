@@ -243,11 +243,23 @@ fn ai_key(pane: &mut AiPane, kp: &KeyPress) -> bool {
     }
 }
 
-/// Applies the visualizer's own key: `c` cycles its colour mode.
+/// Applies the visualizer's own key: `v`/`t` cycles visualizer style; `c`/Space cycles colour mode; `+`/`-` adjusts speed.
 fn visualizer_key(pane: &mut crate::visualizer::VisualizerPane, kp: &KeyPress) -> bool {
     match kp.text {
-        Some('c') => {
+        Some('v') | Some('t') => {
+            pane.cycle_viz_type();
+            true
+        }
+        Some('c') | Some(' ') => {
             pane.cycle_mode();
+            true
+        }
+        Some('+') | Some('=') => {
+            pane.speed_up();
+            true
+        }
+        Some('-') | Some('_') => {
+            pane.speed_down();
             true
         }
         _ => false,
