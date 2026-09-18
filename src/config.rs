@@ -6,6 +6,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Font family to use for terminal panes (defaults to bundled JetBrains Mono).
+    pub font_family: Option<String>,
     /// Font size in points (scaled by DPI at runtime).
     pub font_size: f32,
     /// Built-in theme name, see theme.rs
@@ -151,6 +153,7 @@ impl<'de> Deserialize<'de> for PaneTitleFormat {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            font_family: None,
             font_size: 12.0,
             theme: "tokyonight".into(),
             scrollback: 10_000,
@@ -218,6 +221,7 @@ mod tests {
         assert!((cfg.wave_speed - 1.0).abs() < 1e-6);
         assert!((cfg.wave_amplitude - 1.0).abs() < 1e-6);
         assert!(cfg.shell.is_none());
+        assert!(cfg.font_family.is_none());
     }
 
     #[test]
@@ -247,6 +251,7 @@ mod tests {
     fn all_fields_parse() {
         let cfg = parse_toml(
             r#"
+            font_family = "Fira Code"
             font_size = 13.5
             theme = "nord"
             scrollback = 5000
@@ -269,6 +274,7 @@ mod tests {
             system_prompt = "hello"
         "#,
         );
+        assert_eq!(cfg.font_family.as_deref(), Some("Fira Code"));
         assert!((cfg.font_size - 13.5).abs() < 1e-6);
         assert_eq!(cfg.theme, "nord");
         assert_eq!(cfg.scrollback, 5000);

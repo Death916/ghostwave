@@ -51,8 +51,8 @@ struct Shared {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellDims {
-    pub w: u32,
-    pub h: u32,
+    pub w: f32,
+    pub h: f32,
     /// Baseline offset within the cell: glyph baseline y = cell_top + baseline.
     /// Keeps glyphs and the block cursor aligned in the same cell.
     pub baseline: f32,
@@ -139,14 +139,14 @@ impl TermPane {
         remote: Option<RemoteSpec>,
     ) -> Result<Self> {
         let shared = Arc::new(Shared {
-            size: Mutex::new((cols, rows, cell.w, cell.h)),
+            size: Mutex::new((cols, rows, cell.w.round() as u32, cell.h.round() as u32)),
             effect_fd: Mutex::new(-1),
             ..Default::default()
         });
 
         // Ghostty's VT engine measures max_scrollback in BYTES, not lines.
         // Convert line count (< 1,000,000) to bytes (~1024 bytes/line, min 16MB),
-        // or pass through directly if already specified in bytes.
+        // or accept explicit byte budget if >= 1,000,000.
         let max_scrollback = if scrollback == 0 {
             0
         } else if scrollback < 1_000_000 {
@@ -168,8 +168,8 @@ impl TermPane {
                 WinSize {
                     cols,
                     rows,
-                    xpixel: (cols as u32 * cell.w) as u16,
-                    ypixel: (rows as u32 * cell.h) as u16,
+                    xpixel: (cols as f32 * cell.w).round() as u16,
+                    ypixel: (rows as f32 * cell.h).round() as u16,
                 },
                 shell,
                 args,
@@ -180,7 +180,6 @@ impl TermPane {
         } else {
             (None, None, None)
         };
-
         // Pane output log for durable sessions (asynchronously written and truncated).
         let log = crate::session::AsyncPaneLog::open(log_cap_bytes);
         let log_name = log.as_ref().map(|l| l.name.clone()).unwrap_or_default();
@@ -192,7 +191,7 @@ impl TermPane {
         *shared.effect_fd.lock().unwrap() = effect_fd;
         let shared_effects = shared.clone();
 
-        term.resize(cols, rows, cell.w, cell.h)?;
+        term.resize(cols, rows, cell.w.round() as u32, cell.h.round() as u32)?;
         term
             .set_kitty_image_storage_limit(64 * 1024 * 1024)?
             .set_kitty_image_from_file_allowed(true)?
@@ -387,14 +386,14 @@ impl TermPane {
         }
         self.cols = cols;
         self.rows = rows;
-        *self.shared.size.lock().unwrap() = (cols, rows, cell.w, cell.h);
-        self.term.resize(cols, rows, cell.w, cell.h)?;
+        *self.shared.size.lock().unwrap() = (cols, rows, cell.w.round() as u32, cell.h.round() as u32);
+        self.term.resize(cols, rows, cell.w.round() as u32, cell.h.round() as u32)?;
         if let Some(pty) = self.pty.as_ref() {
             pty.resize(WinSize {
                 cols,
                 rows,
-                xpixel: (cols as u32 * cell.w) as u16,
-                ypixel: (rows as u32 * cell.h) as u16,
+                xpixel: (cols as f32 * cell.w).round() as u16,
+                ypixel: (rows as f32 * cell.h).round() as u16,
             });
         }
         self.force_repaint = true;
@@ -557,8 +556,8 @@ impl TermPane {
             .set_size(mouse::EncoderSize {
                 screen_width: rect.w as u32,
                 screen_height: rect.h as u32,
-                cell_width: cell.w,
-                cell_height: cell.h,
+                cell_width: cell.w.round() as u32,
+                cell_height: cell.h.round() as u32,
                 padding_top: padding as u32,
                 padding_bottom: padding as u32,
                 padding_left: padding as u32,
@@ -754,8 +753,8 @@ impl TermPane {
 
     /// Grid point for a pane-local pixel position (clamped).
     pub fn grid_point(&self, px: f32, py: f32, rect: Rect, cell: CellDims, padding: f32) -> Point {
-        let x = ((px - rect.x - padding) / cell.w as f32).clamp(0.0, self.cols as f32) as u16;
-        let y = ((py - rect.y - padding) / cell.h as f32).clamp(0.0, self.rows as f32) as u32;
+        let x = ((px - rect.x - padding) / cell.w).clamp(0.0, self.cols as f32) as u16;
+        let y = ((py - rect.y - padding) / cell.h).clamp(0.0, self.rows as f32) as u32;
         Point::Viewport(PointCoordinate { x, y })
     }
 
@@ -911,8 +910,8 @@ impl SelectionState<'_> {
         let _ = rect;
         let max_col = cols.saturating_sub(1);
         let max_row = rows.saturating_sub(1);
-        let px = ((x - padding) / cell.w as f32).clamp(0.0, max_col as f32) as u16;
-        let py = ((y - padding) / cell.h as f32).clamp(0.0, max_row as f32) as u32;
+        let px = ((x - padding) / cell.w).clamp(0.0, max_col as f32) as u16;
+        let py = ((y - padding) / cell.h).clamp(0.0, max_row as f32) as u32;
         Point::Viewport(PointCoordinate { x: px, y: py })
     }
 
@@ -992,7 +991,7 @@ impl SelectionState<'_> {
         let grid_ref = terminal.grid_ref(point)?;
         let geometry = Geometry {
             columns: terminal.cols()?.into(),
-            cell_width: cell.w,
+            cell_width: cell.w.round() as u32,
             padding_left: padding as u32,
             screen_height: rect.h as u32,
         };
@@ -1128,7 +1127,7 @@ mod tests {
     /// the time the constructor returns.
     #[test]
     fn prime_drains_early_child_output() {
-        let cell = CellDims { w: 10, h: 26, baseline: 20.0 };
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
         let pane = TermPane::new(
             80,
             24,
@@ -1164,7 +1163,7 @@ mod tests {
 
     #[test]
     fn link_at_cell_detects_urls_and_files() {
-        let cell = CellDims { w: 10, h: 26, baseline: 20.0 };
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
         let mut pane = TermPane::new(
             80,
             24,
@@ -1197,7 +1196,7 @@ mod tests {
 
     #[test]
     fn selection_drag_autoscrolls_viewport() {
-        let cell = CellDims { w: 10, h: 20, baseline: 15.0 };
+        let cell = CellDims { w: 10.0, h: 20.0, baseline: 15.0 };
         let mut pane = TermPane::new(
             40,
             10,
@@ -1254,7 +1253,7 @@ mod tests {
 
     #[test]
     fn scroll_page_and_half_page_scroll_correct_direction() {
-        let cell = CellDims { w: 10, h: 26, baseline: 20.0 };
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
         let mut pane = TermPane::new(
             80,
             24,
@@ -1299,7 +1298,7 @@ mod tests {
 
     #[test]
     fn scrollback_line_count_converts_to_bytes_and_retains_history() {
-        let cell = CellDims { w: 10, h: 26, baseline: 20.0 };
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
         // 10,000 lines should convert to at least 10MB byte budget
         let mut pane = TermPane::new(
             80,

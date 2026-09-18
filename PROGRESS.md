@@ -1185,4 +1185,16 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   forwarding are identical to a docked pane — with a title band taken from the pane's cached title
   and a click target that focuses the pane. `the_scratchpad_float_is_visible_to_the_layer` pins the
   layer's inputs (one visible float, its pane in the tab, a non-zero rect, and hidden after F12).
+- **Terminal font resolution & monospace cell grid**:
+  (1) Resolved font family & weight mismatch in iced: `fontdb` reads Name ID 16 (`TYPOGRAPHIC_FAMILY`),
+  indexing `JetBrainsMono-Medium.ttf` as `"JetBrains Mono"` with `Weight::Medium`. The canvas previously
+  queried `"JetBrains Mono Medium"` with `Weight::Normal`, causing iced to silently fall back to
+  system proportional fonts (Fira Sans/Cantarell).
+  (2) Fixed `score_family` in `src/ui_fonts.rs` to reject non-monospace fonts (score 0 instead of 10),
+  preventing proportional fonts from polluting the terminal font stack.
+  (3) Converted `CellDims` width and height from `u32` to `f32` across `src/term.rs`, `src/pane.rs`,
+  and `src/panes_grid.rs` to eliminate rounding drift across large column counts.
+  (4) Added user configuration for `font_family` in `~/.config/ghostwave/config.toml` with automatic
+  font discovery via `fc-list`, exact cell metric calculation from the selected font, and graceful
+  fallback to the bundled JetBrains Mono.
 

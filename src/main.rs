@@ -39,7 +39,7 @@ use app::AppState;
 use pane::PaneEntry;
 
 /// Cell metrics are measured from it and the canvas draws text with it.
-const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono-Medium.ttf");
+pub const FONT_BYTES: &[u8] = ui_fonts::PRIMARY_BYTES;
 
 /// Replaced by the first `resize_events` message.
 const START_WINDOW: Size = Size::new(1200.0, 800.0);
@@ -135,11 +135,11 @@ static VIZ_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 impl App {
     fn new() -> (Self, Task<Message>) {
         let config = Config::load();
-        let cell = pane::cell_dims(FONT_BYTES, config.font_size, config.row_gap);
+        let cell = pane::cell_dims(ui_fonts::primary_bytes(), config.font_size, config.row_gap);
         let mut state = AppState::new(config, cell, START_WINDOW).expect("spawn the first pane");
         ui_session::restore_last(&mut state);
         eprintln!(
-            "[ghostwave] cell {}x{} px, baseline {}, theme {}, frames {}, session '{}', tab '{}' with {} pane(s)",
+            "[ghostwave] cell {:.2}x{:.1} px, baseline {:.1}, theme {}, frames {}, session '{}', tab '{}' with {} pane(s)",
             cell.w,
             cell.h,
             cell.baseline,
@@ -289,8 +289,8 @@ impl App {
                         .map(|b| (b.width, b.height))
                         .unwrap_or_else(|| {
                             (
-                                (guard.term.cols as u32 * self.state.cell.w) as f32,
-                                (guard.term.rows as u32 * self.state.cell.h) as f32,
+                                guard.term.cols as f32 * self.state.cell.w,
+                                guard.term.rows as f32 * self.state.cell.h,
                             )
                         });
                     let rect = ghostwave::layout::Rect {
@@ -724,11 +724,18 @@ fn key_listener(
 }
 
 fn main() -> iced::Result {
+    let config = Config::load();
+    ui_fonts::init(config.font_family.as_deref());
+
     let mut app = iced::application(App::new, App::update, App::view)
         .title(App::title)
         .subscription(App::subscription)
         .window_size(START_WINDOW)
         .font(ui_fonts::PRIMARY_BYTES);
+    if let Some(custom_bytes) = ui_fonts::custom_bytes() {
+        app = app.font(custom_bytes);
+    }
+    app = app.default_font(ui_fonts::primary());
     for (_family, bytes) in ui_fonts::fallback_bytes(12) {
         app = app.font(bytes);
     }

@@ -9,8 +9,8 @@ use fontdue::{Font, FontSettings};
 fn font() -> &'static Font {
     static FONT: OnceLock<Font> = OnceLock::new();
     FONT.get_or_init(|| {
-        Font::from_bytes(crate::FONT_BYTES, FontSettings::default())
-            .expect("fontdue: parse embedded font")
+        Font::from_bytes(crate::ui_fonts::primary_bytes(), FontSettings::default())
+            .expect("fontdue: parse primary font")
     })
 }
 

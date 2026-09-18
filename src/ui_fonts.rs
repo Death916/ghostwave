@@ -6,16 +6,87 @@
 use std::collections::HashSet;
 use std::fs;
 use std::process::Command;
+use std::sync::OnceLock;
 
 /// The face the cell metrics are measured from and the primary text font.
 pub const PRIMARY_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono-Medium.ttf");
 
-/// Returns the family name that resolves to [`PRIMARY_BYTES`] once it is registered.
-///
-/// iced/cosmic_text matches the typographic family (nameID 16, "JetBrains Mono"),
-/// not the file's nameID 1 ("JetBrains Mono Medium").
+static ACTIVE_FAMILY: OnceLock<String> = OnceLock::new();
+static ACTIVE_BYTES: OnceLock<Option<&'static [u8]>> = OnceLock::new();
+
+/// Initializes the primary font family and bytes from user config if provided.
+/// Falls back to bundled JetBrains Mono if omitted or not found.
+pub fn init(preferred_family: Option<&str>) {
+    if let Some(target) = preferred_family {
+        let target_clean = target.trim();
+        if !target_clean.is_empty() {
+            if let Some((family, bytes)) = resolve_family(target_clean) {
+                eprintln!("[ghostwave] custom font configured: {family}");
+                let leaked_bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+                let _ = ACTIVE_FAMILY.set(family);
+                let _ = ACTIVE_BYTES.set(Some(leaked_bytes));
+                return;
+            } else {
+                eprintln!("[ghostwave] font '{target_clean}' not found on system; falling back to bundled JetBrains Mono");
+            }
+        }
+    }
+    let _ = ACTIVE_FAMILY.set("JetBrains Mono".to_string());
+    let _ = ACTIVE_BYTES.set(None);
+}
+
+/// Returns the active primary font for iced canvas and widget text.
 pub fn primary() -> iced::Font {
-    iced::Font::with_name("JetBrains Mono")
+    let family = ACTIVE_FAMILY.get().map(|s| s.as_str()).unwrap_or("JetBrains Mono");
+    if family == "JetBrains Mono" {
+        iced::Font {
+            family: iced::font::Family::Name("JetBrains Mono"),
+            weight: iced::font::Weight::Medium,
+            stretch: iced::font::Stretch::Normal,
+            style: iced::font::Style::Normal,
+        }
+    } else {
+        iced::Font {
+            family: iced::font::Family::Name(Box::leak(family.to_string().into_boxed_str())),
+            weight: iced::font::Weight::Normal,
+            stretch: iced::font::Stretch::Normal,
+            style: iced::font::Style::Normal,
+        }
+    }
+}
+
+/// Returns the bytes of the primary font for cell dimension calculation.
+pub fn primary_bytes() -> &'static [u8] {
+    ACTIVE_BYTES.get().copied().flatten().unwrap_or(PRIMARY_BYTES)
+}
+
+/// Returns custom font bytes if a non-bundled font was loaded, so iced can register it.
+pub fn custom_bytes() -> Option<&'static [u8]> {
+    ACTIVE_BYTES.get().copied().flatten()
+}
+
+/// Resolves a font family name against `fc-list` output, matching case-insensitively.
+pub fn resolve_family(target: &str) -> Option<(String, Vec<u8>)> {
+    let target_lower = target.to_lowercase();
+    let fonts = discover_fonts();
+    // Try exact case-insensitive match first
+    for (path, family) in &fonts {
+        if family.to_lowercase() == target_lower {
+            if let Some(bytes) = load_font_bytes(path) {
+                return Some((family.clone(), bytes));
+            }
+        }
+    }
+    // Try substring/prefix match second
+    for (path, family) in &fonts {
+        let fam_lower = family.to_lowercase();
+        if fam_lower.starts_with(&target_lower) || fam_lower.contains(&target_lower) {
+            if let Some(bytes) = load_font_bytes(path) {
+                return Some((family.clone(), bytes));
+            }
+        }
+    }
+    None
 }
 
 /// Caps one file's size, bounding memory and parse time. A large variable or
@@ -53,7 +124,8 @@ pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
         if score <= 0 {
             continue;
         }
-        if family.to_lowercase() == PRIMARY_FAMILY {
+        let fam_lower = family.to_lowercase();
+        if fam_lower == PRIMARY_FAMILY || ACTIVE_FAMILY.get().is_some_and(|a| a.to_lowercase() == fam_lower) {
             continue;
         }
         let path_l = path.to_lowercase();
@@ -151,10 +223,17 @@ fn score_family(family: &str) -> i32 {
         70
     } else if has("noto emoji") {
         65
-    } else if has("mono") {
+    } else if has("mono")
+        || has("code")
+        || has("iosevka")
+        || has("hack")
+        || has("inconsolata")
+        || has("courier")
+        || has("consolas")
+    {
         50
     } else {
-        10
+        0
     }
 }
 
@@ -286,7 +365,8 @@ mod tests {
         assert_eq!(score_family("Noto Sans Symbols"), 75);
         assert_eq!(score_family("Symbola"), 70);
         assert_eq!(score_family("Noto Emoji"), 65);
-        assert_eq!(score_family("Fira Code"), 10);
+        assert_eq!(score_family("Fira Code"), 50);
+        assert_eq!(score_family("Fira Sans"), 0);
         assert!(score_family("Noto Color Emoji") <= 0);
     }
 

@@ -445,8 +445,8 @@ pub fn pixel_to_cell(
     cols: usize,
     rows: usize,
 ) -> (usize, usize) {
-    let cw = (cell.w as f32).max(1.0);
-    let ch = (cell.h as f32).max(1.0);
+    let cw = cell.w.max(1.0);
+    let ch = cell.h.max(1.0);
     let max_col = cols.saturating_sub(1);
     let max_row = rows.saturating_sub(1);
 
@@ -472,8 +472,8 @@ pub fn cell_to_pixel(
     padding: f32,
 ) -> (f32, f32) {
     (
-        padding + col as f32 * cell.w as f32,
-        padding + row as f32 * cell.h as f32,
+        padding + col as f32 * cell.w,
+        padding + row as f32 * cell.h,
     )
 }
 
@@ -536,8 +536,8 @@ mod tests {
     #[test]
     fn test_pixel_to_cell_conversions() {
         let cell = CellDims {
-            w: 8,
-            h: 16,
+            w: 8.0,
+            h: 16.0,
             baseline: 12.0,
         };
         let padding = 4.0;

@@ -70,7 +70,8 @@ cargo run
 
 `~/.config/ghostwave/config.toml` (created with defaults on first run):
 
-```toml
+# Appearance
+font_family = "JetBrains Mono" # optional system font name; defaults to bundled JetBrains Mono
 # font_size is in points (12 = 12pt, like ghostty/waveterm)
 font_size = 12.0
 theme = "tokyonight"

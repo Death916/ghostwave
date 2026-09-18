@@ -58,8 +58,8 @@ pub fn bounds_to_cols_rows(width: f32, height: f32, cell: CellDims, padding: f32
     if width.is_nan() || height.is_nan() {
         return (1, 1);
     }
-    let cols = ((width - 2.0 * padding) / cell.w as f32).max(1.0) as u16;
-    let rows = ((height - 2.0 * padding) / cell.h as f32).max(1.0) as u16;
+    let cols = ((width - 2.0 * padding) / cell.w).max(1.0) as u16;
+    let rows = ((height - 2.0 * padding) / cell.h).max(1.0) as u16;
     (cols.max(1), rows.max(1))
 }
 
@@ -530,8 +530,8 @@ mod tests {
     #[test]
     fn bounds_to_cols_rows_calculations() {
         let cell = CellDims {
-            w: 8,
-            h: 16,
+            w: 8.0,
+            h: 16.0,
             baseline: 12.0,
         };
         let padding = 6.0;

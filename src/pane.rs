@@ -701,7 +701,7 @@ pub fn shorten_home(path: &str) -> String {
     path.to_string()
 }
 
-/// Cell metrics from the embedded font: `cell_w = ceil('M' advance)`,
+/// Cell metrics from the embedded font: `cell_w = 'M' advance`,
 /// `cell_h = ceil(ascent + descent + row_gap)`, `baseline = ascent + row_gap / 2`.
 pub fn cell_dims(font_bytes: &[u8], font_px: f32, row_gap: f32) -> CellDims {
     let font = fontdue::Font::from_bytes(font_bytes, fontdue::FontSettings::default())
@@ -712,8 +712,8 @@ pub fn cell_dims(font_bytes: &[u8], font_px: f32, row_gap: f32) -> CellDims {
     let ascent = m.ascent;
     let descent = -m.descent;
     CellDims {
-        w: (font.metrics('M', font_px).advance_width).max(1.0).ceil() as u32,
-        h: (ascent + descent + row_gap).max(8.0).ceil() as u32,
+        w: (font.metrics('M', font_px).advance_width).max(1.0),
+        h: (ascent + descent + row_gap).max(8.0).ceil(),
         baseline: ascent + row_gap / 2.0,
     }
 }

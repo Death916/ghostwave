@@ -138,8 +138,8 @@ pub(crate) fn paint_pane(
         cell_it,
     } = scratch;
 
-    let cw = cell.w as f32;
-    let ch = cell.h as f32;
+    let cw = cell.w;
+    let ch = cell.h;
     let ox = rect.x + padding;
     let oy = rect.y + padding;
 
@@ -176,8 +176,6 @@ pub(crate) fn paint_pane(
             Ok(it) => it,
             Err(_) => continue,
         };
-        let mut run: Option<TextRun> = None;
-        let mut blocks: Vec<TextRun> = Vec::new();
         let sel_range = row
             .selection()
             .ok()
@@ -199,7 +197,7 @@ pub(crate) fn paint_pane(
             if c.graphemes_len().unwrap_or(0) > 0 {
                 let _ = c.graphemes_utf8(&mut text_buf);
                 strip_ignorables(&mut text_buf);
-                has_glyphs = !text_buf.is_empty();
+                has_glyphs = !text_buf.trim().is_empty();
                 if let Ok(Some(fg_c)) = c.fg_color() {
                     fg = to_color(fg_c);
                 }
@@ -237,65 +235,37 @@ pub(crate) fn paint_pane(
             }
 
             let baseline_y = y + cell.baseline;
-            if let Some(c_bg) = cell_bg {
-                push_block(&mut blocks, c_bg, x, baseline_y, BLOCK_GLYPH);
-            }
             if matched {
-                push_block(&mut blocks, match_band, x, baseline_y, BLOCK_GLYPH);
+                draw_glyph(frame, BLOCK_GLYPH, x, baseline_y, match_band, font_px, font);
                 fg = rgb(theme.bg);
             } else if selected {
-                push_block(&mut blocks, band, x, baseline_y, BLOCK_GLYPH);
-            }
-
-            let extends = match &run {
-                Some(r) => has_glyphs && r.color == fg && r.baseline_y == baseline_y,
-                None => false,
-            };
-            if extends {
-                if let Some(r) = run.as_mut() {
-                    r.text.push_str(&text_buf);
-                }
-            } else {
-                if let Some(r) = run.take() {
-                    flush_blocks(frame, &mut blocks, font_px, font);
-                    draw_run(frame, &r, font_px, font);
-                }
-                if has_glyphs {
-                    run = Some(TextRun {
-                        x,
-                        baseline_y,
-                        color: fg,
-                        text: text_buf.clone(),
-                    });
-                }
+                draw_glyph(frame, BLOCK_GLYPH, x, baseline_y, band, font_px, font);
+            } else if let Some(c_bg) = cell_bg {
+                draw_glyph(frame, BLOCK_GLYPH, x, baseline_y, c_bg, font_px, font);
             }
 
             if underline {
-                push_block(&mut blocks, fg, x, baseline_y, UNDERLINE_GLYPH);
+                draw_glyph(frame, UNDERLINE_GLYPH, x, baseline_y, fg, font_px, font);
             }
             if strikethrough {
-                push_block(&mut blocks, fg, x, baseline_y, STRIKE_GLYPH);
+                draw_glyph(frame, STRIKE_GLYPH, x, baseline_y, fg, font_px, font);
+            }
+
+            if has_glyphs {
+                draw_str(frame, &text_buf, x, baseline_y, fg, font_px, font);
             }
 
             x += cw;
             col_idx += 1;
         }
 
-        if let Some(r) = run.take() {
-            flush_blocks(frame, &mut blocks, font_px, font);
-            draw_run(frame, &r, font_px, font);
-        }
-        flush_blocks(frame, &mut blocks, font_px, font);
-
         if term.search.row_has_match(row_idx) {
-            draw_run(
+            draw_glyph(
                 frame,
-                &TextRun {
-                    x: ox - cw,
-                    baseline_y: y + cell.baseline,
-                    color: match_band,
-                    text: MARKER_GLYPH.to_string(),
-                },
+                MARKER_GLYPH,
+                ox - cw,
+                y + cell.baseline,
+                match_band,
                 font_px,
                 font,
             );
@@ -321,14 +291,12 @@ pub(crate) fn paint_pane(
             CursorVisualStyle::Underline => UNDERLINE_GLYPH,
             _ => BLOCK_GLYPH,
         };
-        draw_run(
+        draw_glyph(
             frame,
-            &TextRun {
-                x: cx,
-                baseline_y: cy + cell.baseline,
-                color: cursor_color,
-                text: glyph.to_string(),
-            },
+            glyph,
+            cx,
+            cy + cell.baseline,
+            cursor_color,
             font_px,
             font,
         );
@@ -348,49 +316,36 @@ pub(crate) fn paint_pane(
     let _ = snapshot.set_dirty(Dirty::Clean);
 }
 
-/// A horizontal run of cells sharing one foreground colour, drawn as a single
-/// text item so glyphs advance by the font's own advance instead of being pinned
-/// to the rounded-up cell width.
-struct TextRun {
+fn draw_glyph(
+    frame: &mut Frame,
+    glyph: char,
     x: f32,
     baseline_y: f32,
     color: Color,
-    text: String,
+    font_px: f32,
+    font: Font,
+) {
+    let mut buf = [0u8; 4];
+    let s = glyph.encode_utf8(&mut buf);
+    draw_str(frame, s, x, baseline_y, color, font_px, font);
 }
 
-
-/// Adds one block glyph to the row's pending blocks, merging with the previous one
-/// when it continues the same colour on the same line.
-fn push_block(blocks: &mut Vec<TextRun>, color: Color, x: f32, baseline_y: f32, glyph: char) {
-    match blocks.last_mut() {
-        Some(run) if run.color == color && run.baseline_y == baseline_y => run.text.push(glyph),
-        _ => blocks.push(TextRun {
-            x,
-            baseline_y,
-            color,
-            text: glyph.to_string(),
-        }),
-    }
-}
-
-/// Draws the row's pending blocks.
-///
-/// Called before the row's glyphs are drawn, so blocks land under the text they
-/// sit behind.
-fn flush_blocks(frame: &mut Frame, blocks: &mut Vec<TextRun>, font_px: f32, font: Font) {
-    for run in blocks.drain(..) {
-        draw_run(frame, &run, font_px, font);
-    }
-}
-
-fn draw_run(frame: &mut Frame, run: &TextRun, font_px: f32, font: Font) {
-    if run.text.is_empty() {
+fn draw_str(
+    frame: &mut Frame,
+    text: &str,
+    x: f32,
+    baseline_y: f32,
+    color: Color,
+    font_px: f32,
+    font: Font,
+) {
+    if text.is_empty() {
         return;
     }
     frame.fill_text(CanvasText {
-        content: run.text.clone(),
-        position: Point::new(run.x, run.baseline_y - crate::measure::ascent(font_px)),
-        color: run.color,
+        content: text.to_string(),
+        position: Point::new(x, baseline_y - crate::measure::ascent(font_px)),
+        color,
         size: Pixels(font_px),
         font,
         align_x: alignment::Horizontal::Left.into(),
