@@ -444,7 +444,7 @@ impl VisualizerPane {
         .center_y(Length::Fill);
 
         // Mountain Ridge & Neon Horizon Divider
-        let mountain_line = "      ▲         ▲       ━ ━     ◆     ▲   ━   ◆   ━   ▲       ▲   ━   ◆      ";
+        let mountain_line = "      ╱^╲___╱^^╲____╱^╲___╱^^^╲____╱^╲___╱^^╲      ";
         let mountains = iced::widget::container(
             iced::widget::text(mountain_line)
                 .size(12.0)
@@ -708,10 +708,24 @@ impl<Message> canvas::Program<Message> for VisualizerPane {
             let m_h = mountain_height(prog, self.time);
             let my = horizon - m_h;
 
-            // Mountain ridge peak glyphs
-            let peak_glyph = if i % 2 == 0 { "▲" } else { "━" };
+            // Continuous slope-following wireframe glyphs
+            let prev_h = mountain_height((i.saturating_sub(1)) as f32 / MOUNTAIN_POINTS as f32, self.time);
+            let next_h = mountain_height(((i + 1).min(MOUNTAIN_POINTS)) as f32 / MOUNTAIN_POINTS as f32, self.time);
+            let is_peak = m_h > prev_h && m_h > next_h && m_h > 4.0;
+            let slope = next_h - prev_h;
+
+            let ridge_glyph = if is_peak {
+                "^"
+            } else if slope > 0.8 {
+                "╱"
+            } else if slope < -0.8 {
+                "╲"
+            } else {
+                "─"
+            };
+
             frame.fill_text(CanvasText {
-                content: peak_glyph.to_string(),
+                content: ridge_glyph.to_string(),
                 position: Point::new(mx, my),
                 color: c_sec,
                 size: Pixels(11.0),
@@ -727,9 +741,9 @@ impl<Message> canvas::Program<Message> for VisualizerPane {
                 let ribs = (m_h / 12.0).ceil() as usize;
                 for r in 1..=ribs {
                     let ry = my + (r as f32 * 12.0).min(m_h - 2.0);
-                    let rib_alpha = (0.25 * (1.0 - (ry - my) / m_h)).clamp(0.08, 0.35);
+                    let rib_alpha = (0.20 * (1.0 - (ry - my) / m_h)).clamp(0.06, 0.28);
                     frame.fill_text(CanvasText {
-                        content: "┆".to_string(),
+                        content: "│".to_string(),
                         position: Point::new(mx, ry),
                         color: Color::from_rgba(c_sec.r, c_sec.g, c_sec.b, rib_alpha),
                         size: Pixels(10.0),
