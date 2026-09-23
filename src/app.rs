@@ -465,14 +465,31 @@ impl AppState {
         }
     }
 
-    /// Forks a pty pane for this front-end, themed but not yet in any tab.
+    /// The directory a new pane opens in: the focused pane's live working
+    /// directory, or `None` when there is none, which leaves the shell in the
+    /// app's own directory.
+    ///
+    /// The pane is read with `try_lock`, so the spawn path never waits on a lock
+    /// a caller may already hold.
+    pub(crate) fn spawn_cwd(&self) -> Option<String> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let pane = tab.pane(tab.active)?;
+        let dir = pane.try_lock().ok()?.term.pwd();
+        let path = std::path::Path::new(&dir);
+        (path.is_absolute() && path.is_dir()).then_some(dir)
+    }
+
+    /// Forks a pty pane for this front-end, themed but not yet in any tab,
+    /// starting in the focused pane's directory.
     pub(crate) fn spawn_pane(&self) -> Result<(PaneId, SharedPane)> {
+        let cwd = self.spawn_cwd();
         let mut pane = Pane::spawn(
             SPAWN_COLS,
             SPAWN_ROWS,
             self.cell,
             self.config.scrollback,
             self.config.max_log_mb * 1024 * 1024,
+            cwd.as_deref(),
         )?;
         pane.apply_theme(&self.theme);
         let id = pane.id;

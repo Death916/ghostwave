@@ -352,6 +352,7 @@ impl ScratchpadState {
             app.cell,
             app.config.scrollback,
             app.config.max_log_mb * 1024 * 1024,
+            app.spawn_cwd().as_deref(),
         );
 
         match spawn_res {

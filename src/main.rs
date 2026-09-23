@@ -13,6 +13,7 @@ use libghostty_vt::key;
 
 mod app;
 pub mod ai;
+mod autosave;
 pub mod chrome_widgets;
 mod ui_config;
 mod ui_fonts;
@@ -63,6 +64,10 @@ pub enum Message {
     /// Advances the wave and expires the toast; subscribed only while something
     /// is actually animating.
     Tick,
+    /// Writes the session file; published by the background autosave thread.
+    Autosave,
+    /// The window manager asked the window to close.
+    CloseRequested(iced::window::Id),
     /// Focuses the tab whose chip was clicked in the tab bar.
     FocusTab(usize),
     /// Focuses a pane by its tab-local index.
@@ -263,6 +268,8 @@ impl App {
                 self.self_test_drag();
                 self.state.tick()
             }
+            Message::Autosave => ui_session::save(&self.state),
+            Message::CloseRequested(_) => self.state.quit = true,
             Message::FocusTab(index) => {
                 if index < self.state.tabs.len() {
                     self.state.active_tab = index;
@@ -646,6 +653,8 @@ impl App {
         let mut subs = vec![
             iced::event::listen_with(key_listener),
             iced::window::resize_events().map(|(_id, size)| Message::Resized(size)),
+            iced::window::close_requests().map(Message::CloseRequested),
+            Subscription::run_with(autosave::Autosave, autosave::stream),
         ];
         match self.state.tick_rate() {
             app::TickRate::Off => {}
@@ -731,6 +740,8 @@ fn main() -> iced::Result {
         .title(App::title)
         .subscription(App::subscription)
         .window_size(START_WINDOW)
+        // Close requests reach the update loop, so the quit path saves first.
+        .exit_on_close_request(false)
         .font(ui_fonts::PRIMARY_BYTES);
     if let Some(custom_bytes) = ui_fonts::custom_bytes() {
         app = app.font(custom_bytes);

@@ -14,8 +14,9 @@
 //! drops its panes, closing their ptys, instead of keeping them alive in the
 //! background; a pane saved with a durable remote binding is not restored (this
 //! front-end has no ssh/ghostd panes, and the binding stays in the file for the
-//! macroquad build); and there is no continuous two-second autosave, so a session
-//! file is written on a switch, a delete, a detach and on quit.
+//! macroquad build); and the two-second autosave runs as a background
+//! subscription ([`crate::autosave`]), so a session file is written
+//! periodically as well as on a switch, a delete, a detach and on quit.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -357,10 +358,30 @@ fn adopt(state: &mut AppState, name: &str) {
 
 /// Serialises the tests that touch the shared data dir and the last-session
 /// marker: a crate's tests run in parallel threads, and both are process-wide.
+/// Taking it also isolates the data dir ([`isolate_data_dir`]).
 #[cfg(test)]
 pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    isolate_data_dir();
+    guard
+}
+
+/// Points `XDG_DATA_HOME` at a per-process temp dir, once, before any test reads
+/// a session.
+#[cfg(test)]
+fn isolate_data_dir() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("ghostwave-test-{}", std::process::id()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("ghostwave: tests could not create {}", dir.display());
+            return;
+        }
+        // SAFETY: set once, before this process performs any session call; every
+        // test that touches the session dir takes `test_lock` first.
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
+    });
 }
 
 #[cfg(test)]

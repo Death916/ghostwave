@@ -101,6 +101,8 @@ impl Pane {
     /// priming the shell's startup terminal probes; the pty receiver moves to a bridge
     /// thread that turns its output into an iced event ([`crate::pty_bridge`]).
     ///
+    /// `cwd` is the directory the shell starts in; `None` inherits the app's own.
+    ///
     /// `GHOST_ICED_FIXTURE` runs `/bin/sh -c <cmd>` in place of a shell.
     pub fn spawn(
         cols: u16,
@@ -108,6 +110,7 @@ impl Pane {
         cell: CellDims,
         scrollback_lines: usize,
         log_cap_bytes: u64,
+        cwd: Option<&str>,
     ) -> Result<Self> {
         let fixture = std::env::var("GHOST_ICED_FIXTURE")
             .ok()
@@ -128,7 +131,7 @@ impl Pane {
             cell,
             program,
             &args,
-            None,
+            cwd,
             scrollback_lines,
             log_cap_bytes,
             true,

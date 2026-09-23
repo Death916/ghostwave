@@ -1198,3 +1198,29 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   font discovery via `fc-list`, exact cell metric calculation from the selected font, and graceful
   fallback to the bundled JetBrains Mono.
 
+### iced front-end — session durability and pane cwd (branch `feat/widget-chrome`)
+- **Sessions are written every two seconds again.** `src/autosave.rs` publishes `Message::Autosave`
+  from its own thread and `main.rs` subscribes to it with `Subscription::run_with`, so the write does
+  not depend on the animation `Tick` (which is subscribed only while something animates). This is the
+  macroquad build's two-second save in `update()` (`macroquad-final:src/app.rs:2878`), which the port
+  had dropped — `ui_session.rs` documented its absence. `iced::time::every` is still not available in
+  iced 0.14 (no tokio/smol feature), which is why the period lives on a thread.
+- **A compositor kill bind now saves.** iced's `exit_on_close_request` defaults to `true`, so a
+  `CloseRequested` closed the window without ever reaching the app's save path — which is why Ctrl+Q
+  was the only reliable way to keep a session. The builder now sets it to `false` and subscribes to
+  `iced::window::close_requests()` → `Message::CloseRequested` → `quit = true`, reusing the existing
+  save-and-exit path.
+- **New panes open in the focused pane's directory.** `AppState::spawn_cwd()` reads the focused pane's
+  live working directory (`/proc/<pid>/cwd`, OSC 7 fallback, kept only if it is an absolute path that
+  still exists) and hands it to `Pane::spawn` → `Pty::new` → `Command::current_dir`. It covers split,
+  stacked split, new tab, tab reset and the F12 scratchpad; the app's first pane still inherits the
+  app's own directory. The pane is read with `try_lock`: the spawn path must never wait on a lock a
+  caller may already hold, which is the class of deadlock the pane lock has caused here before.
+- **The test suite was not hermetic, and that is what looked like five hung tests.** The suite ran
+  against the real `~/.local/share/ghostwave`: it created `iced-binds-*.json` there and deleted the
+  user's `default` session on the way out. A session test that opens `default` replays every pane log
+  through the VT engine, and one of those logs is at the 32 MiB cap, so the run spent minutes in
+  `replay_pane_log` with the test thread at 100% CPU — not blocked, just re-reading the user's own
+  output. `ui_session::test_lock()` now points `XDG_DATA_HOME` at a per-process temp dir before any
+  test reads a session. Full suite: 130 passed, 0 failed, 31.7 s.
+
