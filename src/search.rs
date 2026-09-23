@@ -66,18 +66,22 @@ impl SearchState {
         if self.matches.is_empty() {
             return;
         }
-        self.current = (self.current + 1) % self.matches.len();
+        if self.current + 1 < self.matches.len() {
+            self.current += 1;
+        } else if self.wrap {
+            self.current = 0;
+        }
     }
 
     pub fn prev_match(&mut self) {
         if self.matches.is_empty() {
             return;
         }
-        self.current = if self.current == 0 {
-            self.matches.len() - 1
-        } else {
-            self.current - 1
-        };
+        if self.current > 0 {
+            self.current -= 1;
+        } else if self.wrap {
+            self.current = self.matches.len() - 1;
+        }
     }
 
     #[inline]
@@ -180,6 +184,9 @@ impl SearchState {
     }
 }
 
+/// Whether the match at `start..end` sits on a word boundary. Exercised by the
+/// tests below; the search path itself does not use it.
+#[cfg(test)]
 fn is_word_boundary(text: &str, start: usize, end: usize) -> bool {
     let before = text[..start].chars().next_back();
     let after = text[end..].chars().next();
@@ -249,6 +256,32 @@ mod tests {
         assert_eq!(s.current, 2, "prev from 0 wraps to last");
         s.prev_match();
         assert_eq!(s.current, 1);
+    }
+
+    #[test]
+    fn next_prev_stop_at_the_ends_without_wrap() {
+        let mut s = SearchState::default();
+        s.wrap = false;
+        s.matches = vec![
+            Match {
+                row: 0,
+                col_start: 0,
+                col_end: 2,
+            },
+            Match {
+                row: 0,
+                col_start: 5,
+                col_end: 7,
+            },
+        ];
+        s.next_match();
+        assert_eq!(s.current, 1);
+        s.next_match();
+        assert_eq!(s.current, 1, "the last match is the end without wrap");
+        s.prev_match();
+        assert_eq!(s.current, 0);
+        s.prev_match();
+        assert_eq!(s.current, 0, "the first match is the end without wrap");
     }
 
     #[test]

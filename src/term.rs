@@ -15,11 +15,10 @@ use libghostty_vt::{
     Terminal, TerminalOptions,
     alloc::Bytes,
     key::{self, Key, Mods},
-    kitty::graphics::{self, Graphics, Layer, PlacementIterator},
+    kitty::graphics::{self},
     mouse,
-    render::{CellIterator, Dirty, RenderState, RowIterator},
+    render::{CellIterator, RenderState, RowIterator},
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
-    style::RgbColor,
     terminal::{
         ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
         PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
@@ -28,14 +27,12 @@ use libghostty_vt::{
     selection::FormatOptions,
 };
 
-use macroquad::prelude::{Color, color_u8};
 
 use crate::{
     clipboard,
     layout::Rect,
-    pty::{Child, Pty, PtyError, WinSize},
+    pty::{Child, Pty, WinSize},
     search::SearchState,
-    theme::Theme,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -54,8 +51,8 @@ struct Shared {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellDims {
-    pub w: u32,
-    pub h: u32,
+    pub w: f32,
+    pub h: f32,
     /// Baseline offset within the cell: glyph baseline y = cell_top + baseline.
     /// Keeps glyphs and the block cursor aligned in the same cell.
     pub baseline: f32,
@@ -87,7 +84,6 @@ pub struct TermPane {
     render_state: RenderState<'static>,
     row_it: RowIterator<'static>,
     cell_it: CellIterator<'static>,
-    placement_it: PlacementIterator<'static>,
     key_encoder: key::Encoder<'static>,
     key_event: key::Event<'static>,
     mouse_encoder: mouse::Encoder<'static>,
@@ -108,12 +104,8 @@ pub struct TermPane {
     pub exited: Option<String>,
     /// Force full repaint next frame (selection/search/scroll changes).
     pub force_repaint: bool,
-    last_rect: Option<Rect>,
     last_mouse: (f32, f32),
     scroll_active: bool,
-    /// Cursor blink phase (terminal reports cursor_blinking from modes).
-    blink_on: bool,
-    last_blink: std::time::Instant,
     /// Spawn info (for session restore).
     pub program: Option<String>,
     pub args: Vec<String>,
@@ -131,8 +123,6 @@ pub struct TermPane {
     pub log: Option<crate::session::AsyncPaneLog>,
     /// Optional cursor visual style override (from config).
     pub cursor_style: Option<libghostty_vt::render::CursorVisualStyle>,
-    /// GPU texture cache for Kitty graphics images (image_id -> (Texture2D, width, height, data_len)).
-    kitty_textures: std::collections::HashMap<u32, (macroquad::prelude::Texture2D, u32, u32, usize)>,
 }
 
 impl TermPane {
@@ -149,14 +139,14 @@ impl TermPane {
         remote: Option<RemoteSpec>,
     ) -> Result<Self> {
         let shared = Arc::new(Shared {
-            size: Mutex::new((cols, rows, cell.w, cell.h)),
+            size: Mutex::new((cols, rows, cell.w.round() as u32, cell.h.round() as u32)),
             effect_fd: Mutex::new(-1),
             ..Default::default()
         });
 
         // Ghostty's VT engine measures max_scrollback in BYTES, not lines.
         // Convert line count (< 1,000,000) to bytes (~1024 bytes/line, min 16MB),
-        // or pass through directly if already specified in bytes.
+        // or accept explicit byte budget if >= 1,000,000.
         let max_scrollback = if scrollback == 0 {
             0
         } else if scrollback < 1_000_000 {
@@ -178,8 +168,8 @@ impl TermPane {
                 WinSize {
                     cols,
                     rows,
-                    xpixel: (cols as u32 * cell.w) as u16,
-                    ypixel: (rows as u32 * cell.h) as u16,
+                    xpixel: (cols as f32 * cell.w).round() as u16,
+                    ypixel: (rows as f32 * cell.h).round() as u16,
                 },
                 shell,
                 args,
@@ -190,7 +180,6 @@ impl TermPane {
         } else {
             (None, None, None)
         };
-
         // Pane output log for durable sessions (asynchronously written and truncated).
         let log = crate::session::AsyncPaneLog::open(log_cap_bytes);
         let log_name = log.as_ref().map(|l| l.name.clone()).unwrap_or_default();
@@ -202,7 +191,7 @@ impl TermPane {
         *shared.effect_fd.lock().unwrap() = effect_fd;
         let shared_effects = shared.clone();
 
-        term.resize(cols, rows, cell.w, cell.h)?;
+        term.resize(cols, rows, cell.w.round() as u32, cell.h.round() as u32)?;
         term
             .set_kitty_image_storage_limit(64 * 1024 * 1024)?
             .set_kitty_image_from_file_allowed(true)?
@@ -286,14 +275,12 @@ impl TermPane {
         let render_state = RenderState::new()?;
         let row_it = RowIterator::new()?;
         let cell_it = CellIterator::new()?;
-        let placement_it = PlacementIterator::new()?;
 
         Ok(Self {
             term,
             render_state,
             row_it,
             cell_it,
-            placement_it,
             key_encoder,
             key_event,
             mouse_encoder,
@@ -311,11 +298,8 @@ impl TermPane {
             search: SearchState::default(),
             exited: None,
             force_repaint: true,
-            last_rect: None,
             last_mouse: (0.0, 0.0),
             scroll_active: false,
-            blink_on: true,
-            last_blink: std::time::Instant::now(),
             program: shell.map(String::from),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.map(String::from),
@@ -326,7 +310,6 @@ impl TermPane {
             log_name,
             log,
             cursor_style: None,
-            kitty_textures: std::collections::HashMap::new(),
         })
         .map(|mut pane| {
             if spawn {
@@ -403,14 +386,14 @@ impl TermPane {
         }
         self.cols = cols;
         self.rows = rows;
-        *self.shared.size.lock().unwrap() = (cols, rows, cell.w, cell.h);
-        self.term.resize(cols, rows, cell.w, cell.h)?;
+        *self.shared.size.lock().unwrap() = (cols, rows, cell.w.round() as u32, cell.h.round() as u32);
+        self.term.resize(cols, rows, cell.w.round() as u32, cell.h.round() as u32)?;
         if let Some(pty) = self.pty.as_ref() {
             pty.resize(WinSize {
                 cols,
                 rows,
-                xpixel: (cols as u32 * cell.w) as u16,
-                ypixel: (rows as u32 * cell.h) as u16,
+                xpixel: (cols as f32 * cell.w).round() as u16,
+                ypixel: (rows as f32 * cell.h).round() as u16,
             });
         }
         self.force_repaint = true;
@@ -573,8 +556,8 @@ impl TermPane {
             .set_size(mouse::EncoderSize {
                 screen_width: rect.w as u32,
                 screen_height: rect.h as u32,
-                cell_width: cell.w,
-                cell_height: cell.h,
+                cell_width: cell.w.round() as u32,
+                cell_height: cell.h.round() as u32,
                 padding_top: padding as u32,
                 padding_bottom: padding as u32,
                 padding_left: padding as u32,
@@ -601,7 +584,7 @@ impl TermPane {
                     self.selection.on_release(&self.term, ev.x, ev.y, rect, cell, padding)?;
                     let opts = FormatOptions::new().with_trim(true).with_unwrap(true);
                     if let Ok(Some(bytes)) = self.term.format_selection_alloc(None, opts) {
-                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        let text = String::from_utf8_lossy(bytes.as_ref()).into_owned();
                         if !text.is_empty() {
                             clipboard::write_primary_text(&text);
                         }
@@ -715,7 +698,7 @@ impl TermPane {
     pub fn copy_selection(&mut self) -> Result<bool> {
         let opts = FormatOptions::new().with_trim(true).with_unwrap(true);
         if let Some(bytes) = self.term.format_selection_alloc(None, opts)? {
-            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let text = String::from_utf8_lossy(bytes.as_ref()).into_owned();
             if !text.is_empty() {
                 self.term.set_selection(None)?;
                 self.force_repaint = true;
@@ -768,455 +751,10 @@ impl TermPane {
 
     // ---- rendering -------------------------------------------------------
 
-    /// Render this pane into `rect` (window-logical coords, but drawing is in
-    /// physical px via the global dpi scale handled by the caller's camera).
-    pub fn render(
-        &mut self,
-        rect: crate::layout::Rect,
-        cell: CellDims,
-        padding: f32,
-        font_stack: &crate::fonts::FontStack,
-        font_px: u16,
-        theme: Theme,
-        focused: bool,
-    ) -> Result<()> {
-        use macroquad::prelude::*;
-
-        // Pane-local draw origin (macroquad draws in physical px).
-        let (ox, oy) = (rect.x, rect.y);
-
-        self.last_rect = Some(rect);
-
-        let snapshot = self.render_state.update(&self.term)?;
-        let colors = snapshot.colors()?;
-
-        // Documented libghostty-vt pattern (ghostling-rs reference): draw the
-        // pane background every frame using the TERMINAL's default bg, then
-        // redraw ALL rows/cells every frame, then reset dirty flags. NOTE:
-        // per-row damage skipping is NOT possible against the swapchain —
-        // the GL backbuffer is not guaranteed to retain content between
-        // swaps (no buffer-age on Wayland/EGL), so skipping rows leaves
-        // black/garbage (the old flicker bug). Damage rendering would need
-        // an offscreen render target owned by the app (TODO, perf branch).
-        draw_rectangle(ox, oy, rect.w, rect.h, color(colors.background));
-
-        // Blink phase (updated here, once per frame — not per row).
-        if snapshot.cursor_blinking()? {
-            let now = std::time::Instant::now();
-            if now.duration_since(self.last_blink).as_millis() >= 500 {
-                self.blink_on = !self.blink_on;
-                self.last_blink = now;
-            }
-        }
-
-        {
-            // --- search pass: compute matches on current viewport ---
-            if self.search.active() && self.search.dirty {
-                let mut search_it = self.row_it.update(&snapshot)?;
-                self.search.matches.clear();
-                self.search.run_on_rows(&mut search_it)?;
-                self.search.dirty = false;
-            }
-
-            let mut row_it = self.row_it.update(&snapshot)?;
-
-            let mut y = oy + padding;
-            let mut row_idx: u32 = 0;
-            let mut text = String::with_capacity(32);
-
-            struct CellRun {
-                start_col: u16,
-                col_count: u16,
-                text: String,
-                draw_color: crate::theme::Rgb,
-                bg_color: Option<crate::theme::Rgb>,
-                bold: bool,
-                font_idx: usize,
-            }
-
-            let flush_run = |run: CellRun, y: f32| {
-                let rx = ox + padding + run.start_col as f32 * cell.w as f32;
-                let rw = run.col_count as f32 * cell.w as f32;
-                if let Some(bg) = run.bg_color {
-                    draw_rectangle(rx, y, rw, cell.h as f32, color_theme(bg));
-                }
-                if !run.text.is_empty() {
-                    let font = font_stack.get(run.font_idx);
-                    draw_text_ex(
-                        &run.text,
-                        rx,
-                        y + cell.baseline,
-                        TextParams {
-                            font: Some(font),
-                            font_size: font_px,
-                            color: color_theme(run.draw_color),
-                            ..Default::default()
-                        },
-                    );
-                    if run.bold {
-                        draw_text_ex(
-                            &run.text,
-                            rx + 1.0,
-                            y + cell.baseline,
-                            TextParams {
-                                font: Some(font),
-                                font_size: font_px,
-                                color: color_theme(run.draw_color),
-                                ..Default::default()
-                            },
-                        );
-                    }
-                }
-            };
-
-            while let Some(row) = row_it.next() {
-                let mut col_idx: u16 = 0;
-                let mut cell_it = self.cell_it.update(row)?;
-                let mut current_run: Option<CellRun> = None;
-
-                while let Some(c) = cell_it.next() {
-                    let selected = c.is_selected()?;
-                    let graphemes = c.graphemes_len()?;
-                    let bg_opt = c.bg_color()?;
-
-                    let (cell_text, font_idx, draw_color, bg_color, bold) = if graphemes == 0 {
-                        let bg = if selected {
-                            Some(theme.selection)
-                        } else {
-                            bg_opt.map(|bg| crate::theme::Rgb(bg.r, bg.g, bg.b))
-                        };
-                        (None, 0, theme.bg, bg, false)
-                    } else {
-                        text.clear();
-                        c.graphemes_utf8(&mut text)?;
-                        text.retain(|ch| {
-                            !matches!(
-                                ch,
-                                '\u{FE00}'..='\u{FE0F}'
-                                    | '\u{200B}'..='\u{200D}'
-                                    | '\u{2060}'
-                                    | '\u{FEFF}'
-                            )
-                        });
-                        let font_idx = font_stack.font_for(text.chars().next().unwrap_or(' '));
-                        let mut fg = crate::theme::Rgb(colors.foreground.r, colors.foreground.g, colors.foreground.b);
-                        let mut bg = theme.bg;
-                        let mut has_bg = false;
-                        let mut bold = false;
-
-                        if let Some(c) = c.fg_color()? {
-                            fg = crate::theme::Rgb(c.r, c.g, c.b);
-                        }
-                        if let Some(c) = bg_opt {
-                            bg = crate::theme::Rgb(c.r, c.g, c.b);
-                            has_bg = true;
-                        }
-
-                        if c.has_styling()? {
-                            let style = c.style()?;
-                            if style.inverse {
-                                std::mem::swap(&mut fg, &mut bg);
-                                has_bg = true;
-                            }
-                            bold = style.bold;
-                        }
-
-                        if selected {
-                            std::mem::swap(&mut fg, &mut bg);
-                            has_bg = true;
-                        }
-
-                        let matched = self.search.contains(row_idx, col_idx);
-                        let (draw_color, bg_color) = if matched {
-                            (theme.bg, Some(theme.search_match))
-                        } else if has_bg {
-                            (fg, Some(bg))
-                        } else {
-                            (fg, None)
-                        };
-
-                        (Some(text.as_str()), font_idx, draw_color, bg_color, bold)
-                    };
-
-                    let can_merge = match (&current_run, cell_text) {
-                        (Some(run), Some(_t)) => {
-                            run.font_idx == font_idx
-                                && run.draw_color == draw_color
-                                && run.bg_color == bg_color
-                                && run.bold == bold
-                                && (run.font_idx == 0 || run.text.is_empty())
-                        }
-                        (Some(run), None) => {
-                            run.bg_color == bg_color && run.text.is_empty()
-                        }
-                        (None, _) => false,
-                    };
-
-                    if can_merge {
-                        if let Some(run) = current_run.as_mut() {
-                            run.col_count += 1;
-                            if let Some(t) = cell_text {
-                                run.text.push_str(t);
-                            }
-                        }
-                    } else {
-                        if let Some(run) = current_run.take() {
-                            flush_run(run, y);
-                        }
-                        current_run = Some(CellRun {
-                            start_col: col_idx,
-                            col_count: 1,
-                            text: cell_text.unwrap_or("").to_string(),
-                            draw_color,
-                            bg_color,
-                            bold,
-                            font_idx,
-                        });
-                    }
-
-                    col_idx += 1;
-                }
-
-                if let Some(run) = current_run.take() {
-                    flush_run(run, y);
-                }
-
-                // Search match row marker on the left edge.
-                if self.search.row_has_match(row_idx) {
-                    draw_rectangle(
-                        ox + padding - 3.0,
-                        y + 2.0,
-                        2.0,
-                        cell.h as f32 - 4.0,
-                        color_theme(theme.search_match),
-                    );
-                }
-
-                row.set_dirty(false)?;
-                y += cell.h as f32;
-                row_idx += 1;
-            }
-
-            // Cursor (with blink: ghostty reports cursor_blinking from
-            // terminal modes; visibility phase updated above, before the
-            // damage decision, so phase flips trigger a repaint).
-            if snapshot.cursor_visible()?
-                && let Some(vp) = snapshot.cursor_viewport()?
-                && focused
-            {
-                let draw_cursor = self.blink_on || !snapshot.cursor_blinking()?;
-                let cursor_color = colors.cursor.unwrap_or(colors.foreground);
-                let style = match self.cursor_style {
-                    Some(s) => s,
-                    None => snapshot.cursor_visual_style()?,
-                };
-                let (cx, cy) = (
-                    ox + padding + vp.x as f32 * cell.w as f32,
-                    oy + padding + vp.y as f32 * cell.h as f32,
-                );
-                if draw_cursor {
-                    match style {
-                    libghostty_vt::render::CursorVisualStyle::Block => {
-                        draw_rectangle(cx, cy, cell.w as f32, cell.h as f32, color(cursor_color));
-                    }
-                    libghostty_vt::render::CursorVisualStyle::Bar => {
-                        draw_rectangle(cx, cy, 2.0, cell.h as f32, color(cursor_color));
-                    }
-                    libghostty_vt::render::CursorVisualStyle::Underline => {
-                        draw_rectangle(
-                            cx,
-                            cy + cell.h as f32 - 2.0,
-                            cell.w as f32,
-                            2.0,
-                            color(cursor_color),
-                        );
-                    }
-                    libghostty_vt::render::CursorVisualStyle::BlockHollow => {
-                        draw_rectangle_lines(
-                            cx,
-                            cy,
-                            cell.w as f32,
-                            cell.h as f32,
-                            1.0,
-                            color(cursor_color),
-                        );
-                    }
-                    _ => {}
-                    }
-                }
-            }
-        }
-
-        // Kitty graphics images
-        if let Ok(graphics) = self.term.kitty_graphics() {
-            // Prune textures if cache grows beyond a reasonable size
-            if self.kitty_textures.len() > 64 {
-                self.kitty_textures.retain(|id, _| graphics.image(*id).is_some());
-            }
-
-            Self::render_kitty_images(
-                &self.term,
-                &mut self.placement_it,
-                &mut self.kitty_textures,
-                &graphics,
-                Layer::BelowBg,
-                rect,
-                cell,
-                padding,
-            )?;
-            Self::render_kitty_images(
-                &self.term,
-                &mut self.placement_it,
-                &mut self.kitty_textures,
-                &graphics,
-                Layer::BelowText,
-                rect,
-                cell,
-                padding,
-            )?;
-            Self::render_kitty_images(
-                &self.term,
-                &mut self.placement_it,
-                &mut self.kitty_textures,
-                &graphics,
-                Layer::AboveText,
-                rect,
-                cell,
-                padding,
-            )?;
-        }
-
-        // Exited overlay — remote panes get a reconnect prompt instead of
-        // the generic message.
-        if let Some(msg) = &self.exited {
-            if let Some(remote) = &self.remote {
-                let status = match self.reconnect {
-                    ReconnectState::Waiting { attempt, .. } => {
-                        format!("reconnecting (attempt {attempt}) — Esc to stop")
-                    }
-                    ReconnectState::Manual => "disconnected — Enter connect | k kill remote | Esc dismiss".to_string(),
-                    ReconnectState::Idle => "disconnected".to_string(),
-                };
-                draw_rectangle(ox + 4.0, oy + 4.0, 520.0, 56.0, color_theme(theme.status_bg));
-                draw_rectangle_lines(ox + 4.0, oy + 4.0, 520.0, 56.0, 1.0, color_theme(theme.frame_active));
-                draw_text(
-                    &format!("ssh {} — session {}", remote.host, remote.session),
-                    ox + 14.0,
-                    oy + 28.0,
-                    16.0,
-                    color_theme(theme.status_fg),
-                );
-                draw_text(&status, ox + 14.0, oy + 50.0, 14.0, color_theme(theme.status_fg));
-            } else {
-                draw_rectangle(ox + 4.0, oy + 4.0, 260.0, 40.0, color_theme(theme.status_bg));
-                draw_text(&msg, ox + 12.0, oy + 28.0, 16.0, color_theme(theme.status_fg));
-            }
-        }
-
-        // Scrollbar
-        if let Ok(sb) = self.term.scrollbar() {
-            if sb.total > sb.len {
-                let area = (rect.h - 2.0 * padding).max(1.0);
-                let bar_h = area * (sb.len as f32 / sb.total.max(1) as f32);
-                let top_frac = sb.offset as f32 / sb.total.max(1) as f32;
-                let bar_y = oy + padding + top_frac * (area - bar_h);
-                draw_rectangle(ox + rect.w - 5.0, bar_y, 3.0, bar_h.max(8.0), color_theme(theme.frame_active));
-            }
-        }
-
-        // Bell flash
-        if self.shared.bell.swap(false, Ordering::Relaxed) {
-            draw_rectangle(ox, oy, rect.w, rect.h, Color::new(1.0, 1.0, 1.0, 0.08));
-        }
-
-        snapshot.set_dirty(Dirty::Clean)?;
-        Ok(())
-    }
-
-    fn render_kitty_images(
-        term: &Terminal<'static, 'static>,
-        placement_it: &mut PlacementIterator<'static>,
-        kitty_textures: &mut std::collections::HashMap<u32, (macroquad::prelude::Texture2D, u32, u32, usize)>,
-        graphics: &Graphics<'_>,
-        layer: Layer,
-        rect: crate::layout::Rect,
-        cell: CellDims,
-        padding: f32,
-    ) -> Result<()> {
-        use macroquad::prelude::*;
-        let mut placements = placement_it.update(graphics)?;
-        placements.set_layer(layer)?;
-
-        while let Some(placement) = placements.next() {
-            let image_id = placement.image_id()?;
-            let Some(image) = graphics.image(image_id) else { continue };
-            let info = placement.placement_render_info(&image, term)?;
-
-            if !info.viewport_visible
-                || info.pixel_width == 0
-                || info.pixel_height == 0
-                || info.grid_cols == 0
-                || info.grid_rows == 0
-            {
-                continue;
-            }
-            if image.format()? != graphics::ImageFormat::Rgba {
-                continue;
-            }
-            let image_width = image.width()?;
-            let image_height = image.height()?;
-            let data = image.data()?;
-            if data.len() < (image_width * image_height * 4) as usize {
-                continue;
-            }
-
-            let dest_size = vec2(
-                info.grid_cols as f32 * cell.w as f32,
-                info.grid_rows as f32 * cell.h as f32,
-            );
-            let x_offset = placement.x_offset()? as f32;
-            let y_offset = placement.y_offset()? as f32;
-
-            let entry = match kitty_textures.get_mut(&image_id) {
-                Some(cached) if cached.1 == image_width && cached.2 == image_height && cached.3 == data.len() => {
-                    cached.0.clone()
-                }
-                Some(cached) => {
-                    let tex = Texture2D::from_rgba8(image_width as u16, image_height as u16, data);
-                    *cached = (tex.clone(), image_width, image_height, data.len());
-                    tex
-                }
-                None => {
-                    let tex = Texture2D::from_rgba8(image_width as u16, image_height as u16, data);
-                    kitty_textures.insert(image_id, (tex.clone(), image_width, image_height, data.len()));
-                    tex
-                }
-            };
-
-            draw_texture_ex(
-                &entry,
-                rect.x + padding + info.viewport_col as f32 * cell.w as f32 + x_offset,
-                rect.y + padding + info.viewport_row as f32 * cell.h as f32 + y_offset,
-                WHITE,
-                DrawTextureParams {
-                    dest_size: Some(dest_size),
-                    source: Some(macroquad::prelude::Rect {
-                        x: info.source_x as f32,
-                        y: info.source_y as f32,
-                        w: info.source_width as f32,
-                        h: info.source_height as f32,
-                    }),
-                    ..Default::default()
-                },
-            );
-        }
-        Ok(())
-    }
-
     /// Grid point for a pane-local pixel position (clamped).
     pub fn grid_point(&self, px: f32, py: f32, rect: Rect, cell: CellDims, padding: f32) -> Point {
-        let x = ((px - rect.x - padding) / cell.w as f32).clamp(0.0, self.cols as f32) as u16;
-        let y = ((py - rect.y - padding) / cell.h as f32).clamp(0.0, self.rows as f32) as u32;
+        let x = ((px - rect.x - padding) / cell.w).clamp(0.0, self.cols as f32) as u16;
+        let y = ((py - rect.y - padding) / cell.h).clamp(0.0, self.rows as f32) as u32;
         Point::Viewport(PointCoordinate { x, y })
     }
 
@@ -1318,14 +856,6 @@ fn write_raw(fd: i32, data: &[u8]) {
     }
 }
 
-fn color(rgb: RgbColor) -> macroquad::color::Color {
-    color_u8!(rgb.r, rgb.g, rgb.b, 255)
-}
-
-fn color_theme(rgb: crate::theme::Rgb) -> macroquad::color::Color {
-    color_u8!(rgb.0, rgb.1, rgb.2, 255)
-}
-
 // ---- mouse events --------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
@@ -1380,8 +910,8 @@ impl SelectionState<'_> {
         let _ = rect;
         let max_col = cols.saturating_sub(1);
         let max_row = rows.saturating_sub(1);
-        let px = ((x - padding) / cell.w as f32).clamp(0.0, max_col as f32) as u16;
-        let py = ((y - padding) / cell.h as f32).clamp(0.0, max_row as f32) as u32;
+        let px = ((x - padding) / cell.w).clamp(0.0, max_col as f32) as u16;
+        let py = ((y - padding) / cell.h).clamp(0.0, max_row as f32) as u32;
         Point::Viewport(PointCoordinate { x: px, y: py })
     }
 
@@ -1461,7 +991,7 @@ impl SelectionState<'_> {
         let grid_ref = terminal.grid_ref(point)?;
         let geometry = Geometry {
             columns: terminal.cols()?.into(),
-            cell_width: cell.w,
+            cell_width: cell.w.round() as u32,
             padding_left: padding as u32,
             screen_height: rect.h as u32,
         };
@@ -1597,7 +1127,7 @@ mod tests {
     /// the time the constructor returns.
     #[test]
     fn prime_drains_early_child_output() {
-        let cell = CellDims { w: 10, h: 26, baseline: 20.0 };
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
         let pane = TermPane::new(
             80,
             24,
@@ -1633,7 +1163,7 @@ mod tests {
 
     #[test]
     fn link_at_cell_detects_urls_and_files() {
-        let cell = CellDims { w: 10, h: 26, baseline: 20.0 };
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
         let mut pane = TermPane::new(
             80,
             24,
@@ -1666,7 +1196,7 @@ mod tests {
 
     #[test]
     fn selection_drag_autoscrolls_viewport() {
-        let cell = CellDims { w: 10, h: 20, baseline: 15.0 };
+        let cell = CellDims { w: 10.0, h: 20.0, baseline: 15.0 };
         let mut pane = TermPane::new(
             40,
             10,
@@ -1723,7 +1253,7 @@ mod tests {
 
     #[test]
     fn scroll_page_and_half_page_scroll_correct_direction() {
-        let cell = CellDims { w: 10, h: 26, baseline: 20.0 };
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
         let mut pane = TermPane::new(
             80,
             24,
@@ -1768,7 +1298,7 @@ mod tests {
 
     #[test]
     fn scrollback_line_count_converts_to_bytes_and_retains_history() {
-        let cell = CellDims { w: 10, h: 26, baseline: 20.0 };
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
         // 10,000 lines should convert to at least 10MB byte budget
         let mut pane = TermPane::new(
             80,

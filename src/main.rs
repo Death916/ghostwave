@@ -1,742 +1,754 @@
-//! ghostwave — a waveterm-style terminal built on libghostty-vt (Rust),
-//! with zellij-style keybindings.
-//!
-//! Layout: this file is the macroquad event loop + chrome rendering; the
-//! terminal logic lives in `term.rs` (adapted from ghostling-rs), panes/
-//! tabs/actions in `app.rs`, keybindings in `keymap.rs`.
+//! ghostwave on iced: a tab of terminal panes laid out by iced's `pane_grid`,
+//! painted on one clipped canvas, with pane frames, labels, click-to-focus and
+//! wheel scrollback.
 
-mod ai;
+use ghostwave::config::Config;
+use ghostwave::keymap::Action;
+use iced::{
+    keyboard,
+    widget::{pane_grid, Stack},
+    Background, Element, Fill, Length, Padding, Size, Subscription, Task,
+};
+use libghostty_vt::key;
+
 mod app;
-mod clipboard;
-mod config;
-mod fonts;
-mod keymap;
-mod layout;
-mod palette;
-mod preview;
-mod pty;
-mod search;
-mod session;
-mod term;
-mod theme;
-mod visualizer;
+pub mod ai;
+mod autosave;
+pub mod chrome_widgets;
+mod ui_config;
+mod ui_fonts;
+#[allow(dead_code)]
+mod grid_session;
+mod input;
+mod keys;
+mod measure;
+pub mod palette;
+mod pane;
+mod pane_canvas;
+mod panes_grid;
+pub mod preview;
+mod pty_bridge;
+pub mod scratchpad;
+pub mod search_overlay;
+pub mod selection;
+mod ui_session;
+pub mod sessions_overlay;
+mod tick;
+pub mod visualizer;
 
-use std::collections::VecDeque;
+use app::AppState;
+use pane::PaneEntry;
 
-use macroquad::prelude::*;
+/// Cell metrics are measured from it and the canvas draws text with it.
+pub const FONT_BYTES: &[u8] = ui_fonts::PRIMARY_BYTES;
 
-use app::{App, Pane, TAB_BAR_H};
-use keymap::Mode;
+/// Replaced by the first `resize_events` message.
+const START_WINDOW: Size = Size::new(1200.0, 800.0);
 
-/// Crate-wide error type (used by term.rs, app.rs, etc.).
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-/// All keys we track for press/release/repeat (macroquad KeyCode list).
-const ALL_KEYS: &[KeyCode] = &[
-    KeyCode::A, KeyCode::B, KeyCode::C, KeyCode::D, KeyCode::E, KeyCode::F, KeyCode::G,
-    KeyCode::H, KeyCode::I, KeyCode::J, KeyCode::K, KeyCode::L, KeyCode::M, KeyCode::N,
-    KeyCode::O, KeyCode::P, KeyCode::Q, KeyCode::R, KeyCode::S, KeyCode::T, KeyCode::U,
-    KeyCode::V, KeyCode::W, KeyCode::X, KeyCode::Y, KeyCode::Z,
-    KeyCode::Key0, KeyCode::Key1, KeyCode::Key2, KeyCode::Key3, KeyCode::Key4,
-    KeyCode::Key5, KeyCode::Key6, KeyCode::Key7, KeyCode::Key8, KeyCode::Key9,
-    KeyCode::Space, KeyCode::Enter, KeyCode::Tab, KeyCode::Backspace, KeyCode::Delete,
-    KeyCode::Escape, KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right,
-    KeyCode::Home, KeyCode::End, KeyCode::PageUp, KeyCode::PageDown, KeyCode::Insert,
-    KeyCode::F1, KeyCode::F2, KeyCode::F3, KeyCode::F4, KeyCode::F5, KeyCode::F6,
-    KeyCode::F7, KeyCode::F8, KeyCode::F9, KeyCode::F10, KeyCode::F11, KeyCode::F12,
-    KeyCode::Minus, KeyCode::Equal, KeyCode::LeftBracket, KeyCode::RightBracket,
-    KeyCode::Backslash, KeyCode::Semicolon, KeyCode::Apostrophe, KeyCode::Comma,
-    KeyCode::Period, KeyCode::Slash, KeyCode::GraveAccent,
-];
-
-/// Keys that produce text characters via the platform char event.
-fn key_has_text(code: KeyCode) -> bool {
-    matches!(
-        code,
-        KeyCode::A | KeyCode::B | KeyCode::C | KeyCode::D | KeyCode::E | KeyCode::F
-            | KeyCode::G | KeyCode::H | KeyCode::I | KeyCode::J | KeyCode::K | KeyCode::L
-            | KeyCode::M | KeyCode::N | KeyCode::O | KeyCode::P | KeyCode::Q | KeyCode::R
-            | KeyCode::S | KeyCode::T | KeyCode::U | KeyCode::V | KeyCode::W | KeyCode::X
-            | KeyCode::Y | KeyCode::Z | KeyCode::Key0 | KeyCode::Key1 | KeyCode::Key2
-            | KeyCode::Key3 | KeyCode::Key4 | KeyCode::Key5 | KeyCode::Key6 | KeyCode::Key7
-            | KeyCode::Key8 | KeyCode::Key9 | KeyCode::Space | KeyCode::Minus | KeyCode::Equal
-            | KeyCode::LeftBracket | KeyCode::RightBracket | KeyCode::Backslash
-            | KeyCode::Semicolon | KeyCode::Apostrophe | KeyCode::Comma | KeyCode::Period
-            | KeyCode::Slash | KeyCode::GraveAccent
-    )
+/// Events the iced runtime delivers, plus the mouse events the canvas synthesizes.
+#[derive(Clone, Debug)]
+pub enum Message {
+    /// Carries pty output already coalesced by the pane's reader thread.
+    Output {
+        /// The pane's own identity, not its position — see [`pane::PaneId`].
+        id: pane::PaneId,
+        data: Vec<u8>,
+    },
+    /// Signals that a pane's child exited or its pty errored out.
+    Exited {
+        id: pane::PaneId,
+        reason: String,
+    },
+    /// Carries the new window size; every pane's grid follows from it.
+    Resized(Size),
+    /// Advances the wave and expires the toast; subscribed only while something
+    /// is actually animating.
+    Tick,
+    /// Writes the session file; published by the background autosave thread.
+    Autosave,
+    /// The window manager asked the window to close.
+    CloseRequested(iced::window::Id),
+    /// Focuses the tab whose chip was clicked in the tab bar.
+    FocusTab(usize),
+    /// Focuses a pane by its tab-local index.
+    FocusPane(usize),
+    /// A pane-local mouse event: forwarded into the application (when it tracks
+    /// the mouse) or into selection / viewport scrolling.
+    Mouse {
+        tab: usize,
+        /// The pane's identity. Not its index: the index is resolved only when
+        /// the message is handled, by which point the layout may have changed.
+        pane: pane::PaneId,
+        ev: ghostwave::term::MouseEv,
+        /// Modifier state for the pane's encoder; iced's mouse events do not
+        /// carry it.
+        mods: libghostty_vt::key::Mods,
+    },
+    /// Dispatches a key press through [`keys::keypress`] and then
+    /// [`input::key_press`], or [`input::repeat`] when the platform repeated it.
+    KeyDown {
+        key: keyboard::Key,
+        physical: keyboard::key::Physical,
+        modifiers: keyboard::Modifiers,
+        text: Option<String>,
+        /// The platform generated this one because the key is held down.
+        repeat: bool,
+    },
+    /// Matters only to a pane: the kitty keyboard protocol lets an application ask
+    /// for release events, and a modal bind must not leak its release into the shell.
+    KeyUp {
+        key: keyboard::Key,
+        physical: keyboard::key::Physical,
+        modifiers: keyboard::Modifiers,
+    },
+    /// The pane-grid layer's split drag: the split's new ratio, in `[0, 1]`.
+    GridResize {
+        split: pane_grid::Split,
+        ratio: f32,
+    },
+    /// The pane-grid layer's pane drag: picked, dropped or cancelled.
+    GridDrag(pane_grid::DragEvent),
+    /// A message from the command palette overlay.
+    Palette(palette::PaletteMessage),
+    /// A message from the scrollback search overlay.
+    Search(search_overlay::SearchMessage),
+    /// A message from the named-session picker.
+    Sessions(sessions_overlay::SessionsMessage),
+    /// A message from an AI chat pane's own widgets: its prompt input, its send
+    /// button, its clear button.
+    Ai {
+        /// The pane's own identity, not its position.
+        id: pane::PaneId,
+        msg: ai::AiMessage,
+    },
+    /// A message no handler acts on: for a widget that must emit one but whose value
+    /// is owned elsewhere.
+    Noop,
 }
 
-fn handle_input(app: &mut App) -> bool {
-    let mut had_input = false;
-    // Queue of platform text chars (includes auto-repeat for text keys).
-    let mut chars: VecDeque<char> = VecDeque::new();
-    while let Some(c) = get_char_pressed() {
-        chars.push_back(c);
-        had_input = true;
-    }
-
-    for &code in ALL_KEYS {
-        if is_key_pressed(code) {
-            had_input = true;
-            // Attach the first queued char to the key event (if this key
-            // normally produces text). The char is consumed either way.
-            let text = if key_has_text(code) { chars.pop_front() } else { None };
-            if let Some(kp) = keymap::from_macroquad(code, text) {
-                app.handle_key(kp);
-                app.clear_repeat(code);
-            }
-        } else if is_key_down(code) && !key_has_text(code) {
-            had_input = true;
-            // Synthetic repeat for non-text keys (arrows, backspace, ...).
-            if let Some(kp) = keymap::from_macroquad(code, None) {
-                app.handle_repeat(code, kp);
-            }
-        }
-        if is_key_released(code) {
-            had_input = true;
-            if let Some(kp) = keymap::from_macroquad(code, None) {
-                app.handle_key_release(kp);
-            }
-            app.clear_repeat(code);
-        }
-    }
-
-    // Leftover chars (unicode / IME) that didn't map to a tracked key.
-    while let Some(c) = chars.pop_front() {
-        if !c.is_control() {
-            had_input = true;
-            app.handle_char(c);
-        }
-    }
-
-    had_input
+struct App {
+    state: AppState,
 }
 
-fn color_theme(rgb: crate::theme::Rgb) -> Color {
-    color_u8!(rgb.0, rgb.1, rgb.2, 255)
-}
+/// Whether the synthetic self-test drag has already run.
+static SELF_TEST_DRAG_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-fn render(app: &mut App) {
-    let (w, h) = (screen_width(), screen_height());
-    clear_background(color_theme(app.theme.bg));
+/// Whether the visualizer pane has already been opened by the debug hook.
+static VIZ_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    let theme = app.theme;
-    let cell = app.cell;
-    let padding = app.config.padding;
-    let font_px = app.font_px;
-    let font = app.font.clone();
-    let font_stack = app.font_stack.clone();
-    let active_id = app.active_pane_id();
-    let show_frames = app.show_frames;
-
-    // ---- panes -----------------------------------------------------------
-    let rects = app.active_pane_rects();
-    let pane_ids: Vec<usize> = rects.iter().map(|(id, _)| *id).collect();
-    for id in pane_ids {
-        let rect = rects.iter().find(|(p, _)| *p == id).map(|(_, r)| *r).unwrap_or_default();
-        match &mut app.current_tab_mut().panes[id] {
-            Pane::Term(t) => {
-                let _ = t.render(
-                    rect,
-                    cell,
-                    padding,
-                    &font_stack,
-                    font_px,
-                    theme,
-                    id == active_id,
-                );
-            }
-            Pane::Preview(p) => {
-                set_scissor(rect.x, rect.y, rect.w, rect.h);
-                p.render(rect, &font, font_px, theme);
-                reset_scissor();
-            }
-            Pane::Ai(a) => {
-                a.render(rect, &font, font_px, theme);
-            }
-            Pane::Visual(v) => {
-                v.render(rect, &font, &theme);
-            }
-            Pane::Closed => {}
-        }
-    }
-
-    // ---- pane frames (zellij) --------------------------------------------
-    if show_frames {
-        for (i, (id, rect)) in rects.iter().enumerate() {
-            let col = if *id == active_id { theme.frame_active } else { theme.frame };
-            let thick = if *id == active_id { 2.0 } else { 1.0 };
-            draw_rectangle_lines(rect.x - 2.0, rect.y - 2.0, rect.w + 4.0, rect.h + 4.0, thick, color_theme(col));
-            // Pane label: index + name (zellij style).
-            let name = match &app.current_tab().panes[*id] {
-                Pane::Term(t) => {
-                    let title = t.title();
-                    let n = if !t.name.is_empty() { &t.name } else { "pane" };
-                    if title.is_empty() {
-                        format!("{n} {}", i + 1)
-                    } else {
-                        format!("{n} {i} — {title}")
-                    }
-                }
-                Pane::Preview(_) => format!("file {}", i + 1),
-                Pane::Ai(_) => format!("ai {}", i + 1),
-                Pane::Visual(_) => format!("ghostwave {}", i + 1),
-                Pane::Closed => String::new(),
-            };
-            let label = format!(" {} ", name);
-            let lw = measure_text(&label, Some(&font), 13, 1.0).width + 8.0;
-            draw_rectangle(rect.x - 2.0, rect.y - 14.0, lw, 14.0, color_theme(col));
-            draw_text_ex(
-                &label,
-                rect.x,
-                rect.y - 3.0,
-                TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.tab_bg), ..Default::default() },
-            );
-        }
-    }
-
-    // ---- floating panes (drawn last, on top of the tree) -----------------
-    let floats: Vec<(usize, crate::layout::Rect)> = app
-        .current_tab()
-        .floating
-        .iter()
-        .filter(|f| !f.hidden) // hidden floats are bg panes
-        .map(|f| (f.pane, f.rect))
-        .collect();
-    for (id, rect) in &floats {
-        let rect = *rect;
-        match &mut app.current_tab_mut().panes[*id] {
-            Pane::Term(t) => {
-                let _ = t.render(
-                    rect,
-                    cell,
-                    padding,
-                    &font_stack,
-                    font_px,
-                    theme,
-                    *id == active_id,
-                );
-            }
-            Pane::Preview(p) => {
-                set_scissor(rect.x, rect.y, rect.w, rect.h);
-                p.render(rect, &font, font_px, theme);
-                reset_scissor();
-            }
-            Pane::Ai(a) => {
-                a.render(rect, &font, font_px, theme);
-            }
-            Pane::Visual(v) => {
-                v.render(rect, &font, &theme);
-            }
-            Pane::Closed => {}
-        }
-    }
-    if show_frames {
-        for (i, (id, rect)) in floats.iter().enumerate() {
-            let col = if *id == active_id { theme.frame_active } else { theme.frame };
-            let thick = if *id == active_id { 2.0 } else { 1.0 };
-            draw_rectangle_lines(rect.x - 2.0, rect.y - 2.0, rect.w + 4.0, rect.h + 4.0, thick, color_theme(col));
-            let name = match &app.current_tab().panes[*id] {
-                Pane::Term(t) => {
-                    let title = t.title();
-                    let n = if !t.name.is_empty() { &t.name } else { "pane" };
-                    if title.is_empty() {
-                        format!("float {n} {i}")
-                    } else {
-                        format!("float {n} {i} — {title}")
-                    }
-                }
-                Pane::Preview(_) => format!("float file {i}"),
-                Pane::Ai(_) => format!("float ai {i}"),
-                Pane::Visual(_) => format!("float ghostwave {i}"),
-                Pane::Closed => String::new(),
-            };
-            let label = format!(" {} ", name);
-            let lw = measure_text(&label, Some(&font), 13, 1.0).width + 8.0;
-            draw_rectangle(rect.x - 2.0, rect.y - 14.0, lw, 14.0, color_theme(col));
-            draw_text_ex(
-                &label,
-                rect.x,
-                rect.y - 3.0,
-                TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.tab_bg), ..Default::default() },
-            );
-        }
-    }
-
-    // ---- tab bar ---------------------------------------------------------
-    draw_rectangle(0.0, 0.0, w, TAB_BAR_H, color_theme(theme.tab_bg));
-    let tab_w = 130.0_f32;
-    for (i, tab) in app.tabs.iter().enumerate() {
-        let x = i as f32 * tab_w;
-        let active = i == app.active_tab;
-        draw_rectangle(x, 0.0, tab_w - 4.0, TAB_BAR_H, color_theme(if active { theme.tab_active } else { theme.tab_bg }));
-        let label = if tab.name.is_empty() {
-            format!("Tab {}", i + 1)
-        } else {
-            tab.name.clone()
-        };
-        let col = if active { theme.fg } else { theme.tab_inactive_text };
-        draw_text_ex(
-            &label,
-            x + 10.0,
-            TAB_BAR_H / 2.0 + 4.0,
-            TextParams { font: Some(&font), font_size: 14, color: color_theme(col), ..Default::default() },
+impl App {
+    fn new() -> (Self, Task<Message>) {
+        let config = Config::load();
+        let cell = pane::cell_dims(ui_fonts::primary_bytes(), config.font_size, config.row_gap);
+        let mut state = AppState::new(config, cell, START_WINDOW).expect("spawn the first pane");
+        ui_session::restore_last(&mut state);
+        eprintln!(
+            "[ghostwave] cell {:.2}x{:.1} px, baseline {:.1}, theme {}, frames {}, session '{}', tab '{}' with {} pane(s)",
+            cell.w,
+            cell.h,
+            cell.baseline,
+            state.theme.name,
+            state.show_frames,
+            state.current_session,
+            state.current().name,
+            state.current().panes.iter().filter(|p| p.is_some()).count()
         );
+        (Self { state }, Task::none())
+    }
+
+    fn title(&self) -> String {
+        let tab = self.state.current();
+        if let Some(content) = tab.entry(tab.active).and_then(PaneEntry::content) {
+            return format!("{} — ghostwave", content.label());
+        }
+        if self.state.config.dynamic_title != crate::ui_config::DynamicTitleMode::Off {
+            if let Some(pane) = tab.pane(tab.active) {
+                let guard = pane.lock().unwrap();
+                let title = guard.cached_title();
+                if !title.is_empty() {
+                    return format!("{title} — ghostwave");
+                }
+            }
+        }
+        "ghostwave (iced)".to_string()
+    }
+
+    /// Drives one synthetic drag through the normal mouse path, so the selection
+    /// painter can be exercised without a pointer at the window. Enabled by
+    /// `GHOST_ICED_SELFTEST`.
+    fn self_test_drag(&mut self) {
+        if std::env::var_os("GHOST_ICED_SELFTEST").is_none()
+            || SELF_TEST_DRAG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let button = libghostty_vt::mouse::Button::Left;
+        let tab = self.state.active_tab;
+        let mods = keys::current_mods();
+        for (index, y0) in [(0usize, 300.0f32), (1, 600.0)] {
+            let pane = match self.state.pane_mut(self.state.active_tab, index) {
+                Some(pane) => pane.lock().unwrap().id,
+                None => continue,
+            };
+            let ev = |kind: ghostwave::term::MouseEvKind,
+                      x: f32,
+                      y: f32,
+                      any_pressed: bool,
+                      button_down: Option<libghostty_vt::mouse::Button>| Message::Mouse {
+                tab,
+                pane,
+                ev: ghostwave::term::MouseEv {
+                    kind,
+                    x,
+                    y,
+                    any_pressed,
+                    button_down,
+                },
+                mods,
+            };
+            let _ = self.update(ev(
+                ghostwave::term::MouseEvKind::Press(button),
+                60.0,
+                y0,
+                false,
+                None,
+            ));
+            for step in 1..=12 {
+                let step = step as f32;
+                let _ = self.update(ev(
+                    ghostwave::term::MouseEvKind::Motion,
+                    60.0 + step * 30.0,
+                    y0 + step * 14.0,
+                    true,
+                    Some(button),
+                ));
+            }
+            let _ = self.update(ev(
+                ghostwave::term::MouseEvKind::Release(button),
+                420.0,
+                y0 + 168.0,
+                true,
+                Some(button),
+            ));
+            eprintln!("[ghostwave] selftest drag finished in pane {pane:?}");
+        }
+    }
+
+    /// Opens the visualizer pane once, so its canvas can be exercised without a
+    /// pointer or key injection at the window. Enabled by `GHOST_ICED_VIZ`.
+    fn open_visualizer_once(&mut self) {
+        if std::env::var_os("GHOST_ICED_VIZ").is_none()
+            || VIZ_OPENED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        input::execute(&mut self.state, Action::Ghostwave);
+        eprintln!("[ghostwave] viz hook: visualizer pane opened");
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Output { id, data } => {
+                if let Some(pane) = self.state.pane_by_id(id) {
+                    let mut guard = pane.lock().unwrap();
+                    guard.ingest(&data);
+                    guard.refresh_search();
+                    self.state.pty_activity = true;
+                }
+            }
+            Message::Exited { id, reason } => {
+                if let Some(pane) = self.state.pane_by_id(id) {
+                    pane.lock().unwrap().exited(&reason);
+                }
+            }
+            Message::Resized(size) => self.state.set_window(size),
+            Message::Tick => {
+                self.open_visualizer_once();
+                self.self_test_drag();
+                self.state.tick()
+            }
+            Message::Autosave => ui_session::save(&self.state),
+            Message::CloseRequested(_) => self.state.quit = true,
+            Message::FocusTab(index) => {
+                if index < self.state.tabs.len() {
+                    self.state.active_tab = index;
+                    self.state.relayout();
+                }
+            }
+            Message::FocusPane(index) => self.state.focus(index),
+            Message::Mouse {
+                tab,
+                pane,
+                ev,
+                mods,
+            } => {
+                if let Some(pane_ref) = self.state.pane_by_id(pane) {
+                    let mut guard = pane_ref.lock().unwrap();
+                    if std::env::var_os("GHOST_ICED_DEBUG").is_some() {
+                        eprintln!(
+                            "[ghostwave] mouse tab {tab} pane {pane:?} {:?} x {:.1} y {:.1} button_down {:?}",
+                            ev.kind, ev.x, ev.y, ev.button_down
+                        );
+                    }
+                    let (w, h) = guard
+                        .last_bounds
+                        .map(|b| (b.width, b.height))
+                        .unwrap_or_else(|| {
+                            (
+                                guard.term.cols as f32 * self.state.cell.w,
+                                guard.term.rows as f32 * self.state.cell.h,
+                            )
+                        });
+                    let rect = ghostwave::layout::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w,
+                        h,
+                    };
+                    guard.mouse_event(
+                        rect,
+                        self.state.cell,
+                        self.state.config.padding,
+                        ev,
+                        mods,
+                    );
+                }
+            }
+            Message::KeyDown {
+                key,
+                physical,
+                modifiers,
+                text,
+                repeat,
+            } => {
+                keys::note_modifiers(modifiers);
+                if !self.overlay_key(&key, modifiers, text.as_deref()) {
+                    if let Some(kp) = keys::keypress(&key, physical, modifiers, text.as_deref()) {
+                        if repeat {
+                            input::repeat(&mut self.state, kp);
+                        } else {
+                            input::key_press(&mut self.state, kp, key::Action::Press);
+                        }
+                    }
+                }
+            }
+            Message::KeyUp {
+                key,
+                physical,
+                modifiers,
+            } => {
+                keys::note_modifiers(modifiers);
+                if !self.overlay_open() {
+                    if let Some(kp) = keys::keypress(&key, physical, modifiers, None) {
+                        input::key_release(&mut self.state, kp);
+                    }
+                }
+            }
+            Message::GridResize { split, ratio } => self.state.grid_resize(split, ratio),
+            Message::GridDrag(event) => self.state.grid_drag(event),
+            Message::Palette(message) => {
+                if let Some(palette) = self.state.palette.as_mut() {
+                    match palette.update(message) {
+                        Some(palette::PaletteAction::Execute(action)) => {
+                            self.state.palette = None;
+                            input::execute(&mut self.state, action);
+                        }
+                        Some(palette::PaletteAction::Close) => self.state.palette = None,
+                        None => {}
+                    }
+                }
+            }
+            Message::Search(message) => {
+                let closing = matches!(message, search_overlay::SearchMessage::Close);
+                let pane = self.state.active_pane();
+                let mut term = pane.as_ref().map(|pane| pane.lock().unwrap());
+                if let Some(search) = self.state.search.as_mut() {
+                    search.update_with_term(message, term.as_mut().map(|guard| &mut guard.term));
+                }
+                if let Some(guard) = term.as_mut() {
+                    guard.refresh_search();
+                    let matches = guard.term.search.matches.len();
+                    let current = guard.term.search.current;
+                    if let Some(search) = self.state.search.as_mut() {
+                        search.set_total_matches(matches);
+                        search.set_match_index(current);
+                    }
+                }
+                if closing {
+                    self.state.search = None;
+                }
+            }
+            Message::Ai { id, msg } => {
+                if let Some(content) = self.state.content_by_id_mut(id) {
+                    if let Some(ai) = content.as_ai_mut() {
+                        ai.update(msg);
+                        ai.poll();
+                    }
+                }
+            }
+            Message::Sessions(message) => ui_session::picker_message(&mut self.state, message),
+            Message::Noop => {}
+        }
+        if self.state.quit {
+            ui_session::save(&self.state);
+            return iced::exit();
+        }
+        Task::none()
+    }
+
+    /// Whether an overlay currently owns the keyboard.
+    fn overlay_open(&self) -> bool {
+        self.state.palette.is_some()
+            || self.state.search.is_some()
+            || self.state.session_picker.is_some()
+    }
+
+    /// Routes a key to the open overlay, if any; returns whether one consumed it.
+    ///
+    /// Overlays are exclusive: while one is up the panes are sent no key at all,
+    /// and the terminal keymap is not consulted — a key an overlay does not want
+    /// is dropped rather than falling through to the shell.
+    fn overlay_key(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+        text: Option<&str>,
+    ) -> bool {
+        if self.state.palette.is_some() {
+            self.palette_key(key, modifiers, text);
+            return true;
+        }
+        if self.state.search.is_some() {
+            self.search_key(key, modifiers, text);
+            return true;
+        }
+        if self.state.session_picker.is_some() {
+            self.sessions_key(key, modifiers);
+            return true;
+        }
+        false
+    }
+
+    /// Applies a key to the command palette: navigation, submission and dismissal
+    /// through the palette's own iced handler, text through its query.
+    fn palette_key(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+        text: Option<&str>,
+    ) {
+        let action = self
+            .state
+            .palette
+            .as_mut()
+            .and_then(|palette| palette.handle_iced_key(key, &modifiers));
+        match action {
+            Some(palette::PaletteAction::Execute(action)) => {
+                self.state.palette = None;
+                input::execute(&mut self.state, action);
+            }
+            Some(palette::PaletteAction::Close) => self.state.palette = None,
+            None => {
+                if let Some(palette) = self.state.palette.as_mut() {
+                    if is_backspace(key) {
+                        palette.backspace();
+                    } else if let Some(c) = typed_char(text) {
+                        palette.type_char(c);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies a key to the search overlay through the module's own key map,
+    /// driving the search actions so the overlay and the pane's search stay in
+    /// step.
+    fn search_key(
+        &mut self,
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+        text: Option<&str>,
+    ) {
+        match search_overlay::handle_key(key, modifiers) {
+            Some(search_overlay::SearchMessage::Close) => input::close_search(&mut self.state),
+            Some(search_overlay::SearchMessage::NextMatch) => {
+                input::execute(&mut self.state, Action::SearchNext)
+            }
+            Some(search_overlay::SearchMessage::PrevMatch) => {
+                input::execute(&mut self.state, Action::SearchPrev)
+            }
+            Some(search_overlay::SearchMessage::ToggleCaseSensitive) => {
+                input::execute(&mut self.state, Action::SearchToggleCase)
+            }
+            Some(search_overlay::SearchMessage::ToggleRegex) => {
+                if let Some(search) = self.state.search.as_mut() {
+                    search.toggle_regex();
+                }
+            }
+            Some(search_overlay::SearchMessage::QueryChanged(_)) => {}
+            None => {
+                if is_backspace(key) {
+                    input::search_backspace(&mut self.state);
+                } else if let Some(c) = typed_char(text) {
+                    input::search_push_char(&mut self.state, c);
+                }
+            }
+        }
+    }
+
+    /// Applies a key to the session picker: the overlay's own key map decides what
+    /// the key means, and the session module performs what it asks for.
+    fn sessions_key(&mut self, key: &keyboard::Key, modifiers: keyboard::Modifiers) {
+        if let Some(message) = sessions_overlay::handle_key(key, modifiers) {
+            ui_session::picker_message(&mut self.state, message);
+        }
+    }
+
+    /// Every visible float, bottom-to-top, each positioned at its own rect.
+    ///
+    /// A float's pane lives in the tab (so its pty, its identity and the mouse path all
+    /// work) but has no grid cell, which is why this layer paints it: iced has no
+    /// absolute positioning, so a full-size layer carries the float at `position()` via
+    /// padding.
+    fn float_layer(&self) -> Option<Element<'_, Message>> {
+        use iced::widget::{Canvas, Column, container, mouse_area, text};
+
+        let tab = self.state.current();
+        let tab_index = self.state.active_tab;
+        let theme = self.state.theme;
+        let mut floats: Vec<_> = self.state.scratchpad.visible_floats().collect();
+        floats.sort_by_key(|float| float.z_index);
+
+        let mut layers: Vec<Element<'_, Message>> = Vec::new();
+        for float in floats {
+            let Some(index) = tab.index_of(float.id()) else {
+                continue;
+            };
+            let Some(handle) = tab.pane(index).cloned() else {
+                continue;
+            };
+            let tracking = handle.lock().unwrap().mouse_tracking();
+            let title = {
+                let guard = handle.lock().unwrap();
+                let cached = guard.cached_title();
+                if cached.is_empty() {
+                    "float".to_string()
+                } else {
+                    cached.to_string()
+                }
+            };
+            let (pos, size) = (float.position(), float.size());
+            let canvas = Canvas::new(panes_grid::PaneCanvas {
+                tab: tab_index,
+                pane: index,
+                pane_id: float.id(),
+                handle,
+                cell: self.state.cell,
+                font_px: self.state.config.font_size,
+                padding: self.state.config.padding,
+                tracking,
+                theme,
+            })
+            .width(Fill)
+            .height(Fill);
+            let window = Column::with_children(vec![
+                container(text(title).size(12.0).font(ui_fonts::primary()))
+                    .width(Fill)
+                    .padding([2.0, 6.0])
+                    .style(move |_theme| container::Style {
+                        background: Some(Background::Color(pane_canvas::rgb(theme.tab_active))),
+                        ..Default::default()
+                    })
+                    .into(),
+                container(canvas)
+                    .width(Fill)
+                    .height(Fill)
+                    .style(move |_theme| container::Style {
+                        border: iced::Border {
+                            color: pane_canvas::rgb(theme.frame_active),
+                            width: 2.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .into(),
+            ])
+            .width(size.width)
+            .height(size.height);
+            layers.push(
+                container(mouse_area(window).on_press(Message::FocusPane(index)))
+                    .width(Fill)
+                    .height(Fill)
+                    .padding(Padding {
+                        top: pos.y,
+                        left: pos.x,
+                        ..Padding::ZERO
+                    })
+                    .into(),
+            );
         }
 
-        // ---- tab context menu -------------------------------------------------
-        if let Some((tab_idx, mx, my)) = app.tab_menu {
-        use app::{TAB_MENU_ITEM_H, TAB_MENU_ITEMS, TAB_MENU_PAD, TAB_MENU_W};
-        let menu_h = TAB_MENU_PAD + TAB_MENU_ITEMS as f32 * TAB_MENU_ITEM_H + TAB_MENU_PAD;
-        draw_rectangle(mx, my, TAB_MENU_W, menu_h, color_theme(theme.bg));
-        draw_rectangle_lines(mx, my, TAB_MENU_W, menu_h, 1.0, color_theme(theme.tab_bg));
-        let items = [
-            "Rename tab",
-            "Close tab",
+        (!layers.is_empty()).then(|| Stack::with_children(layers).into())
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let tab = self.state.current();
+        let mouse_tracking: Vec<usize> = tab
+            .panes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let handle = entry.as_ref()?.term()?;
+                handle.lock().unwrap().mouse_tracking().then_some(index)
+            })
+            .collect();
+        let base = panes_grid::view(&self.state, mouse_tracking);
+        let floats = self.float_layer();
+        // The window is a column of bands — tab bar, panes, status bar. A Stack is
+        // only for what pops up over them: floats, overlays and the toast.
+        let main = iced::widget::Column::with_children(vec![
+            chrome_widgets::tab_bar_for_state(&self.state),
+            base,
+            chrome_widgets::status_bar_for_state(&self.state),
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill);
+        let mut layers: Vec<Element<'_, Message>> = Vec::new();
+        if let Some(toast) = chrome_widgets::toast_for_state(&self.state) {
+            layers.push(toast);
+        }
+        if let Some(floats) = floats {
+            layers.push(floats);
+        }
+        if let Some(search) = self.state.search.as_ref() {
+            layers.push(search_overlay::search_overlay_mapped(
+                search,
+                &self.state.theme,
+                search_overlay::OverlayPosition::TopRight,
+                Message::Search,
+            ));
+        }
+        if let Some(picker) = self.state.session_picker.as_ref() {
+            layers.push(sessions_overlay::view_mapped(
+                picker,
+                &self.state.theme,
+                Message::Sessions,
+            ));
+        }
+        if let Some(palette) = self.state.palette.as_ref() {
+            layers.push(palette::view(palette, &self.state.theme).map(Message::Palette));
+        }
+        if layers.is_empty() {
+            return main.into();
+        }
+        layers.insert(0, main.into());
+        Stack::with_children(layers)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let mut subs = vec![
+            iced::event::listen_with(key_listener),
+            iced::window::resize_events().map(|(_id, size)| Message::Resized(size)),
+            iced::window::close_requests().map(Message::CloseRequested),
+            Subscription::run_with(autosave::Autosave, autosave::stream),
         ];
-        for (i, label) in items.iter().enumerate() {
-            let y = my + TAB_MENU_PAD + i as f32 * TAB_MENU_ITEM_H;
-            draw_text_ex(
-                label,
-                mx + 12.0,
-                y + TAB_MENU_ITEM_H / 2.0 + 5.0,
-                TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.palette_fg), ..Default::default() },
-            );
+        match self.state.tick_rate() {
+            app::TickRate::Off => {}
+            rate => subs.push(Subscription::run_with(
+                tick::TickSlot { rate },
+                tick::stream,
+            )),
         }
-        }
-
-    // ---- session manager overlay ------------------------------------------
-    if let Some((entries, selected)) = &app.session_list {
-        let w = 460.0_f32;
-        let item_h = 24.0_f32;
-        let title_h = 30.0_f32;
-        let hint_h = 22.0_f32;
-        let h = title_h + entries.len() as f32 * item_h + hint_h;
-        let x = (screen_width() - w) / 2.0;
-        let y = (screen_height() - h) / 3.0;
-        draw_rectangle(x, y, w, h, color_theme(theme.bg));
-        draw_rectangle_lines(x, y, w, h, 1.0, color_theme(theme.tab_bg));
-        draw_text_ex(
-            &format!("SESSIONS — current: {}", app.current_session),
-            x + 12.0,
-            y + 20.0,
-            TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.search_match), ..Default::default() },
-        );
-        for (i, name) in entries.iter().enumerate() {
-            let yy = y + title_h + i as f32 * item_h;
-            if i == *selected {
-                draw_rectangle(x, yy, w, item_h, color_theme(theme.tab_active));
-            }
-            let cur = *name == app.current_session;
-            let label = if cur { format!("● {name}") } else { format!("  {name}") };
-            draw_text_ex(
-                &label,
-                x + 12.0,
-                yy + item_h / 2.0 + 5.0,
-                TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.palette_fg), ..Default::default() },
-            );
-            // ssh marker: sessions containing durable remote panes.
-            if crate::session::has_remote(name) {
-                let lw = measure_text(&label, Some(&font), 13, 1.0).width;
-                draw_text_ex(
-                    "ssh",
-                    x + 16.0 + lw,
-                    yy + item_h / 2.0 + 5.0,
-                    TextParams { font: Some(&font), font_size: 11, color: color_theme(theme.search_match), ..Default::default() },
-                );
+        for tab in &self.state.tabs {
+            for handle in tab.term_handles() {
+                let slot = { handle.lock().unwrap().rx.clone() };
+                subs.push(Subscription::run_with(slot, pty_bridge::stream));
             }
         }
-        draw_text_ex(
-            "↑/↓ select | Enter switch | n new | r rename | d delete | k kill remote | Esc close",
-            x + 12.0,
-            y + h - 8.0,
-            TextParams { font: Some(&font), font_size: 12, color: color_theme(theme.status_fg), ..Default::default() },
-        );
-    }
-
-    // ---- search input overlay --------------------------------------------
-    if app.mode == Mode::EnterSearch {
-        if let Some(t) = app.active_term() {
-            let total = t.search.matches.len();
-            let cur = t.search.current.min(total.saturating_sub(1));
-            let q = if t.search.query.is_empty() { "type to search…".to_string() } else { t.search.query.clone() };
-            let flags = format!(
-                "{} {} {}",
-                if t.search.case_sensitive { "[c]ase ✓" } else { "[c]ase" },
-                if t.search.wrap { "[w]rap ✓" } else { "[w]rap" },
-                if t.search.whole_word { "[o]word ✓" } else { "[o]word" },
-            );
-            let label = format!(" 🔍 {}   {}/{}   {flags}", if q.is_empty() { "type to search…" } else { &q }, cur + 1, total);
-            let lw = measure_text(&label, Some(&font), 14, 1.0).width + 24.0;
-            let bx = (w - lw) / 2.0;
-            draw_rectangle(bx, TAB_BAR_H + 6.0, lw, 30.0, color_theme(theme.palette_bg));
-            draw_rectangle_lines(bx, TAB_BAR_H + 6.0, lw, 30.0, 1.0, color_theme(theme.frame_active));
-            draw_text_ex(
-                &label,
-                bx + 12.0,
-                TAB_BAR_H + 26.0,
-                TextParams { font: Some(&font), font_size: 14, color: color_theme(theme.palette_fg), ..Default::default() },
-            );
-        }
-    }
-
-    // ---- rename overlay --------------------------------------------------
-    if app.mode == Mode::RenameTab || app.mode == Mode::RenamePane {
-        let what = if app.mode == Mode::RenameTab { "Tab" } else { "Pane" };
-        let label = format!(" rename {what}: {}_", app.rename_buf);
-        let lw = measure_text(&label, Some(&font), 14, 1.0).width + 24.0;
-        let bx = (w - lw) / 2.0;
-        draw_rectangle(bx, TAB_BAR_H + 6.0, lw, 30.0, color_theme(theme.palette_bg));
-        draw_rectangle_lines(bx, TAB_BAR_H + 6.0, lw, 30.0, 1.0, color_theme(theme.frame_active));
-        draw_text_ex(
-            &label,
-            bx + 12.0,
-            TAB_BAR_H + 26.0,
-            TextParams { font: Some(&font), font_size: 14, color: color_theme(theme.palette_fg), ..Default::default() },
-        );
-    }
-
-    // ---- command palette -------------------------------------------------
-    if let Some(pal) = &app.palette {
-        let bw = (w * 0.6).min(640.0);
-        let bh = 360.0_f32;
-        let bx = (w - bw) / 2.0;
-        let by = 60.0;
-        draw_rectangle(bx, by, bw, bh, color_theme(theme.palette_bg));
-        draw_rectangle_lines(bx, by, bw, bh, 1.0, color_theme(theme.frame_active));
-        // Input line
-        let prompt = format!("> {}", pal.input);
-        draw_text_ex(
-            &prompt,
-            bx + 12.0,
-            by + 28.0,
-            TextParams { font: Some(&font), font_size: 16, color: color_theme(theme.palette_fg), ..Default::default() },
-        );
-        draw_line(bx + 6.0, by + 38.0, bx + bw - 6.0, by + 38.0, 1.0, color_theme(theme.frame));
-        // Items
-        let filtered = pal.filtered();
-        let visible = 10.min(filtered.len());
-        for i in 0..visible {
-            let item = &filtered[i];
-            let y = by + 48.0 + i as f32 * 28.0;
-            let selected = i == pal.cursor.min(filtered.len().saturating_sub(1));
-            if selected {
-                draw_rectangle(bx + 4.0, y - 18.0, bw - 8.0, 26.0, color_theme(theme.palette_sel));
-            }
-            draw_text_ex(
-                &item.label,
-                bx + 14.0,
-                y,
-                TextParams { font: Some(&font), font_size: 15, color: color_theme(if selected { theme.bg } else { theme.palette_fg }), ..Default::default() },
-            );
-        }
-        if filtered.is_empty() {
-            draw_text_ex(
-                "no matching command (try: open <path> | ssh <host> | theme <name>)",
-                bx + 14.0,
-                by + 66.0,
-                TextParams { font: Some(&font), font_size: 14, color: color_theme(theme.tab_inactive_text), ..Default::default() },
-            );
-        }
-    }
-
-    // ---- status bar ------------------------------------------------------
-    let sh = 26.0_f32;
-    draw_rectangle(0.0, h - sh, w, sh, color_theme(theme.status_bg));
-    let mode_label = format!(" {} ", app.mode.label());
-    let mw = measure_text(&mode_label, Some(&font), 13, 1.0).width + 12.0;
-    draw_rectangle(0.0, h - sh, mw, sh, color_theme(theme.frame_active));
-    draw_text_ex(
-        &mode_label,
-        6.0,
-        h - 8.0,
-        TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.bg), ..Default::default() },
-    );
-    let hints = app.mode.hints();
-    draw_text_ex(
-        hints,
-        mw + 10.0,
-        h - 8.0,
-        TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.status_fg), ..Default::default() },
-    );
-    let right = format!(" {} ", app.theme_name);
-    let rw = measure_text(&right, Some(&font), 13, 1.0).width + 12.0;
-    draw_text_ex(
-        &right,
-        w - rw,
-        h - 8.0,
-        TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.status_fg), ..Default::default() },
-    );
-
-    if app.current_tab().sync_panes {
-        let sync_label = " [SYNC] ";
-        let sw = measure_text(sync_label, Some(&font), 13, 1.0).width + 8.0;
-        let sx = w - rw - sw - 4.0;
-        draw_rectangle(sx, h - sh + 2.0, sw, sh - 4.0, color_theme(theme.search_match));
-        draw_text_ex(
-            sync_label,
-            sx + 4.0,
-            h - 8.0,
-            TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.bg), ..Default::default() },
-        );
-    }
-
-    // ---- living reactive "ghostwave" waveform ----------------------------
-    if app.config.visual_wave {
-        let hints_w = measure_text(hints, Some(&font), 13, 1.0).width;
-        let wave_start_x = mw + 10.0 + hints_w + 24.0;
-        let wave_end_x = if app.current_tab().sync_panes {
-            let sw = measure_text(" [SYNC] ", Some(&font), 13, 1.0).width + 8.0;
-            w - rw - sw - 24.0
-        } else {
-            w - rw - 24.0
-        };
-
-        if wave_end_x > wave_start_x + 50.0 {
-            let wave_w = wave_end_x - wave_start_x;
-            let center_y = h - sh / 2.0;
-            let step = 3.0_f32;
-            let num_points = (wave_w / step).max(10.0) as usize;
-            let phase = app.wave_phase;
-            let energy = app.wave_energy;
-            let max_amp = (sh * 0.35 * app.config.wave_amplitude).clamp(2.0, 10.0);
-
-            let accent = theme.frame_active;
-            let sel = theme.palette_sel;
-
-            // Harmonic 1: Primary glowing neon ribbon
-            let mut prev_x = wave_start_x;
-            let mut prev_y = center_y;
-            for i in 0..=num_points {
-                let progress = i as f32 / num_points as f32;
-                let cur_x = wave_start_x + progress * wave_w;
-                let envelope = (progress * std::f32::consts::PI).sin();
-                let freq = 0.035;
-                let y_offset = ((cur_x * freq + phase).sin() * 0.7
-                    + (cur_x * freq * 1.8 - phase * 1.4).sin() * 0.3)
-                    * max_amp * energy * envelope;
-                let cur_y = center_y + y_offset;
-
-                if i > 0 {
-                    let alpha = (0.20 + 0.50 * (energy / 2.0).min(1.0)) * envelope;
-                    draw_line(
-                        prev_x,
-                        prev_y,
-                        cur_x,
-                        cur_y,
-                        1.5,
-                        Color::new(
-                            accent.0 as f32 / 255.0,
-                            accent.1 as f32 / 255.0,
-                            accent.2 as f32 / 255.0,
-                            alpha,
-                        ),
-                    );
-                }
-                prev_x = cur_x;
-                prev_y = cur_y;
-            }
-
-            // Harmonic 2: Secondary counter-phase ethereal glow
-            let mut prev_x2 = wave_start_x;
-            let mut prev_y2 = center_y;
-            for i in 0..=num_points {
-                let progress = i as f32 / num_points as f32;
-                let cur_x = wave_start_x + progress * wave_w;
-                let envelope = (progress * std::f32::consts::PI).sin();
-                let freq = 0.022;
-                let y_offset = ((cur_x * freq * 1.3 - phase * 0.8).sin() * 0.8
-                    + (cur_x * freq * 2.2 + phase * 1.9).sin() * 0.2)
-                    * (max_amp * 0.65) * energy * envelope;
-                let cur_y = center_y + y_offset;
-
-                if i > 0 {
-                    let alpha = (0.12 + 0.30 * (energy / 2.0).min(1.0)) * envelope;
-                    draw_line(
-                        prev_x2,
-                        prev_y2,
-                        cur_x,
-                        cur_y,
-                        1.0,
-                        Color::new(
-                            sel.0 as f32 / 255.0,
-                            sel.1 as f32 / 255.0,
-                            sel.2 as f32 / 255.0,
-                            alpha,
-                        ),
-                    );
-                }
-                prev_x2 = cur_x;
-                prev_y2 = cur_y;
-            }
-        }
-    }
-
-    // ---- toast -----------------------------------------------------------
-    if let Some((msg, t0)) = &app.toast {
-        if t0.elapsed().as_secs_f32() < 2.5 {
-            let label = format!(" {msg} ");
-            let lw = measure_text(&label, Some(&font), 13, 1.0).width + 16.0;
-            draw_rectangle(8.0, h - sh - 30.0, lw, 24.0, color_theme(theme.palette_sel));
-            draw_text_ex(
-                &label,
-                16.0,
-                h - sh - 12.0,
-                TextParams { font: Some(&font), font_size: 13, color: color_theme(theme.bg), ..Default::default() },
-            );
-        }
+        Subscription::batch(subs)
     }
 }
 
-fn reset_scissor() {
-    unsafe {
-        let mut gl = macroquad::window::get_internal_gl();
-        gl.flush();
-        gl.quad_gl.scissor(None);
+/// Whether the event is the Backspace key.
+fn is_backspace(key: &keyboard::Key) -> bool {
+    matches!(key, keyboard::Key::Named(keyboard::key::Named::Backspace))
+}
+
+/// The single printable character a key event produced, if it produced one.
+///
+/// A composed sequence (a dead-key pair, an IME pre-edit run) or a control
+/// character — Ctrl+C hands over `\u{3}` — is not text to type.
+fn typed_char(text: Option<&str>) -> Option<char> {
+    let mut chars = text?.chars();
+    let c = chars.next()?;
+    if chars.next().is_none() && !c.is_control() {
+        Some(c)
+    } else {
+        None
     }
 }
 
-/// Clip drawing to a logical-pixel rect. macroquad has no public scissor
-/// API; quad_gl.scissor works in physical px (Y flipped internally for OpenGL viewport).
-fn set_scissor(x: f32, y: f32, w: f32, h: f32) {
-    let dpi = macroquad::window::screen_dpi_scale();
-    let sh = macroquad::window::screen_height();
-    let sx = (x * dpi).max(0.0) as i32;
-    let sy = (((sh - (y + h)) * dpi).max(0.0)) as i32;
-    let sw = (w * dpi).max(0.0) as i32;
-    let sh_px = (h * dpi).max(0.0) as i32;
-    unsafe {
-        let mut gl = macroquad::window::get_internal_gl();
-        gl.flush();
-        gl.quad_gl.scissor(Some((sx, sy, sw, sh_px)));
+/// Key events are the only runtime events this front-end listens for. Mouse input
+/// goes through the canvas ([`pane_canvas::TerminalCanvas`]), which knows the rects.
+fn key_listener(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            text,
+            repeat,
+            ..
+        }) => Some(Message::KeyDown {
+            key,
+            physical: physical_key,
+            modifiers,
+            text: text.map(|t| t.to_string()),
+            repeat,
+        }),
+        iced::Event::Keyboard(keyboard::Event::KeyReleased {
+            key,
+            physical_key,
+            modifiers,
+            ..
+        }) => Some(Message::KeyUp {
+            key,
+            physical: physical_key,
+            modifiers,
+        }),
+        iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+            keys::note_modifiers(modifiers);
+            None
+        }
+        _ => None,
     }
 }
 
-fn macroquad_conf() -> macroquad::conf::Conf {
-    macroquad::conf::Conf {
-        miniquad_conf: miniquad::conf::Conf {
-            window_title: "ghostwave".to_owned(),
-            window_width: 1280,
-            window_height: 800,
-            window_resizable: true,
-            high_dpi: true,
-            platform: miniquad::conf::Platform {
-                linux_backend: miniquad::conf::LinuxBackend::WaylandOnly,
-                // Never block in poll() (default)…
-                blocking_event_loop: false,
-                // …and never wait on the compositor's frame callback:
-                // with vsync (swap_interval 1), eglSwapBuffers blocks until
-                // the next wl_surface.frame callback — Hyprland stops
-                // sending those when the window is on another workspace,
-                // so the loop stalls forever and Hyprland flags the app
-                // as "not responding". swap_interval 0 makes every swap
-                // return immediately; the main loop caps the frame rate
-                // itself (see main()).
-                swap_interval: Some(0),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        ..Default::default()
+fn main() -> iced::Result {
+    let config = Config::load();
+    ui_fonts::init(config.font_family.as_deref());
+
+    let mut app = iced::application(App::new, App::update, App::view)
+        .title(App::title)
+        .subscription(App::subscription)
+        .window_size(START_WINDOW)
+        // Close requests reach the update loop, so the quit path saves first.
+        .exit_on_close_request(false)
+        .font(ui_fonts::PRIMARY_BYTES);
+    if let Some(custom_bytes) = ui_fonts::custom_bytes() {
+        app = app.font(custom_bytes);
     }
-}
-
-#[macroquad::main(macroquad_conf)]
-async fn main() -> Result<()> {
-    let _ = term::install_png_decoder();
-
-    let config = config::Config::load();
-
-    // Write a default config file on first run so the user can tweak it.
-    if !config::Config::path().exists() {
-        if let Some(dir) = config::Config::path().parent() {
-            let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(
-                config::Config::path(),
-                "# ghostwave configuration\n# font_size is in points (12 = 12pt, like ghostty/waveterm)\nfont_size = 12.0\ntheme = \"tokyonight\"\nscrollback = 10000\n# per-pane durable-session log cap in MiB (front-truncated when exceeded)\nmax_log_mb = 32\npadding = 6.0\nrow_gap = 4.0\n\n[ai]\nbase_url = \"https://api.minimax.chat/v1\"\nmodel = \"MiniMax-M2\"\napi_key_env = \"MINIMAX_API_KEY\"\n",
-            );
-        }
+    app = app.default_font(ui_fonts::primary());
+    for (_family, bytes) in ui_fonts::fallback_bytes(12) {
+        app = app.font(bytes);
     }
-
-    let font = load_ttf_font_from_bytes(include_bytes!("../assets/JetBrainsMono-Medium.ttf"))?;
-    let font_stack = fonts::FontStack::new(include_bytes!("../assets/JetBrainsMono-Medium.ttf"), font.clone())?;
-    let mut app = App::new(config, font, font_stack)?;
-
-    let mut last_mouse_pos = mouse_position();
-    let mut last_activity = std::time::Instant::now();
-
-    loop {
-        let frame_start = std::time::Instant::now();
-        app.update();
-
-        // Recompute pane grids when the window/layout changes (no-op otherwise).
-        app.layout_all();
-
-        let had_input = handle_input(&mut app);
-        app.handle_mouse();
-
-        let mouse_pos = mouse_position();
-        let (wheel_x, wheel_y) = mouse_wheel();
-        let mouse_active = (mouse_pos.0 - last_mouse_pos.0).abs() > 0.5
-            || (mouse_pos.1 - last_mouse_pos.1).abs() > 0.5
-            || is_mouse_button_down(MouseButton::Left)
-            || is_mouse_button_down(MouseButton::Right)
-            || is_mouse_button_down(MouseButton::Middle)
-            || wheel_x != 0.0
-            || wheel_y != 0.0;
-        if mouse_active {
-            last_mouse_pos = mouse_pos;
-        }
-
-        let has_visual_pane = app.current_tab().panes.iter().any(|p| matches!(p, Pane::Visual(_)));
-        let is_active = app.pty_activity
-            || had_input
-            || mouse_active
-            || has_visual_pane
-            || app.toast.is_some()
-            || app.wave_energy > 0.15;
-
-        if is_active {
-            last_activity = std::time::Instant::now();
-        }
-
-        render(&mut app);
-
-        if app.quit {
-            // Persist the active session AND every parked (background) one —
-            // a parked session's metadata must not be lost on quit.
-            app.save_all_sessions();
-            std::process::exit(0);
-        }
-
-        // Frame pacing. Every iteration presents a full-window redraw (macroquad
-        // has no way to skip a present and the EGL backbuffer is not retained on
-        // Wayland), so the loop rate IS the GPU cost — our redraw plus one
-        // full-screen compositor recomposite per presented frame. Measured on
-        // this box: 30 FPS idle was 14-30% of the GPU engine, 8 FPS idle is 1-2%.
-        // - PTY output in flight (streaming pane, typed echo) → 120 FPS ceiling.
-        //   This used to be uncapped (no sleep at all while output drained), which
-        //   is what made typing expensive: a keystroke's echo drove hundreds of
-        //   full-window presents per second.
-        // - Input / mouse / animation / toast / visual pane → 60 FPS.
-        // - Nothing changed for a second → 8 FPS.
-        const OUTPUT_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(8_333);
-        const ACTIVE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(16_667);
-        const IDLE_FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(125_000);
-        const ACTIVE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1_000);
-        let target_frame_time = if app.pty_activity {
-            OUTPUT_FRAME_TIME
-        } else if last_activity.elapsed() < ACTIVE_WINDOW {
-            ACTIVE_FRAME_TIME
-        } else {
-            IDLE_FRAME_TIME
-        };
-
-        let elapsed = frame_start.elapsed();
-        if elapsed < target_frame_time {
-            std::thread::sleep(target_frame_time - elapsed);
-        }
-
-        next_frame().await
-    }
+    app.run()
 }

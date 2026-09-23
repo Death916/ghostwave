@@ -6,6 +6,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Font family to use for terminal panes (defaults to bundled JetBrains Mono).
+    pub font_family: Option<String>,
     /// Font size in points (scaled by DPI at runtime).
     pub font_size: f32,
     /// Built-in theme name, see theme.rs
@@ -24,6 +26,10 @@ pub struct Config {
     pub max_log_mb: u64,
     /// Terminal cursor visual style ("block", "bar", "beam", "underline", "hollow").
     pub cursor_style: Option<String>,
+    /// Mode for dynamic pane and window title generation.
+    pub dynamic_title: DynamicTitleMode,
+    /// Formatting style for the pane's title band.
+    pub pane_title_format: PaneTitleFormat,
     /// Living reactive sine-wave visualizer in the status bar.
     pub visual_wave: bool,
     /// Wave animation speed multiplier (default 1.0).
@@ -81,9 +87,73 @@ impl Default for RemoteConfig {
     }
 }
 
+/// Mode for dynamic pane and window title generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DynamicTitleMode {
+    /// Tracks foreground process and falls back to directory or OSC title.
+    #[default]
+    Process,
+    /// Ignores foreground process inspection; honors only OSC escape sequences.
+    OscOnly,
+    /// Disables dynamic titles; preserves static index/name formatting.
+    Off,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DynamicTitleValue {
+    Bool(bool),
+    Str(String),
+}
+
+impl<'de> Deserialize<'de> for DynamicTitleMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match DynamicTitleValue::deserialize(deserializer)? {
+            DynamicTitleValue::Bool(true) => Ok(DynamicTitleMode::Process),
+            DynamicTitleValue::Bool(false) => Ok(DynamicTitleMode::Off),
+            DynamicTitleValue::Str(s) => match s.to_ascii_lowercase().as_str() {
+                "process" => Ok(DynamicTitleMode::Process),
+                "osc" | "osc_only" | "osc-only" => Ok(DynamicTitleMode::OscOnly),
+                "off" | "false" | "none" => Ok(DynamicTitleMode::Off),
+                _ => Ok(DynamicTitleMode::Process),
+            },
+        }
+    }
+}
+
+/// Formatting style for the pane's title band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneTitleFormat {
+    /// Displays command name when running, directory or OSC title when idle.
+    #[default]
+    Process,
+    /// Prioritizes current working directory over process name.
+    Pwd,
+    /// Combines process and working directory (`cmd (~/dir)`).
+    Both,
+}
+
+impl<'de> Deserialize<'de> for PaneTitleFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "pwd" | "cwd" | "dir" => Ok(PaneTitleFormat::Pwd),
+            "both" => Ok(PaneTitleFormat::Both),
+            _ => Ok(PaneTitleFormat::Process),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
+            font_family: None,
             font_size: 12.0,
             theme: "tokyonight".into(),
             scrollback: 10_000,
@@ -92,6 +162,8 @@ impl Default for Config {
             row_gap: 4.0,
             max_log_mb: 32,
             cursor_style: None,
+            dynamic_title: DynamicTitleMode::Process,
+            pane_title_format: PaneTitleFormat::Process,
             visual_wave: true,
             wave_speed: 1.0,
             wave_amplitude: 1.0,
@@ -149,6 +221,7 @@ mod tests {
         assert!((cfg.wave_speed - 1.0).abs() < 1e-6);
         assert!((cfg.wave_amplitude - 1.0).abs() < 1e-6);
         assert!(cfg.shell.is_none());
+        assert!(cfg.font_family.is_none());
     }
 
     #[test]
@@ -178,6 +251,7 @@ mod tests {
     fn all_fields_parse() {
         let cfg = parse_toml(
             r#"
+            font_family = "Fira Code"
             font_size = 13.5
             theme = "nord"
             scrollback = 5000
@@ -200,6 +274,7 @@ mod tests {
             system_prompt = "hello"
         "#,
         );
+        assert_eq!(cfg.font_family.as_deref(), Some("Fira Code"));
         assert!((cfg.font_size - 13.5).abs() < 1e-6);
         assert_eq!(cfg.theme, "nord");
         assert_eq!(cfg.scrollback, 5000);

@@ -4,6 +4,11 @@
 //! controls default fg/bg (applied via terminal default color setters) and all
 //! application chrome.
 
+/// Height of the tab bar, in logical pixels.
+pub const TAB_BAR_H: f32 = 30.0;
+/// Height of the status bar, in logical pixels.
+pub const STATUS_BAR_H: f32 = 26.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
