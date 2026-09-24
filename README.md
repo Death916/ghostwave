@@ -95,30 +95,6 @@ api_key_env = "OPENAI_API_KEY"
 Session data (pane logs + session state) lives in
 `~/.local/share/ghostwave/`.
 
-## Not in this build
-
-These were implemented in the macroquad front-end and are **not** ported yet.
-The archived branch is their only implementation:
-
-- **Remote / SSH panes** (`ghostd` durable sessions: `ds <host>`, attach,
-  reconnect with replay, kill). The `ghostd/` daemon crate is still here; only
-  the front-end's side is missing.
-- **Kitty graphics** (inline images in the terminal).
-- **Middle-click paste** and image previews.
-- **Session parking**: switching sessions saves the outgoing workspace, but its
-  processes end with it rather than continuing in the background.
-
-## Retired: the macroquad front-end
-
-The previous front-end (macroquad 0.4) is archived, not deleted:
-
-- Branch `macroquad-archive`, tag `macroquad-final` (the last commit it was
-  known good at: tests green, binary run in a real window).
-- `ARCHIVE.md` on that branch says how to build and run it, and carries the
-  `LD_LIBRARY_PATH` / miniquad gotcha.
-
-History was not rewritten: the code is still in this repo's past, and the
-branch and tag are the stable pointers.
 
 ## Project layout
 
