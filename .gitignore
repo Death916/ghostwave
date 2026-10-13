@@ -6,3 +6,6 @@ ghostd/.toolchain/
 perf.data*
 flamegraph.html
 target/
+
+# card worktrees created by the agent harness
+.worktrees/
