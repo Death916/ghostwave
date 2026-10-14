@@ -58,13 +58,89 @@ pub struct CellDims {
     pub baseline: f32,
 }
 
+/// Session-name prefix of a remote ghostd session: `ghostwave-<host token>`.
+pub const REMOTE_SESSION_PREFIX: &str = "ghostwave-";
+
+/// Longest ssh destination accepted, so a session file cannot feed an unbounded
+/// token into a command line.
+pub const HOST_MAX_LEN: usize = 255;
+
+/// Whether `host` is a usable ssh destination.
+///
+/// The accepted characters are exactly what the supported forms need — an alias,
+/// `user@host`, `host:port`, `[v6]:port`, `user@[v6]:port` and
+/// `ssh://user@host:port` — so a destination can be handed to `ssh` as an argv
+/// element and would still be plain data if it ever reached a shell. Whitespace,
+/// control characters, quotes and shell metacharacters are all refused at this
+/// boundary; the port (`%` for a zone id) is the only punctuation beyond the URI
+/// set.
+pub fn host_is_valid(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= HOST_MAX_LEN
+        && host.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '-' | '_' | '@' | ':' | '/' | '[' | ']' | '%')
+        })
+}
+
+/// The host as a filesystem-safe token, for session names.
+pub fn sanitize_host(host: &str) -> String {
+    host.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect()
+}
+
+/// The ghostd session a durable pane binds to on `host`: `ghostwave-<host>`.
+///
+/// This is the only source of a session name — a name stored in a session file
+/// is rederived from its host ([`RemoteSpec::rederived`]) rather than trusted.
+pub fn remote_session(host: &str) -> String {
+    format!("{REMOTE_SESSION_PREFIX}{}", sanitize_host(host))
+}
+
 /// A durable remote session binding (ghostd). Saved with the session so
 /// restore can re-show the pane in a disconnected state.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+///
+/// `session` is derived data: it is serialized for readability and backwards
+/// compatibility, but deserialization rederives it from `host`, so a crafted
+/// session file cannot choose the name that later reaches a remote command line
+/// or a `pkill` pattern.
+#[derive(Serialize, Clone, Debug)]
 pub struct RemoteSpec {
     pub host: String,
-    /// Session name on the remote host.
+    /// Session name on the remote host; always [`remote_session`] of `host`.
     pub session: String,
+}
+
+impl RemoteSpec {
+    /// The binding for `host`, with the session name derived from it.
+    pub fn for_host(host: &str) -> Self {
+        Self {
+            host: host.to_string(),
+            session: remote_session(host),
+        }
+    }
+
+    /// This binding with the session name rederived from its host.
+    ///
+    /// Used wherever a binding comes from outside the process — a session file,
+    /// a hand-edited config — so nothing downstream has to trust a stored name.
+    pub fn rederived(&self) -> Self {
+        Self::for_host(&self.host)
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored {
+            host: String,
+            #[serde(default)]
+            session: String,
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        Ok(RemoteSpec::for_host(&stored.host))
+    }
 }
 
 /// Reconnect state machine for remote (ssh/ghostd) panes.
