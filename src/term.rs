@@ -131,7 +131,9 @@ impl RemoteSpec {
 }
 
 impl<'de> Deserialize<'de> for RemoteSpec {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Stored {
             host: String,
