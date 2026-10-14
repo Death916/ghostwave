@@ -34,6 +34,7 @@ pub mod search_overlay;
 pub mod selection;
 mod ui_session;
 pub mod sessions_overlay;
+mod status_overlay;
 mod tick;
 pub mod visualizer;
 
@@ -115,6 +116,8 @@ pub enum Message {
     Search(search_overlay::SearchMessage),
     /// A message from the named-session picker.
     Sessions(sessions_overlay::SessionsMessage),
+    /// A message from the OSC 7501 program-status inbox.
+    Status(status_overlay::StatusMessage),
     /// A message from an AI chat pane's own widgets: its prompt input, its send
     /// button, its clear button.
     Ai {
@@ -389,6 +392,7 @@ impl App {
                 }
             }
             Message::Sessions(message) => ui_session::picker_message(&mut self.state, message),
+            Message::Status(message) => self.apply_status_message(message),
             Message::Noop => {}
         }
         if self.state.quit {
@@ -403,6 +407,7 @@ impl App {
         self.state.palette.is_some()
             || self.state.search.is_some()
             || self.state.session_picker.is_some()
+            || self.state.status_inbox.is_some()
     }
 
     /// Routes a key to the open overlay, if any; returns whether one consumed it.
@@ -428,7 +433,40 @@ impl App {
             self.sessions_key(key, modifiers);
             return true;
         }
+        if self.state.status_inbox.is_some() {
+            self.status_key(key, modifiers);
+            return true;
+        }
         false
+    }
+
+    /// Applies a key to the program-status inbox through the module's own key
+    /// map; the inbox has no bind that reaches a pane or the shell.
+    fn status_key(&mut self, key: &keyboard::Key, modifiers: keyboard::Modifiers) {
+        if let Some(message) = status_overlay::handle_key(key, modifiers) {
+            self.apply_status_message(message);
+        }
+    }
+
+    /// Applies one inbox message: navigating stays in the inbox, `Enter` goes to
+    /// the pane the record came from and closes it, `Esc` closes it. A pane that
+    /// closed while its record was on screen is a toast, not a failure.
+    fn apply_status_message(&mut self, message: status_overlay::StatusMessage) {
+        let action = self
+            .state
+            .status_inbox
+            .as_mut()
+            .and_then(|inbox| inbox.update(message));
+        match action {
+            Some(status_overlay::StatusAction::Focus(id)) => {
+                self.state.status_inbox = None;
+                if !self.state.focus_pane_id(id) {
+                    self.state.toast("that pane is gone");
+                }
+            }
+            Some(status_overlay::StatusAction::Close) => self.state.status_inbox = None,
+            None => {}
+        }
     }
 
     /// Applies a key to the command palette: navigation, submission and dismissal
@@ -635,6 +673,13 @@ impl App {
                 picker,
                 &self.state.theme,
                 Message::Sessions,
+            ));
+        }
+        if let Some(inbox) = self.state.status_inbox.as_ref() {
+            layers.push(status_overlay::view_mapped(
+                inbox,
+                &self.state.theme,
+                Message::Status,
             ));
         }
         if let Some(palette) = self.state.palette.as_ref() {

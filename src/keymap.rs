@@ -135,6 +135,8 @@ pub enum Action {
     SessionRename,
     SessionDelete,
     Detach,
+    /// Opens the OSC 7501 program-status inbox.
+    StatusInbox,
     Theme(String),
     FocusPane(u8),
     MoveTab(Dir),
@@ -233,6 +235,7 @@ pub fn global_binds(k: Key, m: Mods) -> Option<Action> {
     Some(match k {
         _ if ctrl_shift(k, m, P) => Action::OpenCommandBar,
         _ if ctrl_shift(k, m, F) => Action::OpenSearch,
+        _ if ctrl_shift(k, m, S) => Action::StatusInbox,
         _ if ctrl_shift(k, m, C) => Action::Copy,
         _ if ctrl_shift(k, m, V) => Action::Paste,
         _ if ctrl_shift(k, m, D) => Action::NewPaneDown,

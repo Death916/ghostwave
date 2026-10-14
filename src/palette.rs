@@ -693,6 +693,12 @@ pub fn default_items(themes: &[&str]) -> Vec<PaletteItem> {
         PaletteItem::new("Toggle Last Active Tab", "Tab", Some("Ctrl+T Tab"), ToggleLastTab),
         PaletteItem::new("Rename Tab", "Tab", Some("F2"), RenameTab),
         PaletteItem::new("Find in Terminal", "Terminal", Some("Ctrl+Shift+F"), OpenSearch),
+        PaletteItem::new(
+            "Program Status Inbox",
+            "Terminal",
+            Some("Ctrl+Shift+S"),
+            StatusInbox,
+        ),
         PaletteItem::new("Copy", "Terminal", Some("Ctrl+Shift+C"), Copy),
         PaletteItem::new("Paste", "Terminal", Some("Ctrl+Shift+V"), Paste),
         PaletteItem::new("Clear Terminal", "Terminal", Some("Ctrl+K"), ClearTerminal),

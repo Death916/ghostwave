@@ -464,6 +464,7 @@ pub(crate) fn execute(state: &mut AppState, action: Action) {
         Action::NewAi => new_content(state, ContentPane::ai(state.config.ai.clone())),
         Action::OpenFile(path) => new_content(state, ContentPane::preview(path)),
         Action::SessionManager => crate::ui_session::open_picker(state),
+        Action::StatusInbox => state.open_status_inbox(),
         Action::SessionNew => {
             let name = crate::ui_session::next_name();
             crate::ui_session::start(state, &name);

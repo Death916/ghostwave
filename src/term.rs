@@ -31,6 +31,7 @@ use libghostty_vt::{
 use crate::{
     clipboard,
     layout::Rect,
+    program_status::{Table, Tracker},
     pty::{Child, Pty, WinSize},
     search::SearchState,
 };
@@ -123,6 +124,9 @@ pub struct TermPane {
     pub log: Option<crate::session::AsyncPaneLog>,
     /// Optional cursor visual style override (from config).
     pub cursor_style: Option<libghostty_vt::render::CursorVisualStyle>,
+    /// OSC 7501 program status: this pane's records, and the scan that keeps
+    /// them (see [`crate::program_status`]).
+    status: Tracker,
 }
 
 impl TermPane {
@@ -310,6 +314,7 @@ impl TermPane {
             log_name,
             log,
             cursor_style: None,
+            status: Tracker::new(),
         })
         .map(|mut pane| {
             if spawn {
@@ -433,26 +438,59 @@ impl TermPane {
             match msg {
                 crate::pty::PtyMsg::Data(data) => {
                     if !data.is_empty() {
-                        if let Some(log) = self.log.as_mut() {
-                            log.write(&data);
-                        }
-                        self.term.vt_write(&data);
+                        self.ingest_bytes(&data);
                         had_activity = true;
                     }
                 }
                 crate::pty::PtyMsg::Eof => {
                     self.exited = Some("process exited".into());
+                    self.status.child_exit();
                     self.force_repaint = true;
                     self.last_exit_code = self.child.as_mut().and_then(|c| c.poll_reap());
                 }
                 crate::pty::PtyMsg::Error(e) => {
                     self.exited = Some(format!("pty error: {e}"));
+                    self.status.child_exit();
                     self.force_repaint = true;
                     self.last_exit_code = self.child.as_mut().and_then(|c| c.poll_reap());
                 }
             }
         }
         had_activity
+    }
+
+    /// Takes one read of pty output: to the pane's log, through the program-status
+    /// scan, and into the VT engine — the bytes the grid gets are the bytes the
+    /// child wrote, whatever the scan recognized among them.
+    ///
+    /// The scan may answer a feature-detection query from the program, which is
+    /// the only way it ever writes back.
+    pub fn ingest_bytes(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        if let Some(log) = self.log.as_mut() {
+            log.write(data);
+        }
+        let mut reply = Vec::new();
+        self.status.feed(data, &mut reply);
+        if !reply.is_empty() {
+            if let Some(pty) = self.pty.as_ref() {
+                pty.write(&reply);
+            }
+        }
+        self.term.vt_write(data);
+    }
+
+    /// This pane's OSC 7501 records.
+    pub fn program_status(&self) -> &Table {
+        self.status.table()
+    }
+
+    /// The child process exited: `working` and `blocked` records go, `done` and
+    /// `error` stay for the user to find.
+    pub fn program_status_child_exit(&mut self) {
+        self.status.child_exit();
     }
 
     pub fn write_input(&mut self, data: &[u8]) {
@@ -700,6 +738,8 @@ impl TermPane {
 
     pub fn clear_terminal(&mut self) -> Result<()> {
         self.term.reset();
+        // RIS removes every program-status record with everything else.
+        self.status.full_reset();
         self.force_repaint = true;
         Ok(())
     }

@@ -13,6 +13,7 @@ use iced::{
 };
 
 use crate::app::AppState;
+use crate::status_overlay::{StatusChip, state_color};
 use crate::ui_fonts;
 use crate::Message;
 
@@ -110,6 +111,21 @@ pub fn tab_bar<'a>(
     rename_target: Option<&'a str>,
     theme: &GhostTheme,
 ) -> Element<'a, Message> {
+    tab_bar_with_status(tabs, &[], rename_target, theme)
+}
+
+/// Native iced tab bar widget with each tab's OSC 7501 state on its chip.
+///
+/// `statuses` is parallel to `tabs`: a tab whose entry is `Some` gets the
+/// state's glyph before its label and its state colour for the label text, so a
+/// program that needs the user is visible on a tab nobody is looking at. A tab
+/// without a status keeps the plain active/inactive colours.
+pub fn tab_bar_with_status<'a>(
+    tabs: &[(String, bool)],
+    statuses: &[Option<StatusChip>],
+    rename_target: Option<&'a str>,
+    theme: &GhostTheme,
+) -> Element<'a, Message> {
     let theme = *theme;
     let mut chips: Vec<Element<'a, Message>> = Vec::with_capacity(tabs.len());
 
@@ -161,11 +177,16 @@ pub fn tab_bar<'a>(
             } else {
                 label.clone()
             };
+            let chip = statuses.get(i).copied().flatten();
+            let display_text = match chip {
+                Some(chip) => format!("{} {display_text}", chip.state.glyph()),
+                None => display_text,
+            };
 
-            let text_color = if is_active {
-                rgb(theme.palette_fg)
-            } else {
-                rgb(theme.tab_inactive_text)
+            let text_color = match chip {
+                Some(chip) => state_color(chip.state, &theme),
+                None if is_active => rgb(theme.palette_fg),
+                None => rgb(theme.tab_inactive_text),
             };
 
             let chip_bg = if is_active {
@@ -223,6 +244,12 @@ pub fn tab_bar_for_state<'a>(state: &'a AppState) -> Element<'a, Message> {
         .enumerate()
         .map(|(i, t)| (t.label(i), i == state.active_tab))
         .collect();
+    let statuses: Vec<Option<StatusChip>> = state
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(i, _)| state.tab_status_chip(i))
+        .collect();
 
     let rename_target = if state.mode == ghostwave::keymap::Mode::RenameTab {
         Some(state.rename_buf.as_str())
@@ -230,7 +257,7 @@ pub fn tab_bar_for_state<'a>(state: &'a AppState) -> Element<'a, Message> {
         None
     };
 
-    tab_bar(&tabs, rename_target, &state.theme)
+    tab_bar_with_status(&tabs, &statuses, rename_target, &state.theme)
 }
 
 /// Builder for constructing a tab bar widget with fluent options.

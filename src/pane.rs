@@ -329,23 +329,25 @@ impl Pane {
         self.dirty = true;
     }
 
-    /// Writes pty output to the pane log first, then to the VT.
+    /// Writes pty output to the pane log, through the OSC 7501 program-status
+    /// scan, then to the VT.
     pub fn ingest(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
         }
-        if let Some(log) = self.term.log.as_mut() {
-            log.write(data);
-        }
-        self.term.term.vt_write(data);
+        self.term.ingest_bytes(data);
         self.term.force_repaint = true;
         self.dirty = true;
     }
 
     /// Records that the child exited or the pty errored, reaping it for an exit code.
+    ///
+    /// The exit is also a program-status lifetime: `working` and `blocked`
+    /// records belong to the process that is gone.
     pub fn exited(&mut self, reason: &str) {
         self.term.exited = Some(reason.to_string());
         self.term.last_exit_code = self.term.child.as_mut().and_then(|c| c.poll_reap());
+        self.term.program_status_child_exit();
         self.term.force_repaint = true;
         self.dirty = true;
     }

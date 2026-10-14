@@ -4,6 +4,7 @@ pub mod clipboard;
 pub mod config;
 pub mod keymap;
 pub mod layout;
+pub mod program_status;
 pub mod pty;
 pub mod search;
 pub mod session;

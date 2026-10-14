@@ -28,7 +28,7 @@ use ghostwave::term::{CellDims, MouseEv, MouseEvKind};
 use ghostwave::theme::Theme as GhostTheme;
 use iced::widget::canvas::{self, Action, Event, Frame, Geometry};
 use iced::widget::pane_grid::{self, Axis, Content, PaneGrid, TitleBar};
-use iced::widget::{Canvas, container, text};
+use iced::widget::{Canvas, container, row, text};
 use iced::{
     Background, Border, Element, Fill, Font, Length, Padding, Point, Rectangle, Renderer, Theme,
     alignment, mouse,
@@ -40,6 +40,7 @@ use crate::ui_fonts;
 use crate::keys;
 use crate::pane::{ContentPane, PaneEntry, PaneId, SharedPane};
 use crate::pane_canvas::{self, CanvasState};
+use crate::status_overlay::{StatusChip, state_color};
 
 /// Gutter between neighbouring cells, in px.
 pub const SPACING: f32 = 4.0;
@@ -190,7 +191,16 @@ fn grid<'a>(state: &'a AppState, mouse_tracking: Vec<usize>) -> PaneGrid<'a, Mes
                 Some(PaneEntry::Content(content)) => content.label(),
                 None => String::new(),
             };
-            content = content.title_bar(TitleBar::new(label_band(&label, frame_color, font, theme)));
+            // The pane's OSC 7501 state, on its own band, so it is visible
+            // without focusing the pane. `None` when no program has reported.
+            let chip = index.and_then(|index| state.pane_status_chip(tab_index, index));
+            content = content.title_bar(TitleBar::new(label_band(
+                &label,
+                chip,
+                frame_color,
+                font,
+                theme,
+            )));
         }
         content.style(move |_theme| container::Style {
             background: Some(pane_canvas::rgb(theme.bg).into()),
@@ -246,18 +256,39 @@ fn content_body<'a>(content: &'a ContentPane, inset: f32, theme: GhostTheme) -> 
 
 /// The pane's label as a filled band, the canvas layer's chip turned into a title
 /// bar; a long label is clipped rather than wrapped, so the band keeps its height.
+///
+/// `chip` is the pane's OSC 7501 state, drawn in its own colour after the label
+/// as plain text — a record's `msg` and `title` reach the widget only through
+/// [`crate::status_overlay`], which disarms them first.
 fn label_band<'a>(
     label: &str,
+    chip: Option<StatusChip>,
     frame_color: ghostwave::theme::Rgb,
     font: Font,
     theme: GhostTheme,
 ) -> Element<'a, Message> {
-    container(
+    let mut children: Vec<Element<'a, Message>> = vec![
         text(label.to_string())
             .size(pane_canvas::LABEL_PX)
             .font(font)
             .color(pane_canvas::rgb(theme.tab_bg))
-            .wrapping(text::Wrapping::None),
+            .wrapping(text::Wrapping::None)
+            .into(),
+    ];
+    if let Some(chip) = chip {
+        children.push(
+            text(chip.label())
+                .size(pane_canvas::LABEL_PX)
+                .font(font)
+                .color(state_color(chip.state, &theme))
+                .wrapping(text::Wrapping::None)
+                .into(),
+        );
+    }
+    container(
+        row(children)
+            .spacing(8.0)
+            .align_y(alignment::Vertical::Center),
     )
     .width(Length::Shrink)
     .height(TITLE_H)

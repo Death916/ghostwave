@@ -1283,3 +1283,160 @@ merge-base. Not merged and not pushed — the merge is the owner's call.
   `folio_wait_bit_common` and the loopback `juicefs` daemon was the only busy process on the box.
   Root was at 96 % the whole time and the mount runs `--free-space-ratio 0.15`, so the write-back
   cache was throttled throughout — expect the same wall-clock for any future full-suite run here.
+
+### OSC 7501 Program Status Protocol, consumer side (branch `wt/osc7501`) — parse, per-pane records, lifetimes, iced surfacing
+
+The owner asked for OSC 7501. This is ghostwave as the **consumer**: it parses the
+protocol out of each pane's pty stream, keeps a record table per pane, honours the
+lifetimes a multiplexer has to decide for itself, answers feature detection, and
+shows the state in the chrome and in an inbox.
+
+**Spec revision pinned: 0.4 (2026-10-10)**, the live revision at
+`https://www.superlogical.com/rex/docs/build/program-status`. The card quoted 0.2
+(2026-10-06); the parsing grammar, the record/id rules, the states, the keys and
+every limit in the table are **byte-for-byte the same text** in 0.2 and 0.4, so
+implementing 0.4 implements 0.2's core. Three deltas:
+
+- **0.3** — absent `progress` means *indeterminate* (the key table already said so);
+  a program MAY send reports without querying first.
+- **0.4** — the feature-detection reply MAY carry `states=` and `kinds=` lists. We
+  send them: `ESC ] 7501 ; ?:states=idle,working,done,blocked,error:kinds=permission,question,auth ST`.
+  0.2 only asked that the query be answered, and a program reads an answer rather
+  than a fixed byte string, so this is legal under both and is what a 0.4-era
+  emitter checks to decide whether a newer state exists.
+- **0.4 removed the terminfo capability** (`Pst`) that 0.2 defined — and the card's
+  item 4 asked us to advertise it "only if we actually implement the query". We do
+  implement the query, and 0.4 says there is no terminfo entry to ship, so **no
+  terminfo entry is shipped**. `Pst` also goes stale over SSH and in multiplexers,
+  which is exactly why the spec now requires a program to query instead.
+
+#### What is implemented
+
+- `src/program_status.rs` (no new dependencies, std only): `Scanner` — a
+  fragment-tolerant byte scan for `ESC ] 7501 ; … ST|BEL`, bounded by the spec's
+  4096-byte whole-sequence limit, which also reports `OSC 133 ; A` (prompt mark)
+  and `ESC c` (RIS); `Table` — the records, whole-record replacement, `clear`
+  with and without an id, app inheritance up the id tree, LRU eviction;
+  `Tracker` — the two together with the lifetimes and the rate-limited answer.
+- `src/term.rs`: one `Tracker` per pane, fed from **both** paths pty bytes take —
+  `TermPane::poll_pty` (priming/restore) and `Pane::ingest` (the iced event path) —
+  through a single `TermPane::ingest_bytes`. The bytes the VT engine receives are
+  unchanged: the scan reads the same slice, it never filters or rewrites it.
+- Chrome: the pane's label band carries the state (glyph, state, kind, progress) in
+  the state's colour, and a tab's chip shows the glyph of the most urgent record any
+  of its panes holds — visible without focusing the pane.
+- `src/status_overlay.rs`: the inbox (`Ctrl+Shift+S`, also in the command palette) —
+  every live record across every pane, blocked first, each row naming the terminal it
+  came from, `Enter` jumping to that pane.
+
+#### Lifetimes, and the multiplexer decisions the spec leaves open
+
+The spec has **no multiplexer guidance** (open issue 1 in the third-party review), so
+these are decisions with reasoning rather than readings of the spec:
+
+- **Consume, never forward, never re-emit.** A report is kept in the pane's own table.
+  Forwarding is meaningless here (ghostwave is a GUI, not a pty link to an outer
+  terminal) and re-emitting on the pane's behalf is rejected outright: it would
+  attribute a program's state to ghostwave, double-report when a pane runs another
+  terminal, and put bytes on ghostwave's own stdout that no one asked for. ghostwave is
+  the terminal of record for its panes; that is the whole job.
+- **Nesting (a pane running a terminal, a nested ghostwave, or ssh).** Whichever
+  emulator is *attached to the pty the program writes to* is the terminal of record
+  and consumes the sequence. So: `ssh host prog` → the reports arrive over the outer
+  pane's pty (that channel is why the protocol exists) and ghostwave records them for
+  that pane. A pane running *another emulator* → that emulator consumes them and its
+  own chrome shows them; the outer pane records nothing, which is correct, because the
+  program's terminal is the inner one. Per spec, "a program writes to a terminal" —
+  one terminal, one consumer.
+- **OSC 9;4 is not mapped.** The spec says a terminal MAY map OSC 9;4 to the root
+  record and SHOULD stop once a 7501 report arrives. We never mapped it, so there is
+  nothing to stop: a mapped 9;4 can therefore never wipe the `kind`/`msg` of a real
+  report.
+- **Child exit / prompt begins** — `working` and `blocked` records are dropped;
+  `idle`, `done` and `error` stay (the spec MUSTs the first two, MAYs `idle`; we keep
+  `idle`). **RIS** clears every record (both from the byte scan and from ghostwave's
+  own `clear_terminal`, which calls `Terminal::reset`); a soft reset (DECSTR) and a
+  primary/alternate screen switch touch nothing, because nothing in ghostwave's
+  paths does. **Closing a pane** removes its records: they live in the pane's table,
+  and the inbox is built from the live panes, so a closed pane cannot be listed.
+- **What "process exits" means over SSH** (open issue 2) is answered as: the pane's
+  pty child. For a remote pane that is the ssh client/ghostd, so a remote program's
+  `working` record goes when the session ends — the scope the pane can actually see.
+
+#### Prompt marks: what the pin gives us (item 5 of the card)
+
+libghostty-vt 0.2.1 exposes **no event** for OSC 133: the callback set
+(`on_pty_write`, `on_bell`, `on_enquiry`, `on_xtversion`, `on_title_changed`,
+`on_pwd_changed`, `on_size`, `on_color_scheme`, `on_device_attributes`,
+`on_clipboard_write`) has no reset or prompt hook, and `osc::CommandType::SemanticPrompt`
+carries no data. The binding does expose row-level prompt state
+(`render::RowIterator` → `Row::semantic_prompt()` / `Cell::semantic_content()`), but
+that is a polled view of the visible screen — "a new prompt began" would mean diffing
+rows every frame and would miss a prompt that scrolled away, so it is not a lifetime
+signal.
+
+Because our scan runs on the same bytes, it can see the mark itself: `OSC 133 ; A` is
+detected in the pty stream and drives the same lifetime as the child exiting. **The
+limitation, recorded as the card asks:** this fires only when the pane's shell emits
+OSC 133 prompt marks (shell integration on); with integration off, the prompt-begins
+lifetime is not available and the lifetime falls back to child exit plus an explicit
+`state=clear` — which is what the card told us to do if the pin gives us nothing, and
+it is why both paths are implemented rather than one.
+
+#### LRU eviction and `blocked` (open issue 3)
+
+256 records per terminal (the spec's cap; terminals must support at least 64 — the
+table will not go below 64 even if asked). Above the cap the **least-recently-updated
+`blocked` record is pinned**: eviction takes the least-recently-updated *unblocked*
+record, and falls back to plain LRU only when every record is blocked, because a table
+that refuses to evict cannot stay bounded and the spec makes eviction mandatory. Two
+counters make the trade-off visible rather than silent: `Table::evicted` (surfaced in
+the inbox title as "N evicted at capacity") and `Table::blocked_count()`.
+
+#### Untrusted text
+
+`msg` and `title` are decoded, refused if they hold a control character (whole report
+dropped, per spec), stored as sent, and then **disarmed at the display edge**
+(`program_status::sanitize` replaces bidi overrides/isolates, zero-width and other
+invisible formatting, and the Unicode line/paragraph separators with U+FFFD) and capped
+(240/80 chars). They are drawn only through iced's plain-text widget — no markup path
+exists — and every row names the pane it came from. **Nothing in a record can cause an
+external effect**: no desktop notification, no sound, no write, no pty output beyond the
+constant feature-detection reply, so the only thing rate-limited is that reply (one per
+250 ms per pane; a query inside the window is dropped, not queued). A report's content
+is provably never echoed: the reply is a `const` byte string, pinned by a test.
+
+#### Verification
+
+`src/program_status.rs` is std-only by design, so its 41 tests run without cargo:
+`rustc --edition 2024 --test src/program_status.rs` → **41 passed, 0 failed** (conformance
+to the spec's example; unknown key; duplicate last-wins; malformed pair skipped; missing
+and unknown `state`; invalid base64; control character in decoded text; `msg`/`title`
+over their limits (at the limit and one past); over-long key; `id` past 8 levels/128
+bytes/32 per segment; `progress` non-numeric/out-of-range/at the edges; `kind` only with
+`blocked`; `clear` with and without an id; whole-record replacement; app inheritance and
+a missing parent; LRU at capacity; blocked-pinned eviction; the dominant-state order;
+child-exit and RIS lifetimes; a sequence split at **every** byte boundary and
+byte-by-byte; an over-long sequence dropped without losing sync; an abandoned body; the
+answer being the constant and never report content; rate limiting).
+
+`tests/program_status_pane.rs` drives the same protocol through a **real pane**: the
+spec's own shell function in a real `/bin/sh` on a real pty, asserting the working→done
+state change, that a 7501 report renders nothing on the grid, that `done` survives the
+child's exit while `working` does not, that a report split over pty reads is still found,
+and that a `OSC 7501 ; ? ST` query is answered over the pty byte-for-byte.
+**That binary and the crate-wide `cargo test` are written but NOT yet run** — see the
+blocked note below; nothing in this section claims otherwise.
+
+#### Blocked verification (environment)
+
+The crate build cannot run on orac at the moment of writing: `/mnt/myjfs` is mounted
+**read-only** (`JuiceFS:my-jfs-volume … ro`), so (a) the build gate cannot create/take
+its lock file (`build_gate.sh: : Read-only file system`, exit 1) and (b) this card's
+`CARGO_TARGET_DIR=/mnt/myjfs/build/ghostwave-osc7501` cannot be created. `/` itself has
+~2.3 GB free and the existing debug target on that mount is 4.8 GB, so there is no
+writable place with room for the dependency tree, and remounting needs root. The
+crate-wide `cargo test` (including `tests/program_status_pane.rs` and the iced
+front-end's own tests) is therefore **unverified**, as is the UI: the chrome chip, the
+tab glyph and the inbox compile untested, and whether the front-end can be driven
+headlessly on orac for a screenshot was not reached.

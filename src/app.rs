@@ -20,6 +20,7 @@ use iced::widget::pane_grid::{self, Axis, Split};
 use crate::pane::{ContentPane, Pane, PaneEntry, PaneId, SharedPane};
 use crate::panes_grid;
 use crate::remote;
+use crate::status_overlay::{StatusChip, StatusInbox, StatusRow};
 
 /// Ratios a resize keeps a split within, the same limits the canvas pane layer
 /// applies when it moves one.
@@ -386,6 +387,8 @@ pub struct AppState {
     pub current_session: String,
     /// The named-session picker, while it is open. Keys and clicks go here.
     pub session_picker: Option<crate::sessions_overlay::SessionsOverlay>,
+    /// The OSC 7501 program-status inbox, while it is open.
+    pub status_inbox: Option<StatusInbox>,
     /// Floating panes and the F12 scratchpad terminal.
     pub scratchpad: crate::scratchpad::ScratchpadState,
     /// Hosts whose ghostd binary is known to be present and current, so a
@@ -436,6 +439,7 @@ impl AppState {
             search: None,
             current_session: ghostwave::session::last_session(),
             session_picker: None,
+            status_inbox: None,
             scratchpad: crate::scratchpad::ScratchpadState::new(),
             binary_ready: Default::default(),
             remote_uploads,
@@ -589,6 +593,7 @@ impl AppState {
         );
         self.tick_content(dt);
         self.refresh_titles();
+        self.refresh_status_inbox();
     }
 
     /// `Fast` while a toast, an energized wave or a live visualizer is on
@@ -615,6 +620,115 @@ impl AppState {
     #[allow(dead_code)]
     pub fn toast(&mut self, message: impl Into<String>) {
         self.toast = Some((message.into(), std::time::Instant::now()));
+    }
+
+    // ---- OSC 7501 program status ------------------------------------------
+
+    /// The status chip for the terminal at `index` in `tab`.
+    ///
+    /// The pane is read with `try_lock`: the chrome must never wait on the pty
+    /// path, so a pane that is mid-write simply shows nothing this frame.
+    pub fn pane_status_chip(&self, tab: usize, index: usize) -> Option<StatusChip> {
+        let pane = self.tabs.get(tab)?.pane(index)?;
+        let guard = pane.try_lock().ok()?;
+        guard
+            .term
+            .program_status()
+            .dominant()
+            .map(StatusChip::from_record)
+    }
+
+    /// The status chip for a whole tab: the most urgent record any of its panes
+    /// holds, so an unfocused tab still says that something needs the user.
+    pub fn tab_status_chip(&self, tab: usize) -> Option<StatusChip> {
+        let tab = self.tabs.get(tab)?;
+        tab.term_handles()
+            .iter()
+            .filter_map(|pane| {
+                let guard = pane.try_lock().ok()?;
+                guard
+                    .term
+                    .program_status()
+                    .dominant()
+                    .map(StatusChip::from_record)
+            })
+            .max_by_key(|chip| chip.state.urgency())
+    }
+
+    /// Every live record across every pane, ordered blocked first and then by
+    /// how recently it was updated, with the number of records left off the end
+    /// of the list and the total evicted at capacity.
+    ///
+    /// A closed pane is not in it: its records went with its table.
+    pub fn status_rows(&self) -> (Vec<StatusRow>, usize, u64) {
+        let mut rows: Vec<StatusRow> = Vec::new();
+        let mut evicted = 0u64;
+        for (tab_index, tab) in self.tabs.iter().enumerate() {
+            for (index, entry) in tab.panes.iter().enumerate() {
+                let Some(entry) = entry.as_ref() else { continue };
+                let Some(handle) = entry.term() else { continue };
+                let Ok(guard) = handle.try_lock() else { continue };
+                let table = guard.term.program_status();
+                evicted += table.evicted;
+                let source = format!("Tab {} / pane {}", tab_index + 1, index + 1);
+                for record in table.records() {
+                    rows.push(StatusRow::from_record(
+                        source.clone(),
+                        Some(entry.id()),
+                        table,
+                        record,
+                    ));
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            b.chip
+                .state
+                .urgency()
+                .cmp(&a.chip.state.urgency())
+                .then(b.updated.cmp(&a.updated))
+                .then(a.source.cmp(&b.source))
+        });
+        let hidden = rows.len().saturating_sub(crate::status_overlay::MAX_ROWS);
+        rows.truncate(crate::status_overlay::MAX_ROWS);
+        (rows, hidden, evicted)
+    }
+
+    /// Opens the program-status inbox, or leaves the open one where it is.
+    pub fn open_status_inbox(&mut self) {
+        if self.status_inbox.is_none() {
+            self.status_inbox = Some(StatusInbox::default());
+        }
+        self.refresh_status_inbox();
+    }
+
+    /// Rebuilds the open inbox's rows from the live panes. Programs change state
+    /// as fast as they can write, so this runs every tick.
+    pub fn refresh_status_inbox(&mut self) {
+        if self.status_inbox.is_none() {
+            return;
+        }
+        let (rows, hidden, evicted) = self.status_rows();
+        if let Some(inbox) = self.status_inbox.as_mut() {
+            inbox.relist(rows, hidden, evicted);
+        }
+    }
+
+    /// Focuses the pane with identity `id`, switching to the tab that holds it.
+    /// Returns whether the workspace still has that pane.
+    pub fn focus_pane_id(&mut self, id: PaneId) -> bool {
+        let found = self
+            .tabs
+            .iter()
+            .enumerate()
+            .find_map(|(tab_index, tab)| tab.index_of(id).map(|index| (tab_index, index)));
+        let Some((tab_index, index)) = found else {
+            return false;
+        };
+        self.active_tab = tab_index;
+        self.tabs[tab_index].active = index;
+        self.relayout();
+        true
     }
 
     /// Energizes the wave; called on every key press.
