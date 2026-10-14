@@ -191,13 +191,22 @@ status working:id=leftover "Still going"
 }
 
 #[test]
-fn a_query_is_never_a_record_and_renders_nothing() {
-    // `OSC 7501 ; ? ST` is feature detection, not a report: it must leave no
-    // record (a pane that recorded it would invent a program out of a query)
-    // and must not reach the grid, which must stay empty.
+fn a_query_leaves_no_record_and_echoes_no_report_content() {
+    // A query is feature detection, not a report: it must leave no record — a
+    // pane that recorded it would invent a program out of a query — and the
+    // pane's answer must never carry a report's content.
+    //
+    // The answer itself does reach the grid, and that is not something to
+    // assert away: the pane writes the constant reply into the child's pty, and
+    // a child that has stopped reading (this script sleeps) leaves the line
+    // discipline to echo it back caret-escaped, the path `term::prime_pty`
+    // documents. So the grid is asserted to hold no *report* text rather than to
+    // be empty: the report below carries a marker, and that marker must never
+    // appear — nor may anything the pane reads back from the pty turn into a
+    // record.
     let script = r#"
+printf '\033]7501;state=blocked:msg=U0VDUkVULU1BUktFUg==\033\\'
 printf '\033]7501;?\033\\'
-printf '\033]7501;?:states=idle,working,done,blocked,error\033\\'
 sleep 1
 "#;
     let mut pane = pane_running(script);
@@ -206,13 +215,13 @@ sleep 1
     assert_eq!(
         pane.program_status().len(),
         0,
-        "a query leaves no record"
+        "a query is not a record, and the report's `blocked` record dies with the child"
     );
     let rows = rows(&pane);
-    let content: Vec<&String> = rows.iter().filter(|row| !row.is_empty()).collect();
+    let visible = rows.join("\n");
     assert!(
-        content.is_empty(),
-        "the query rendered nothing on the grid: {rows:?}"
+        !visible.contains("SECRET-MARKER") && !visible.contains("msg="),
+        "no report content reaches the grid: {rows:?}"
     );
 }
 
@@ -221,9 +230,11 @@ fn a_report_split_over_pty_reads_is_still_found() {
     // `dd` hands the sequence over in one-byte reads, so the pane's own reads
     // land wherever the scheduler happens to cut them.
     // The `msg` is base64 of "Apply 3 to add, 1 to change, 0 to destroy?", so
-    // the pty is fed a report no shell quoting can mangle.
+    // the pty is fed a report no shell quoting can mangle. Its last character is
+    // `/`, not `?`: the value charset has no `?`, so a literal ending in one is
+    // a malformed pair and the parser skips it by design.
     let script = r#"
-printf '\033]7501;state=blocked:kind=permission:app=terraform:msg=QXBwbHkgMyB0byBhZGQsIDEgdG8gY2hhbmdlLCAwIHRvIGRlc3Ryb3k?\033\\' | dd bs=1 2>/dev/null
+printf '\033]7501;state=blocked:kind=permission:app=terraform:msg=QXBwbHkgMyB0byBhZGQsIDEgdG8gY2hhbmdlLCAwIHRvIGRlc3Ryb3k/\033\\' | dd bs=1 2>/dev/null
 sleep 1
 "#;
     let mut pane = pane_running(script);
