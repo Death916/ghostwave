@@ -1406,9 +1406,72 @@ constant feature-detection reply, so the only thing rate-limited is that reply (
 250 ms per pane; a query inside the window is dropped, not queued). A report's content
 is provably never echoed: the reply is a `const` byte string, pinned by a test.
 
+#### Upstream now parses 7501 — our pin cannot reach it (checked 2026-10-14)
+
+Raised on the card: *"i think libghostty has this now so we might not need to implement it
+all"*. Half true, and worth writing down so nobody re-derives it:
+
+- **Upstream ghostty main does have it.** `src/terminal/osc/parsers/program_status.zig`
+  exists, with the spec's limits, `State`/`Kind`, base64 text decoding and the 0.4
+  feature-detection reply (`?:states=…:kinds=…`). Its own doc comment says the parser
+  *"only reads and validates one report at a time. Keeping records is up to the code that
+  handles the command."*
+- **The engine we compile does not.** `libghostty-vt-sys 0.2.1` vendors ghostty at commit
+  `a887df42` (2026-07-11) — eleven weeks before spec rev 0.1 (2026-09-28). Its
+  `src/terminal/osc/parsers/` has no `program_status.zig`, and `grep -rl "7501\|program_status"
+  $S/src/terminal` finds nothing. The Rust binding's `CommandType` stops at
+  `SemanticPrompt`.
+- **No bump exists today.** crates.io: `libghostty-vt` newest is 0.2.2 (2026-09-28), but
+  `libghostty-vt-sys` — the crate that carries the engine — is still 0.2.1 (2026-07-18).
+  Every possible pin today carries the July engine.
+- **What a future bump would replace is the small half.** It would replace our byte scanner
+  and validator; the record table, `clear` semantics, app inheritance, LRU with `blocked`
+  pinning, the multiplexer lifetimes and the whole iced surfacing stay ours, because
+  upstream leaves them to the consumer. That is roughly three quarters of this branch.
+
+So: pin-sync to `uzaaft/libghostty-rs` once a `libghostty-vt-sys` past the upstream merge
+is published, then delete the scanner and read the engine's effect instead — a follow-up
+in its own right, since it moves three months of terminal emulation and needs the whole
+suite re-run. It is not a reason to drop this work: with the pin we have, nothing would
+parse 7501 at all.
+
 #### Verification
 
-`src/program_status.rs` is std-only by design, so its 41 tests run without cargo:
+`cargo test --all-targets --no-fail-fast`, through the build gate (`usermgr_build.sh` →
+`build_gate.sh`, own `CARGO_TARGET_DIR=/mnt/myjfs/build/ghostwave-osc7501`), **EXIT=0** —
+log `…/scratch/osc7501/cargo-verify4.log`, unit start 06:19:15 → exit 06:29:49, sha256
+`a9c8ba9f…`:
+
+    --lib                       ok.  90 passed; 0 failed   (the 41 protocol tests are among them)
+    --bin ghostwave             ok. 138 passed; 0 failed
+    --test flood_throughput     ok.   1 passed; 0 failed
+    --test program_status_pane  ok.   5 passed; 0 failed
+    --test term_core            ok.   6 passed; 0 failed
+
+240 tests, no failures. The suite was run four times to get there, so the failures it found
+on the way are part of the record rather than hidden (commits `65256a6`, `9b368b5`):
+
+- `cargo check --all-targets --keep-going` — clean in 5m11s: the pane wiring,
+  `tests/program_status_pane.rs` and the whole iced front-end type-check.
+- one compile error, `E0502` at `src/term.rs:429`: `poll_pty` held the `pty_rx` borrow
+  across `self.ingest_bytes`. The pty reads are drained into a `Vec` first, so the
+  receiver borrow ends before the scan needs `&mut self`.
+- five test failures across the runs, **every one of them a test asserting something the
+  protocol or the environment does not do**, and each one worth knowing:
+  - `msg` base64 literals that did not decode — one invalid UTF-8, one ending in `?`,
+    which the value charset `[A-Za-z0-9_.,+/=-]*` excludes, so the pair is a malformed
+    pair that is skipped by design and the record keeps no `msg`;
+  - three pane tests reading a `working`/`blocked` record *after* the child exited — i.e.
+    after the lifetime this feature implements had correctly dropped it;
+  - one pane test asserting the grid stays empty after a query, when the pane's constant
+    answer is echoed back caret-escaped by the child's pty (the path `term::prime_pty`
+    documents). It now asserts what the spec asks for instead: no *report* content ever
+    reaches the grid.
+- `term::tests::prime_drains_early_child_output` is flaky on this box and not ours: it
+  fails in the sibling master build (`scratch/g1/cargo-test-run2.log`) and passes there in
+  run 4. It passed in both runs that ended green.
+
+`src/program_status.rs` is std-only by design, so its 41 tests also run without cargo:
 `rustc --edition 2024 --test src/program_status.rs` → **41 passed, 0 failed** (conformance
 to the spec's example; unknown key; duplicate last-wins; malformed pair skipped; missing
 and unknown `state`; invalid base64; control character in decoded text; `msg`/`title`
@@ -1424,19 +1487,31 @@ answer being the constant and never report content; rate limiting).
 spec's own shell function in a real `/bin/sh` on a real pty, asserting the working→done
 state change, that a 7501 report renders nothing on the grid, that `done` survives the
 child's exit while `working` does not, that a report split over pty reads is still found,
-and that a `OSC 7501 ; ? ST` query is answered over the pty byte-for-byte.
-**That binary and the crate-wide `cargo test` are written but NOT yet run** — see the
-blocked note below; nothing in this section claims otherwise.
+and that a query leaves no record and echoes no report content. The byte-for-byte query
+answer is pinned by the module's own tests, which feed `Tracker` the exact query bytes and
+assert the constant reply, that no report's content is in it, and that repeats are
+rate-limited; end-to-end the answer is echoed by the pty, so it cannot be read off the
+child.
 
-#### Blocked verification (environment)
+#### The build environment, and why the first attempt misread it
 
-The crate build cannot run on orac at the moment of writing: `/mnt/myjfs` is mounted
-**read-only** (`JuiceFS:my-jfs-volume … ro`), so (a) the build gate cannot create/take
-its lock file (`build_gate.sh: : Read-only file system`, exit 1) and (b) this card's
-`CARGO_TARGET_DIR=/mnt/myjfs/build/ghostwave-osc7501` cannot be created. `/` itself has
-~2.3 GB free and the existing debug target on that mount is 4.8 GB, so there is no
-writable place with room for the dependency tree, and remounting needs root. The
-crate-wide `cargo test` (including `tests/program_status_pane.rs` and the iced
-front-end's own tests) is therefore **unverified**, as is the UI: the chrome chip, the
-tab glyph and the inbox compile untested, and whether the front-end can be driven
-headlessly on orac for a screenshot was not reached.
+A direct `build_gate.sh` call dies `EROFS` / `GATE_EXIT=1` on this box: the gateway
+(`hermes-agent.service`, `ProtectSystem=strict`, `ReadWritePaths=/home/death916 …`) hands
+every process it spawns a **read-only** view of `/mnt/myjfs`, while `/proc/1/mounts` shows
+the mount itself is `rw`. Builds therefore go through `usermgr_build.sh`, which launches
+the gate as a `systemd --user` unit in the user manager's mount namespace
+(`mnt:[4026531832]`, rw) where the fleet's `CARGO_TARGET_DIR` under
+`/mnt/myjfs/build/<project>` is writable. No root remount and no root space is involved.
+
+#### Still NEEDS-VULCAN: the interactive capture
+
+Item 7's visual half — run the spec's shell function in a ghostwave window and capture the
+state change on the pane band, the tab chip and the inbox — needs a display. orac has no
+`DISPLAY`, no Wayland, no X socket and no X/Wayland process, so the front-end cannot be
+driven for a screenshot here. What *is* verified is the protocol half of the same demo:
+`tests/program_status_pane.rs` runs the spec's own shell function in a real pane on a real
+pty and asserts the working→done change. The UI type-checks and its widget logic is
+unit-tested (chip label, row source, wording, disarming, capping, navigation), but nothing
+in this branch has drawn a frame on a screen — that half belongs to a machine with a
+screen.
+
