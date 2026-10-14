@@ -1669,8 +1669,15 @@ mod tests {
 
         state.ensure_remote_binary("prod");
         ssh.wait_calls(1, std::time::Duration::from_secs(5));
-        state.drain_remote_uploads();
+        // The report is sent by the upload thread after its last call returns, so
+        // give the channel a bounded chance to deliver it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state.uploads_pending.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            state.drain_remote_uploads();
+        }
 
+        assert!(state.uploads_pending.is_empty(), "the upload reported back");
         assert!(!state.binary_ready.contains("prod"), "the failed host is not ready");
         assert!(!state.remote_activity(), "and nothing is left in flight");
 
