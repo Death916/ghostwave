@@ -429,12 +429,17 @@ impl TermPane {
             return false;
         }
 
-        let Some(rx) = self.pty_rx.as_ref() else {
-            return false;
-        };
+        // Drained first, handled after: the receiver borrows `self`, and
+        // handling a read (which scans it for program status) needs it mutable.
+        let mut pending = Vec::new();
+        if let Some(rx) = self.pty_rx.as_ref() {
+            while let Ok(msg) = rx.try_recv() {
+                pending.push(msg);
+            }
+        }
 
         let mut had_activity = false;
-        while let Ok(msg) = rx.try_recv() {
+        for msg in pending {
             match msg {
                 crate::pty::PtyMsg::Data(data) => {
                     if !data.is_empty() {

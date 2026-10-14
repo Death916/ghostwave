@@ -460,7 +460,7 @@ mod tests {
     fn a_row_disarms_bidi_text_from_a_record() {
         // "safe\u{202e}gnp.exe" — the override would reorder the line it is
         // drawn in, so it never reaches the widget.
-        let table = table_with(&["state=blocked:msg=c2FmZSLuZ25wLmV4ZQ=="]);
+        let table = table_with(&["state=blocked:msg=c2FmZeKArmducC5leGU="]);
         let record = table.get(Table::ROOT).unwrap();
         assert!(
             record.msg.as_deref().unwrap().contains('\u{202e}'),
