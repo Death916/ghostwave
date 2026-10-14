@@ -135,7 +135,9 @@ impl<'de> Deserialize<'de> for RemoteSpec {
         #[derive(Deserialize)]
         struct Stored {
             host: String,
+            /// Accepted from the file format, then ignored: the name is derived.
             #[serde(default)]
+            #[allow(dead_code)]
             session: String,
         }
         let stored = Stored::deserialize(deserializer)?;
