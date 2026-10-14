@@ -29,6 +29,10 @@ enum BridgeMsg {
 struct Slot {
     tag: PaneTag,
     rx: Mutex<Option<fmpsc::UnboundedReceiver<BridgeMsg>>>,
+    /// Keeps an idle slot's channel open, so a pane that has no child yet
+    /// streams nothing instead of ending. Held for its drop, never read.
+    #[allow(dead_code)]
+    keepalive: Option<fmpsc::UnboundedSender<BridgeMsg>>,
 }
 
 /// A pane's iced-side receiver; hashes by pointer so the subscription identity is
@@ -103,6 +107,18 @@ pub fn spawn(id: crate::pane::PaneId, rx: mpsc::Receiver<PtyMsg>) -> PtyRxSlot {
     PtyRxSlot(Arc::new(Slot {
         tag: PaneTag(id),
         rx: Mutex::new(Some(out_rx)),
+        keepalive: None,
+    }))
+}
+
+/// The slot for a pane that has no child (a restored remote pane): its stream
+/// stays open and yields nothing until the pane reconnects and takes a real one.
+pub fn idle(id: crate::pane::PaneId) -> PtyRxSlot {
+    let (tx, out_rx) = fmpsc::unbounded::<BridgeMsg>();
+    PtyRxSlot(Arc::new(Slot {
+        tag: PaneTag(id),
+        rx: Mutex::new(Some(out_rx)),
+        keepalive: Some(tx),
     }))
 }
 

@@ -12,13 +12,14 @@ use std::sync::{Arc, Mutex};
 
 use ghostwave::config::Config;
 use ghostwave::layout::{Dir, SplitDir};
-use ghostwave::term::CellDims;
+use ghostwave::term::{CellDims, ReconnectState, RemoteSpec};
 use ghostwave::theme::{self, Theme};
 use iced::Size;
 use iced::widget::pane_grid::{self, Axis, Split};
 
 use crate::pane::{ContentPane, Pane, PaneEntry, PaneId, SharedPane};
 use crate::panes_grid;
+use crate::remote;
 
 /// Ratios a resize keeps a split within, the same limits the canvas pane layer
 /// applies when it moves one.
@@ -29,6 +30,12 @@ const RATIO_MAX: f32 = 0.9;
 /// paint.
 const SPAWN_COLS: u16 = 80;
 const SPAWN_ROWS: u16 = 24;
+
+/// Grid a remote pane is born with, as the reference opened them: an ssh pane is
+/// sized by its own bounds on the first paint like any other, and the remote
+/// side sees this until then.
+const REMOTE_COLS: u16 = 100;
+const REMOTE_ROWS: u16 = 30;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -381,6 +388,14 @@ pub struct AppState {
     pub session_picker: Option<crate::sessions_overlay::SessionsOverlay>,
     /// Floating panes and the F12 scratchpad terminal.
     pub scratchpad: crate::scratchpad::ScratchpadState,
+    /// Hosts whose ghostd binary is known to be present and current, so a
+    /// reconnecting pane may connect without waiting for an upload.
+    pub binary_ready: std::collections::HashSet<String>,
+    /// Results of the background ghostd uploads, drained by [`AppState::tick`].
+    pub(crate) remote_uploads: std::sync::mpsc::Receiver<crate::remote::UploadResult>,
+    remote_upload_tx: std::sync::mpsc::Sender<crate::remote::UploadResult>,
+    /// Uploads still in flight; the front-end keeps ticking while any is.
+    uploads_in_flight: usize,
     last_tick: std::time::Instant,
     window: Size,
 }
@@ -400,6 +415,7 @@ pub enum TickRate {
 impl AppState {
     pub fn new(config: Config, cell: CellDims, window: Size) -> Result<Self> {
         let theme = theme::by_name(&config.theme);
+        let (remote_upload_tx, remote_uploads) = crate::remote::upload_channel();
         let mut state = Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -421,6 +437,10 @@ impl AppState {
             current_session: ghostwave::session::last_session(),
             session_picker: None,
             scratchpad: crate::scratchpad::ScratchpadState::new(),
+            binary_ready: Default::default(),
+            remote_uploads,
+            remote_upload_tx,
+            uploads_in_flight: 0,
             last_tick: std::time::Instant::now(),
             window,
         };
@@ -560,13 +580,20 @@ impl AppState {
             }
         }
 
+        self.drain_remote_uploads();
+        remote::reconnect_pass(
+            &self.config,
+            &self.binary_ready,
+            &mut self.tabs,
+            std::time::Instant::now(),
+        );
         self.tick_content(dt);
         self.refresh_titles();
     }
 
     /// `Fast` while a toast, an energized wave or a live visualizer is on
-    /// screen, `Slow` for an idle wave, dynamic title polling or an AI reply in
-    /// flight, otherwise `Off`.
+    /// screen, `Slow` for an idle wave, dynamic title polling, an AI reply in
+    /// flight or a remote pane with something to do, otherwise `Off`.
     pub fn tick_rate(&self) -> TickRate {
         if self.toast.is_some() || (self.config.visual_wave && self.wave_energy > 0.15) {
             TickRate::Fast
@@ -576,6 +603,7 @@ impl AppState {
             TickRate::Slow
         } else if self.config.dynamic_title != crate::ui_config::DynamicTitleMode::Off
             || self.ai_pending()
+            || self.remote_activity()
         {
             TickRate::Slow
         } else {
@@ -1020,6 +1048,405 @@ impl AppState {
             }
         }
     }
+
+    // ---- remote/SSH panes (ghostd) ---------------------------------------
+
+    /// Opens a plain `ssh <host>` connection in its own session (`ssh-<host>`) as
+    /// a new tab.
+    ///
+    /// The connection is not durable — it has no ghostd binding, so it is not
+    /// shown with the session manager's `ssh` marker and does not auto-reconnect.
+    /// Re-running the command resumes it by re-opening the connection, which is
+    /// what living in its own named session is for.
+    pub fn connect_ssh(&mut self, host: &str) {
+        let target = remote::ssh_session(host);
+        let fresh = if self.current_session != target {
+            self.open_remote_session(&target)
+        } else {
+            false
+        };
+        let args = [host];
+        match self.remote_pane(Some("ssh"), &args, None) {
+            Ok(pane) => {
+                self.push_remote_tab(pane, &format!("ssh {host}"), fresh);
+                self.toast(format!("connecting to {host}"));
+            }
+            Err(e) => self.toast(format!("ssh failed: {e}")),
+        }
+    }
+
+    /// Opens a durable remote pane on `host`: `ssh -t <host>` running the ghostd
+    /// attach command, bound to `ghostwave-<host>` so it can be restored and
+    /// killed independently of the local pane.
+    ///
+    /// The ghostd binary is uploaded in the background on first use; until the
+    /// upload lands the pane's ssh reports the missing binary and exits, and the
+    /// auto-reconnect loop retries. Re-running the command focuses the existing
+    /// attach pane (one daemon serves one client at a time) instead of stacking a
+    /// duplicate.
+    pub fn connect_durable_ssh(&mut self, host: &str) {
+        let target = remote::ssh_session(host);
+        let fresh = if self.current_session != target {
+            self.open_remote_session(&target)
+        } else {
+            false
+        };
+        if let Some((tab, pane)) = self.remote_pane_of_host(host) {
+            self.active_tab = tab;
+            self.tabs[tab].active = pane;
+            if self.remote_pane_needs_connect(tab, pane) {
+                self.connect_remote_pane(tab, pane);
+                self.toast(format!("reconnecting durable ssh: {host}"));
+            } else {
+                self.toast(format!("already attached to {host}"));
+            }
+            return;
+        }
+        let session = remote::remote_session(host);
+        let argv = remote::attach_argv(host, &session);
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        self.ensure_remote_binary(host);
+        let spec = RemoteSpec {
+            host: host.to_string(),
+            session,
+        };
+        match self.remote_pane(Some("ssh"), &args, Some(spec)) {
+            Ok(pane) => {
+                self.push_remote_tab(pane, &format!("ssh {host}"), fresh);
+                self.toast(format!("durable ssh: {host}"));
+            }
+            Err(e) => self.toast(format!("ssh failed: {e}")),
+        }
+    }
+
+    /// Connects the remote pane at `(tab, pane)` now: immediately when its host's
+    /// ghostd binary is already there, otherwise once the upload lands.
+    ///
+    /// A manual connect spends no auto-reconnect attempt: the failure count is
+    /// reset, so a pane the user reconnects by hand gets the full budget again.
+    pub fn connect_remote_pane(&mut self, tab: usize, pane: usize) {
+        let Some((host, _session)) = self.remote_spec_of(tab, pane) else {
+            return;
+        };
+        let ready = self.binary_ready.contains(&host);
+        if !ready {
+            self.ensure_remote_binary(&host);
+        }
+        let Some(handle) = self.pane_at(tab, pane) else {
+            return;
+        };
+        let mut guard = handle.lock().unwrap();
+        guard.term.reconnect_failures = 0;
+        if ready {
+            if guard.respawn_remote() {
+                return;
+            }
+            guard.term.reconnect = ReconnectState::Manual;
+            drop(guard);
+            self.toast("reconnect failed");
+        } else {
+            guard.term.reconnect = ReconnectState::Waiting {
+                attempt: 1,
+                next: std::time::Instant::now(),
+            };
+        }
+    }
+
+    /// Kills the remote session the pane at `(tab, pane)` is bound to, over a
+    /// fresh ssh connection. The local pane stays as it is — it is left
+    /// disconnected, and the kill is the daemon's own to report.
+    pub fn kill_remote_pane(&mut self, tab: usize, pane: usize) {
+        let Some((host, session)) = self.remote_spec_of(tab, pane) else {
+            return;
+        };
+        self.toast(format!("killing remote session {session} on {host}"));
+        remote::spawn_kill(&host, &session);
+    }
+
+    /// Palette "Kill Remote Session": kills the remote session of the focused
+    /// pane and closes the pane — the only way to be rid of a durable remote
+    /// session completely.
+    pub fn kill_active_remote_pane(&mut self) {
+        let tab = self.active_tab;
+        let pane = self.tabs[tab].active;
+        let Some((host, session)) = self.remote_spec_of(tab, pane) else {
+            self.toast("no remote session in active pane");
+            return;
+        };
+        self.kill_remote_pane(tab, pane);
+        self.close_active();
+        self.toast(format!("killed remote session {session} on {host}"));
+    }
+
+    /// Session manager `k`: kills every remote daemon the named session owns,
+    /// then drops a session that held nothing else.
+    ///
+    /// The daemons are killed over fresh ssh connections, so this works when the
+    /// panes are dead or the daemons are wedged; a session whose panes are ALL
+    /// remote is removed, while a mixed one keeps its local tabs.
+    pub fn kill_session_remotes(&mut self, name: &str) {
+        let (specs, pure) = if name == self.current_session {
+            (
+                Self::live_remote_specs(&self.tabs),
+                Self::live_is_pure_remote(&self.tabs),
+            )
+        } else {
+            (
+                ghostwave::session::remote_specs(name),
+                ghostwave::session::is_pure_remote(name),
+            )
+        };
+        if specs.is_empty() {
+            self.toast(format!("no remote sessions in {name}"));
+            return;
+        }
+        let hosts = remote::dedupe_hosts(specs);
+        for (host, session) in &hosts {
+            remote::spawn_kill(host, session);
+        }
+        let on = hosts
+            .iter()
+            .map(|(host, _)| host.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if name != self.current_session && pure {
+            ghostwave::session::delete(name);
+            crate::ui_session::refresh_picker(self);
+            self.toast(format!(
+                "killed {} remote session(s) on {on}, removed {name}",
+                hosts.len()
+            ));
+        } else {
+            self.toast(format!(
+                "killed {} remote session(s) on {on}",
+                hosts.len()
+            ));
+        }
+    }
+
+    /// Stops the auto-reconnect loop on the focused pane: it stays disconnected
+    /// until Enter connects it.
+    pub fn stop_remote_reconnect(&mut self) {
+        if let Some(handle) = self.active_pane() {
+            handle.lock().unwrap().term.reconnect = ReconnectState::Manual;
+        }
+        self.toast("reconnect stopped — Enter to connect");
+    }
+
+    /// Whether the focused pane is a remote pane with no live connection, which
+    /// is the state its own keys act on.
+    pub fn remote_pane_disconnected(&self) -> bool {
+        self.active_pane()
+            .is_some_and(|handle| handle.lock().unwrap().remote_disconnected())
+    }
+
+    /// The host and daemon session of the pane at `(tab, pane)`.
+    pub fn remote_spec_of(&self, tab: usize, pane: usize) -> Option<(String, String)> {
+        self.pane_at(tab, pane)?.lock().unwrap().remote_spec()
+    }
+
+    /// Every (host, daemon session) pair across live tabs.
+    fn live_remote_specs(tabs: &[Tab]) -> Vec<(String, String)> {
+        let mut specs = Vec::new();
+        for tab in tabs {
+            for entry in tab.panes.iter().flatten() {
+                if let Some(spec) = entry.term().and_then(|handle| handle.lock().unwrap().remote_spec()) {
+                    specs.push(spec);
+                }
+            }
+        }
+        specs
+    }
+
+    /// Whether every live pane is a durable remote pane, so killing its daemons
+    /// leaves nothing behind.
+    fn live_is_pure_remote(tabs: &[Tab]) -> bool {
+        let mut total = 0;
+        let mut remote = 0;
+        for tab in tabs {
+            for entry in tab.panes.iter().flatten() {
+                total += 1;
+                if entry
+                    .term()
+                    .is_some_and(|handle| handle.lock().unwrap().term.remote.is_some())
+                {
+                    remote += 1;
+                }
+            }
+        }
+        total > 0 && total == remote
+    }
+
+    /// Whether any pane needs the reconnect pass, or a ghostd upload is still in
+    /// flight; the front-end ticks while this is true, because the pass is what
+    /// advances those panes and it runs on the tick.
+    fn remote_activity(&self) -> bool {
+        self.uploads_in_flight > 0 || remote::pending(&self.tabs)
+    }
+
+    /// The live pane at `(tab, pane)`, by identity rather than by borrow.
+    fn pane_at(&self, tab: usize, pane: usize) -> Option<SharedPane> {
+        self.tabs.get(tab)?.pane(pane).cloned()
+    }
+
+    /// The live remote pane bound to `host`, which is the pane a repeat `ds
+    /// <host>` focuses instead of duplicating.
+    fn remote_pane_of_host(&self, host: &str) -> Option<(usize, usize)> {
+        for (tab_index, tab) in self.tabs.iter().enumerate() {
+            for (pane_index, entry) in tab.panes.iter().enumerate() {
+                let Some(handle) = entry.as_ref().and_then(PaneEntry::term) else {
+                    continue;
+                };
+                let spec = handle.lock().unwrap().remote_spec();
+                if spec.is_some_and(|(pane_host, _)| pane_host == host) {
+                    return Some((tab_index, pane_index));
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether the pane at `(tab, pane)` has a connection to (re)establish: it is
+    /// disconnected, or an auto-reconnect is already under way.
+    fn remote_pane_needs_connect(&self, tab: usize, pane: usize) -> bool {
+        let Some(handle) = self.pane_at(tab, pane) else {
+            return false;
+        };
+        let guard = handle.lock().unwrap();
+        guard.term.exited.is_some() || guard.term.reconnect != ReconnectState::Idle
+    }
+
+    /// Switches to the session a remote pane belongs in, creating it when nothing
+    /// has been saved under that name. `true` when it was created now.
+    fn open_remote_session(&mut self, name: &str) -> bool {
+        if crate::ui_session::names().iter().any(|saved| saved == name) {
+            crate::ui_session::switch(self, name);
+            false
+        } else {
+            crate::ui_session::start(self, name);
+            true
+        }
+    }
+
+    /// Forks a pane running `program`/`args`, optionally bound to a durable
+    /// remote session.
+    fn remote_pane(
+        &self,
+        program: Option<&str>,
+        args: &[&str],
+        remote: Option<RemoteSpec>,
+    ) -> Result<SharedPane> {
+        let pane = Pane::spawn_program(
+            REMOTE_COLS,
+            REMOTE_ROWS,
+            self.cell,
+            self.config.scrollback,
+            self.config.max_log_mb * 1024 * 1024,
+            program,
+            args,
+            None,
+            remote,
+        )?;
+        Ok(Arc::new(Mutex::new(pane)))
+    }
+
+    /// Adds a tab holding a remote pane and focuses it.
+    ///
+    /// `fresh_session` replaces the placeholder tab instead of adding beside it.
+    /// The reference opens a remote session with `tabs` emptied by `park_current`,
+    /// so the attach pane is the session's only pane; this port cannot leave a
+    /// workspace empty (`relayout` walks the current tab), so a session created
+    /// here is born with one placeholder shell tab and that tab is the one the
+    /// pane takes over. Without it a `ds` session would carry a stray local shell
+    /// and stop being pure-remote — the condition `k` deletes a session on.
+    fn push_remote_tab(&mut self, pane: SharedPane, name: &str, fresh_session: bool) {
+        self.last_tab = None;
+        if fresh_session && self.tabs.len() == 1 {
+            self.tabs[0] = Tab::new(name.to_string(), PaneEntry::Term(pane));
+            self.active_tab = 0;
+        } else {
+            self.tabs.push(Tab::new(name.to_string(), PaneEntry::Term(pane)));
+            self.active_tab = self.tabs.len() - 1;
+        }
+        self.apply_terminal_colors();
+        self.relayout();
+    }
+
+    /// Starts the background upload of `host`'s ghostd binary, unless it is
+    /// already known good.
+    ///
+    /// The result arrives on the upload channel and is drained by the tick, which
+    /// is what keeps running while an upload is in flight.
+    fn ensure_remote_binary(&mut self, host: &str) {
+        if self.binary_ready.contains(host) {
+            return;
+        }
+        let tx = self.remote_upload_tx.clone();
+        let host = host.to_string();
+        self.uploads_in_flight += 1;
+        std::thread::spawn(move || {
+            let ok = remote::upload_ghostd(&host);
+            let _ = tx.send((host, ok));
+        });
+    }
+
+    /// Applies whatever the upload threads have reported: a host that is ready
+    /// lets its waiting panes connect, a host that failed leaves them manual.
+    fn drain_remote_uploads(&mut self) {
+        while let Ok((host, ok)) = self.remote_uploads.try_recv() {
+            self.uploads_in_flight = self.uploads_in_flight.saturating_sub(1);
+            if ok {
+                self.binary_ready.insert(host.clone());
+                self.respawn_waiting(&host);
+            } else {
+                self.set_remote_manual(&host);
+                self.toast(format!("ghostd setup failed on {host}"));
+            }
+        }
+    }
+
+    /// Respawns every pane waiting to reconnect to `host`, now that its binary is
+    /// there.
+    fn respawn_waiting(&mut self, host: &str) {
+        for tab in self.tabs.iter_mut() {
+            for entry in tab.panes.iter_mut().flatten() {
+                let Some(handle) = entry.term() else { continue };
+                let Ok(mut guard) = handle.try_lock() else {
+                    continue;
+                };
+                let waiting_here = guard
+                    .term
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.host == host)
+                    && matches!(guard.term.reconnect, ReconnectState::Waiting { .. });
+                if waiting_here {
+                    let _ = guard.respawn_remote();
+                }
+            }
+        }
+    }
+
+    /// Drops every pane bound to `host` to manual reconnection, after its ghostd
+    /// upload failed.
+    fn set_remote_manual(&mut self, host: &str) {
+        for tab in self.tabs.iter_mut() {
+            for entry in tab.panes.iter_mut().flatten() {
+                let Some(handle) = entry.term() else { continue };
+                let Ok(mut guard) = handle.try_lock() else {
+                    continue;
+                };
+                if guard
+                    .term
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.host == host)
+                {
+                    guard.term.reconnect = ReconnectState::Manual;
+                }
+            }
+        }
+    }
 }
 
 /// iced's direction for a layout direction.
@@ -1083,5 +1510,281 @@ fn holds(node: &pane_grid::Node, pane: pane_grid::Pane) -> bool {
     match node {
         pane_grid::Node::Pane(cell) => *cell == pane,
         pane_grid::Node::Split { a, b, .. } => holds(a, pane) || holds(b, pane),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The remote-pane state machine over real tabs: a durable pane built
+    //! DISCONNECTED (no child process, so nothing is ever dialled), the reconnect
+    //! pass run against it, and where its kills and its bindings come from.
+
+    use super::*;
+    use ghostwave::config::RemoteConfig;
+    use ghostwave::layout::Node;
+    use std::collections::HashSet;
+
+    /// The reconnect settings the tests run with, whatever the user's own config
+    /// says: the reference defaults.
+    fn config() -> Config {
+        Config {
+            remote: RemoteConfig {
+                auto_reconnect: true,
+                reconnect_attempts: 5,
+                reconnect_delay_secs: 3,
+            },
+            ..Config::load()
+        }
+    }
+
+    fn cell(config: &Config) -> CellDims {
+        crate::pane::cell_dims(crate::FONT_BYTES, config.font_size, config.row_gap)
+    }
+
+    /// A workspace with its own throwaway session dir and one shell pane.
+    fn workspace() -> AppState {
+        let config = config();
+        let dims = cell(&config);
+        AppState::new(config, dims, iced::Size::new(1200.0, 800.0)).expect("a workspace")
+    }
+
+    fn ready(hosts: &[&str]) -> HashSet<String> {
+        hosts.iter().map(|host| host.to_string()).collect()
+    }
+
+    /// A tab holding one DISCONNECTED remote pane for `host`, built without a
+    /// child process.
+    fn remote_tab(host: &str, program: &str, args: &[&str]) -> Tab {
+        let config = config();
+        let pane = Pane::restore_remote(
+            80,
+            24,
+            cell(&config),
+            config.scrollback,
+            config.max_log_mb * 1024 * 1024,
+            Some(program),
+            args,
+            None,
+            "no-such-log",
+            RemoteSpec {
+                host: host.to_string(),
+                session: remote::remote_session(host),
+            },
+        )
+        .expect("a disconnected remote pane needs no connection to be built");
+        let id = pane.id;
+        let grid = crate::grid_session::state_from_node(&Node::Leaf { pane: 0 }, |_| id);
+        Tab::restored(
+            format!("ssh {host}"),
+            vec![PaneEntry::Term(Arc::new(Mutex::new(pane)))],
+            grid,
+        )
+    }
+
+    /// A tab holding one pane that is not a terminal, for the purity check.
+    fn content_tab() -> Tab {
+        let content = ContentPane::visualizer();
+        let id = content.id();
+        let grid = crate::grid_session::state_from_node(&Node::Leaf { pane: 0 }, |_| id);
+        Tab::restored("mixed".to_string(), vec![PaneEntry::Content(Box::new(content))], grid)
+    }
+
+    fn pane(tab: &Tab) -> SharedPane {
+        tab.pane(0).cloned().expect("the tab's pane")
+    }
+
+    /// Arms `pane` as the pass leaves a pane whose attempt failed.
+    fn arm_failed_attempt(tab: &Tab, failures: u32, code: i32) {
+        let handle = pane(tab);
+        let mut guard = handle.lock().unwrap();
+        guard.term.exited = Some("process exited".to_string());
+        guard.term.last_exit_code = Some(code);
+        guard.term.reconnect_failures = failures;
+        guard.term.reconnect = ReconnectState::Idle;
+    }
+
+    #[test]
+    fn a_pane_that_died_enters_the_bounded_reconnect_loop() {
+        let _guard = crate::ui_session::test_lock();
+        let mut tab = remote_tab("prod", "/bin/sh", &["-c", "true"]);
+        arm_failed_attempt(&tab, 0, 1);
+        let now = std::time::Instant::now();
+        remote::reconnect_pass(
+            &config(),
+            &ready(&["prod"]),
+            std::slice::from_mut(&mut tab),
+            now,
+        );
+        let handle = pane(&tab);
+        let guard = handle.lock().unwrap();
+        assert_eq!(guard.term.reconnect_failures, 1, "attempt 1 is spent arming the retry");
+        assert_eq!(
+            guard.term.reconnect,
+            ReconnectState::Waiting {
+                attempt: 1,
+                next: now + std::time::Duration::from_secs(3),
+            },
+            "the first retry waits the configured 3s"
+        );
+        assert!(
+            guard.term.exited.is_some(),
+            "the pane is still disconnected while it waits"
+        );
+    }
+
+    #[test]
+    fn a_due_retry_respawns_the_pane_and_clears_its_disconnected_state() {
+        let _guard = crate::ui_session::test_lock();
+        let mut tab = remote_tab("prod", "/bin/sh", &["-c", "true"]);
+        arm_failed_attempt(&tab, 0, 1);
+        let now = std::time::Instant::now();
+        remote::reconnect_pass(&config(), &ready(&["prod"]), std::slice::from_mut(&mut tab), now);
+        remote::reconnect_pass(
+            &config(),
+            &ready(&["prod"]),
+            std::slice::from_mut(&mut tab),
+            now + std::time::Duration::from_secs(3),
+        );
+        let handle = pane(&tab);
+        let guard = handle.lock().unwrap();
+        assert!(guard.term.exited.is_none(), "the retry reconnected the pane");
+        assert_eq!(guard.term.reconnect, ReconnectState::Idle);
+        assert!(guard.term.child.is_some(), "its stored command runs again");
+    }
+
+    #[test]
+    fn a_due_retry_waits_for_the_upload_instead_of_spending_the_attempt() {
+        let _guard = crate::ui_session::test_lock();
+        let mut tab = remote_tab("prod", "/bin/sh", &["-c", "true"]);
+        arm_failed_attempt(&tab, 0, 1);
+        let now = std::time::Instant::now();
+        remote::reconnect_pass(&config(), &HashSet::new(), std::slice::from_mut(&mut tab), now);
+        remote::reconnect_pass(
+            &config(),
+            &HashSet::new(),
+            std::slice::from_mut(&mut tab),
+            now + std::time::Duration::from_secs(3),
+        );
+        let handle = pane(&tab);
+        let guard = handle.lock().unwrap();
+        assert_eq!(guard.term.reconnect_failures, 1, "no second attempt was spent");
+        assert_eq!(
+            guard.term.reconnect,
+            ReconnectState::Waiting {
+                attempt: 1,
+                next: now + std::time::Duration::from_secs(3) + std::time::Duration::from_millis(500),
+            },
+            "it re-arms half a second out, waiting for the ghostd upload"
+        );
+        assert!(guard.term.child.is_none(), "nothing is dialled before the upload");
+    }
+
+    #[test]
+    fn the_retries_stop_at_the_configured_attempt_count() {
+        let _guard = crate::ui_session::test_lock();
+        for failures in [5, 6] {
+            let mut tab = remote_tab("prod", "/bin/sh", &["-c", "true"]);
+            arm_failed_attempt(&tab, failures, 1);
+            remote::reconnect_pass(
+                &config(),
+                &ready(&["prod"]),
+                std::slice::from_mut(&mut tab),
+                std::time::Instant::now(),
+            );
+            let handle = pane(&tab);
+            let guard = handle.lock().unwrap();
+            assert_eq!(
+                guard.term.reconnect,
+                ReconnectState::Manual,
+                "after {failures} failures the pane waits for the user"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clean_exit_or_auto_reconnect_off_drops_straight_to_manual() {
+        let _guard = crate::ui_session::test_lock();
+
+        let mut clean = remote_tab("prod", "/bin/sh", &["-c", "true"]);
+        arm_failed_attempt(&clean, 0, 0);
+        remote::reconnect_pass(
+            &config(),
+            &ready(&["prod"]),
+            std::slice::from_mut(&mut clean),
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            pane(&clean).lock().unwrap().term.reconnect,
+            ReconnectState::Manual,
+            "a pane that exited cleanly is not reconnected"
+        );
+
+        let mut off = remote_tab("prod", "/bin/sh", &["-c", "true"]);
+        arm_failed_attempt(&off, 0, 1);
+        let config = Config {
+            remote: RemoteConfig {
+                auto_reconnect: false,
+                ..config().remote
+            },
+            ..Config::load()
+        };
+        remote::reconnect_pass(
+            &config,
+            &ready(&["prod"]),
+            std::slice::from_mut(&mut off),
+            std::time::Instant::now(),
+        );
+        let handle = pane(&off);
+        let guard = handle.lock().unwrap();
+        assert_eq!(guard.term.reconnect, ReconnectState::Manual);
+        assert_eq!(guard.term.reconnect_failures, 0, "no attempt was spent");
+    }
+
+    #[test]
+    fn the_live_specs_come_from_the_panes_and_a_mixed_tab_is_not_pure_remote() {
+        let _guard = crate::ui_session::test_lock();
+        let remote = remote_tab("prod", "/bin/sh", &["-c", "true"]);
+        let content = content_tab();
+        assert_eq!(
+            AppState::live_remote_specs(std::slice::from_ref(&remote)),
+            vec![("prod".to_string(), "ghostwave-prod".to_string())]
+        );
+        assert!(
+            AppState::live_is_pure_remote(std::slice::from_ref(&remote)),
+            "a tab of remote panes is a pure ds session"
+        );
+        assert!(
+            !AppState::live_is_pure_remote(&[remote, content]),
+            "a session with a local pane keeps its local tabs"
+        );
+    }
+
+    #[test]
+    fn a_workspace_finds_the_remote_pane_bound_to_a_host() {
+        let _guard = crate::ui_session::test_lock();
+        let mut state = workspace();
+        state.replace_tabs(vec![remote_tab("prod", "/bin/sh", &["-c", "true"])]);
+        assert_eq!(
+            state.remote_pane_of_host("prod"),
+            Some((0, 0)),
+            "the pane is found by its host"
+        );
+        assert_eq!(state.remote_pane_of_host("other"), None);
+        assert_eq!(
+            state.remote_spec_of(0, 0),
+            Some(("prod".to_string(), "ghostwave-prod".to_string()))
+        );
+        assert_eq!(state.remote_spec_of(0, 1), None, "there is no second pane");
+    }
+
+    #[test]
+    fn killing_the_remotes_of_a_session_without_any_says_so() {
+        let _guard = crate::ui_session::test_lock();
+        let mut state = workspace();
+        state.kill_session_remotes("no-such-session");
+        assert_eq!(
+            state.toast.as_ref().map(|(message, _)| message.as_str()),
+            Some("no remote sessions in no-such-session")
+        );
     }
 }

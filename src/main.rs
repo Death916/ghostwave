@@ -28,6 +28,7 @@ mod pane_canvas;
 mod panes_grid;
 pub mod preview;
 mod pty_bridge;
+mod remote;
 pub mod scratchpad;
 pub mod search_overlay;
 pub mod selection;
