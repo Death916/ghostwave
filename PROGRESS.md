@@ -1224,3 +1224,62 @@ The first hands-on run of the wired overlays turned up two things worth recordin
   output. `ui_session::test_lock()` now points `XDG_DATA_HOME` at a per-process temp dir before any
   test reads a session. Full suite: 130 passed, 0 failed, 31.7 s.
 
+### Remote/SSH panes ported to the iced front-end (branch `wt/remote-ssh`) — suite green
+
+The parity gap this file called the last missing feature is ported, and the whole suite runs green
+through the project's own shell: **50 + 154 + 1 + 6 passed, 0 failed**, `cargo test --all-targets
+--no-fail-fast` **EXIT=0** — `--lib` 50, `src/main.rs` unittests 154, `tests/flood_throughput.rs` 1,
+`tests/term_core.rs` 6 (`--all-targets` runs no doc-tests). Commits on `wt/remote-ssh`: `1e2c589`
+(the port), `8a5a000` (prime drain), `c46fb58` (pty drop); 11 files, +1793/−125 against the
+merge-base. Not merged and not pushed — the merge is the owner's call.
+
+- **What the port adds.** `src/remote.rs` (new, 433 lines) is the stateless half of the reference's
+  `feat/remote-durable` subsystem: `sanitize_host`, the `ghostwave-<host>` / `ssh-<host>` session
+  names, `attach_cmd`/`attach_argv` (`sh -c` wrapper, version check, `exec attach || new`
+  fallback), `kill_cmd`/`spawn_kill`, `upload_ghostd` (`uname -m` → embedded static musl binary,
+  version-checked), `reconnect_delay` (base ×2, capped 15 s), `dedupe_hosts`, `pending`,
+  `reconnect_pass`. `src/app.rs` holds the stateful half: `connect_ssh`, `connect_durable_ssh`,
+  `ensure_remote_binary`, `connect_remote_pane`, `kill_remote_pane`, `kill_session_remotes`,
+  `live_remote_specs`, `live_is_pure_remote`, `set_remote_manual`, `respawn_waiting`,
+  `stop_remote_reconnect`, `remote_activity`; `tick()` drains the upload channel and runs the
+  reconnect pass. `ConnectSsh`, `ConnectDurableSsh` and `KillRemoteSession` dispatch into these
+  instead of toasting. The behaviours this file specified are preserved: bounded auto-reconnect
+  (5 attempts, 3 s→15 s backoff, then manual), restored remote panes come back **DISCONNECTED** and
+  connect on Enter, the session manager's `ssh` marker, and `k` = kill remote session.
+- **`ds <host>` sessions hold only their attach pane.** The port's first suite run failed
+  `the_durable_ssh_action_opens_its_own_session_and_binds_the_pane` with `remote_spec_of(0, 0) ==
+  None`: `ui_session::start` gives a new session one placeholder shell tab and the attach pane was
+  appended beside it, whereas the reference empties the tab list (`park_current` does
+  `std::mem::take(&mut self.tabs)`, and `connect_durable_ssh` does `self.tabs = Vec::new()`). That
+  is not only test fidelity — a stray local shell makes `live_is_pure_remote` false, so `k`
+  (`kill_session_remotes`) would never delete a session it is supposed to delete wholesale. Fixed
+  in `src/pane.rs`.
+- **`prime_pty` started its idle clock before the child had written anything.** A child whose
+  fork/exec+printf took longer than the old 60 ms window was declared idle and the drain returned
+  having read nothing — the startup burst prime exists to catch. Measured with a pty probe
+  (`g1/pty_latency.py`, 40 samples/run): that child takes p50 3.6 ms idle, but p90 43.4 ms and
+  max 268.2 ms with 12 hogs on the box, so the old code lost it 3/40 under load and 0/40 idle —
+  which is why it failed in two in-suite runs and passed 15/15 standalone. The idle clock now
+  starts on the child's first byte, the blocking bound is 1 s, and a known child exit ends the
+  drain at once (`8a5a000`), with the deterministic regression test
+  `prime_drain_waits_out_a_slow_first_write` (its child sleeps 200 ms before its first byte).
+- **That fix exposed an unbounded `waitpid` in `Drop for Child`.** The next run hung in the bin
+  target: `input::tests::locked_mode_swallows_binds_and_only_ctrl_g_unlocks` and
+  `input::tests::terminal_only_paths_skip_a_content_pane` sat for minutes with the test thread in
+  `do_wait` and a live bash child. `Drop` reaped with a blocking `waitpid`, so dropping a pane whose
+  child ignores SIGHUP/TERM parked the dropping thread forever. `c46fb58` bounds the wait and
+  SIGKILLs what will not go. This is a latent deadlock in the iced front-end rather than test
+  fallout: any pane closed while its shell refuses to die could have hung the UI.
+- **Not exercised by hand, and marked as such.** No real ssh target was used, so
+  `ensure_remote_binary`'s upload, the `ghostd attach` path, the reconnect pass and `k`-kill rest on
+  their unit tests and the reference's semantics: `NEEDS-HOST:` a real ssh host (a local `ssh orac`
+  would do) before any of it is called proven. Nothing was run in a window either, so the `ssh`
+  badge, the disconnected/reconnecting label band and the `k` bind are `NEEDS-DISPLAY:`. `ghostd/`
+  and the embedded musl binaries are untouched by this work.
+- **Build environment note for the next session.** The suite ran through the build gate in the
+  *user* manager's namespace (`~/.hermes/scripts/usermgr_build.sh`, `CARGO_TARGET_DIR=
+  /mnt/myjfs/build/ghostwave`) because the gateway's namespace has `/mnt/myjfs` read-only. The
+  final link of the two ~500 MB test binaries took ~1 h 45 m and it was not CPU: `ld` sat in `D` on
+  `folio_wait_bit_common` and the loopback `juicefs` daemon was the only busy process on the box.
+  Root was at 96 % the whole time and the mount runs `--free-space-ratio 0.15`, so the write-back
+  cache was throttled throughout — expect the same wall-clock for any future full-suite run here.

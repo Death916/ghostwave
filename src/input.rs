@@ -48,6 +48,10 @@ pub fn key_press(state: &mut AppState, kp: KeyPress, action: key::Action) {
         return;
     }
 
+    if state.mode == Mode::Normal && remote_dead_key(state, &kp) {
+        return;
+    }
+
     if let Some(new_mode) = keymap::entry_bind(k, m) {
         state.mode = if state.mode == new_mode {
             Mode::Normal
@@ -97,6 +101,26 @@ pub fn key_press(state: &mut AppState, kp: KeyPress, action: key::Action) {
         },
         Dispatch::Ignore => {}
     }
+}
+
+/// Keys a DISCONNECTED remote pane takes: Enter connects it, `k` kills its remote
+/// session, Esc stops the auto-reconnect loop. Every other key is swallowed —
+/// there is no process in the pane to send it to.
+///
+/// Reports whether the key belonged to that state, which is also how the keys
+/// that follow are kept away from a pane that cannot receive them.
+fn remote_dead_key(state: &mut AppState, kp: &KeyPress) -> bool {
+    if !state.remote_pane_disconnected() {
+        return false;
+    }
+    let (tab, pane) = (state.active_tab, state.current().active);
+    match kp.key {
+        key::Key::Enter => state.connect_remote_pane(tab, pane),
+        key::Key::K => state.kill_remote_pane(tab, pane),
+        key::Key::Escape => state.stop_remote_reconnect(),
+        _ => {}
+    }
+    true
 }
 
 /// Sends a platform key repeat to the active pane, bypassing the bind table.
@@ -456,9 +480,9 @@ pub(crate) fn execute(state: &mut AppState, action: Action) {
             state.toast(format!("session {name} saved — quitting"));
             state.quit = true;
         }
-        Action::ConnectSsh(_) | Action::ConnectDurableSsh(_) | Action::KillRemoteSession => {
-            state.toast("remote panes: not implemented yet")
-        }
+        Action::ConnectSsh(host) => state.connect_ssh(&host),
+        Action::ConnectDurableSsh(host) => state.connect_durable_ssh(&host),
+        Action::KillRemoteSession => state.kill_active_remote_pane(),
 
         Action::Backspace => match state.mode {
             Mode::RenameTab | Mode::RenamePane | Mode::RenameSession => {
@@ -695,6 +719,7 @@ mod tests {
     use super::*;
     use ghostwave::config::Config;
     use ghostwave::keymap::Mode;
+    use ghostwave::term::{ReconnectState, RemoteSpec};
     use iced::widget::pane_grid::{Axis, Node as GridNode};
     use libghostty_vt::key::Key;
 
@@ -2057,5 +2082,152 @@ mod tests {
         let ai = ai_at(&s, index);
         assert!(!ai.busy, "an empty prompt is not a request");
         assert_eq!(ai.history().len(), 1, "only the system prompt is in it");
+    }
+
+    // ---- remote/SSH panes ------------------------------------------------
+
+    /// Host used by the remote tests: a local address whose ssh attempt fails
+    /// instantly, so the background kills these tests start die at once.
+    const TEST_HOST: &str = "127.0.0.1";
+
+    /// Replaces the focused tab with one DISCONNECTED remote pane running
+    /// `program`, and returns its handle.
+    fn install_disconnected_remote(s: &mut AppState, program: &str, args: &[&str]) -> SharedPane {
+        let pane = crate::pane::Pane::restore_remote(
+            80,
+            24,
+            s.cell,
+            s.config.scrollback,
+            s.config.max_log_mb * 1024 * 1024,
+            Some(program),
+            args,
+            None,
+            "no-such-log",
+            RemoteSpec {
+                host: TEST_HOST.to_string(),
+                session: crate::remote::remote_session(TEST_HOST),
+            },
+        )
+        .expect("a disconnected remote pane is built without connecting");
+        let id = pane.id;
+        let handle = std::sync::Arc::new(std::sync::Mutex::new(pane));
+        let tab = &mut s.tabs[s.active_tab];
+        tab.panes = vec![Some(PaneEntry::Term(handle.clone()))];
+        tab.grid = iced::widget::pane_grid::State::new(GridPane::single(id)).0;
+        tab.active = 0;
+        handle
+    }
+
+    #[test]
+    fn enter_reconnects_a_disconnected_remote_pane() {
+        let _guard = crate::ui_session::test_lock();
+        let mut s = state();
+        let handle = install_disconnected_remote(&mut s, "/bin/sh", &["-c", "true"]);
+        assert!(s.remote_pane_disconnected(), "the pane starts disconnected");
+        s.binary_ready.insert(TEST_HOST.to_string());
+
+        press(&mut s, Key::Enter, Mods::empty());
+
+        let guard = handle.lock().unwrap();
+        assert!(guard.term.exited.is_none(), "Enter connected the pane");
+        assert_eq!(guard.term.reconnect, ReconnectState::Idle);
+        assert!(guard.term.child.is_some(), "its stored command runs again");
+    }
+
+    #[test]
+    fn escape_stops_the_auto_reconnect_loop() {
+        let _guard = crate::ui_session::test_lock();
+        let mut s = state();
+        let handle = install_disconnected_remote(&mut s, "/bin/sh", &["-c", "true"]);
+        handle.lock().unwrap().term.reconnect = ReconnectState::Waiting {
+            attempt: 2,
+            next: std::time::Instant::now(),
+        };
+
+        press(&mut s, Key::Escape, Mods::empty());
+
+        assert_eq!(
+            handle.lock().unwrap().term.reconnect,
+            ReconnectState::Manual,
+            "Esc leaves the pane for the user to connect"
+        );
+        assert_eq!(toast(&s), "reconnect stopped — Enter to connect");
+    }
+
+    #[test]
+    fn k_on_a_disconnected_remote_pane_kills_its_remote_session() {
+        let _guard = crate::ui_session::test_lock();
+        let mut s = state();
+        let handle = install_disconnected_remote(&mut s, "/bin/sh", &["-c", "true"]);
+
+        typed(&mut s, Key::K, 'k');
+
+        assert_eq!(
+            toast(&s),
+            format!("killing remote session ghostwave-{TEST_HOST} on {TEST_HOST}")
+        );
+        assert!(
+            handle.lock().unwrap().remote_disconnected(),
+            "killing the remote session leaves the local pane as it was"
+        );
+    }
+
+    #[test]
+    fn every_other_key_is_swallowed_by_a_disconnected_remote_pane() {
+        let _guard = crate::ui_session::test_lock();
+        let mut s = state();
+        install_disconnected_remote(&mut s, "/bin/sh", &["-c", "true"]);
+        assert_eq!(s.mode, Mode::Normal);
+
+        ctrl(&mut s, Key::O);
+
+        assert_eq!(
+            s.mode,
+            Mode::Normal,
+            "the session-mode chord is not a bind while the pane is disconnected"
+        );
+    }
+
+    #[test]
+    fn the_durable_ssh_action_opens_its_own_session_and_binds_the_pane() {
+        let _guard = crate::ui_session::test_lock();
+        let mut s = state();
+
+        execute(&mut s, Action::ConnectDurableSsh(TEST_HOST.to_string()));
+
+        assert_eq!(s.current_session, format!("ssh-{TEST_HOST}"));
+        assert_eq!(s.current().name, format!("ssh {TEST_HOST}"));
+        assert_eq!(
+            s.remote_spec_of(0, 0),
+            Some((
+                TEST_HOST.to_string(),
+                crate::remote::remote_session(TEST_HOST)
+            )),
+            "the pane is bound to the host's ghostd session"
+        );
+        assert_eq!(toast(&s), format!("durable ssh: {TEST_HOST}"));
+    }
+
+    #[test]
+    fn the_plain_ssh_action_opens_its_session_without_a_ghostd_binding() {
+        let _guard = crate::ui_session::test_lock();
+        let mut s = state();
+
+        execute(&mut s, Action::ConnectSsh(TEST_HOST.to_string()));
+
+        assert_eq!(s.current_session, format!("ssh-{TEST_HOST}"));
+        assert_eq!(s.remote_spec_of(0, 0), None, "a plain ssh pane is not durable");
+        assert_eq!(toast(&s), format!("connecting to {TEST_HOST}"));
+    }
+
+    #[test]
+    fn killing_the_remote_session_of_a_pane_that_has_none_says_so() {
+        let mut s = state();
+        let before = live_panes(&s);
+
+        execute(&mut s, Action::KillRemoteSession);
+
+        assert_eq!(toast(&s), "no remote session in active pane");
+        assert_eq!(live_panes(&s), before, "no pane was closed");
     }
 }

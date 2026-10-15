@@ -2,7 +2,7 @@
 //! per-cell fg/bg, text, underline/strikethrough, cursor, then the pane frames
 //! and their labels. Rects are canvas-local coordinates.
 
-use ghostwave::term::CellDims;
+use ghostwave::term::{CellDims, ReconnectState};
 use ghostwave::theme::Theme as GhostTheme;
 use iced::widget::canvas::{Frame, Text as CanvasText};
 use iced::widget::text;
@@ -104,6 +104,9 @@ pub fn format_pane_label(
 }
 
 /// Returns a cell's label string from its pane handle, 1-based position and optional stack info.
+///
+/// A remote pane's label also carries its connection state: a disconnected pane
+/// shows no output of its own, so its label band is where it asks to be connected.
 pub fn cell_label(
     pane: &SharedPane,
     index: usize,
@@ -111,8 +114,28 @@ pub fn cell_label(
     replace: bool,
 ) -> String {
     let guard = pane.lock().unwrap();
-    let title = guard.cached_title();
-    format_pane_label(&guard.term.name, index, title, stack, replace)
+    let label = format_pane_label(&guard.term.name, index, guard.cached_title(), stack, replace);
+    match remote_status(&guard) {
+        Some(status) => format!("{label} — {status}"),
+        None => label,
+    }
+}
+
+/// The connection state a remote pane shows in its label band; `None` for a pane
+/// that is not remote and for one that is connected.
+fn remote_status(pane: &Pane) -> Option<String> {
+    let remote = pane.term.remote.as_ref()?;
+    match (&pane.term.reconnect, pane.term.exited.is_some()) {
+        (ReconnectState::Waiting { attempt, .. }, _) => Some(format!(
+            "ssh {} — reconnecting (attempt {attempt}) — Esc to stop",
+            remote.host
+        )),
+        (_, true) => Some(format!(
+            "ssh {} — disconnected (Enter connect | k kill)",
+            remote.host
+        )),
+        _ => None,
+    }
 }
 
 /// Paints one pane's terminal content into `rect`, in frame-local coordinates.

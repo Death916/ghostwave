@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use ghostwave::config::AiConfig;
 use ghostwave::keymap::KeyPress;
-use ghostwave::term::{CellDims, TermPane};
+use ghostwave::term::{CellDims, ReconnectState, RemoteSpec, TermPane};
 use libghostty_vt::key::{self, Mods};
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 
@@ -96,6 +96,36 @@ pub fn with_pane_meta<R>(id: PaneId, f: impl FnOnce(&ghostwave::session::PaneSta
     PANE_META.lock().ok()?.get(&id).map(f)
 }
 
+/// Wraps a built terminal as an iced pane: records what it was spawned with for
+/// the session format, and bridges its pty — or an idle slot when it has no child
+/// yet, which is how a restored remote pane waits for its reconnect.
+fn into_pane(mut term: TermPane) -> Result<Pane> {
+    let id = PaneId::next();
+    register_meta(
+        id,
+        ghostwave::session::PaneState {
+            program: term.program.clone(),
+            args: term.args.clone(),
+            cwd: term.cwd.clone(),
+            remote: term.remote.clone(),
+            log: term.log_name.clone(),
+        },
+    );
+    let rx = match term.pty_rx.take() {
+        Some(rx) => pty_bridge::spawn(id, rx),
+        None => pty_bridge::idle(id),
+    };
+    Ok(Pane {
+        id,
+        term,
+        scratch: RenderScratch::new()?,
+        dirty: true,
+        last_bounds: None,
+        rx,
+        cached_title: String::new(),
+    })
+}
+
 impl Pane {
     /// Forks a pty running the user's login shell and starts its reader thread,
     /// priming the shell's startup terminal probes; the pty receiver moves to a bridge
@@ -125,7 +155,7 @@ impl Pane {
             None
         };
 
-        let mut term = TermPane::new(
+        let term = TermPane::new(
             cols,
             rows,
             cell,
@@ -137,30 +167,42 @@ impl Pane {
             true,
             None,
         )?;
-        let rx = term
-            .pty_rx
-            .take()
-            .expect("pty reader receiver (TermPane::new with spawn = true)");
-        let id = PaneId::next();
-        register_meta(
-            id,
-            ghostwave::session::PaneState {
-                program: term.program.clone(),
-                args: term.args.clone(),
-                cwd: term.cwd.clone(),
-                remote: term.remote.clone(),
-                log: term.log_name.clone(),
-            },
+        assert!(
+            term.pty_rx.is_some(),
+            "pty reader receiver (TermPane::new with spawn = true)"
         );
-        Ok(Self {
-            id,
-            term,
-            scratch: RenderScratch::new()?,
-            dirty: true,
-            last_bounds: None,
-            rx: pty_bridge::spawn(id, rx),
-            cached_title: String::new(),
-        })
+        into_pane(term)
+    }
+
+    /// Forks a pty running `program` with `args` — the path a remote pane takes,
+    /// where the child is `ssh` and `remote` is the ghostd session it binds to.
+    ///
+    /// `remote` is recorded for the session format, so the pane comes back
+    /// disconnected rather than run at restore (see [`Self::restore_remote`]).
+    pub fn spawn_program(
+        cols: u16,
+        rows: u16,
+        cell: CellDims,
+        scrollback_lines: usize,
+        log_cap_bytes: u64,
+        program: Option<&str>,
+        args: &[&str],
+        cwd: Option<&str>,
+        remote: Option<RemoteSpec>,
+    ) -> Result<Self> {
+        let term = TermPane::new(
+            cols,
+            rows,
+            cell,
+            program,
+            args,
+            cwd,
+            scrollback_lines,
+            log_cap_bytes,
+            true,
+            remote,
+        )?;
+        into_pane(term)
     }
 
     /// Restores a pane from a saved session: its scrollback log replayed, then a
@@ -200,30 +242,78 @@ impl Pane {
         let seeded = ghostwave::session::replay_pane_log(log, &mut term.term, log_cap_bytes);
         term.log_seed(&seeded);
         term.spawn_child()?;
-        let rx = term
-            .pty_rx
-            .take()
-            .expect("pty reader receiver (spawn_child always takes one)");
-        let id = PaneId::next();
-        register_meta(
-            id,
-            ghostwave::session::PaneState {
-                program: term.program.clone(),
-                args: term.args.clone(),
-                cwd: term.cwd.clone(),
-                remote: term.remote.clone(),
-                log: term.log_name.clone(),
-            },
-        );
-        Ok(Self {
-            id,
-            term,
-            scratch: RenderScratch::new()?,
-            dirty: true,
-            last_bounds: None,
-            rx: pty_bridge::spawn(id, rx),
-            cached_title: String::new(),
-        })
+        into_pane(term)
+    }
+
+    /// Restores a pane whose saved binding is a durable remote session: the
+    /// history is replayed over a terminal with NO child process, and the pane is
+    /// left DISCONNECTED for the user to connect with Enter (or for the
+    /// auto-reconnect loop to pick up).
+    ///
+    /// A remote pane is never connected at restore, which is the reference's
+    /// rule: coming back to a workspace must not silently re-open an ssh
+    /// connection to every host it remembers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_remote(
+        cols: u16,
+        rows: u16,
+        cell: CellDims,
+        scrollback_lines: usize,
+        log_cap_bytes: u64,
+        program: Option<&str>,
+        args: &[&str],
+        cwd: Option<&str>,
+        log: &str,
+        remote: RemoteSpec,
+    ) -> Result<Self> {
+        let mut term = TermPane::new(
+            cols,
+            rows,
+            cell,
+            program,
+            args,
+            cwd,
+            scrollback_lines,
+            log_cap_bytes,
+            false,
+            Some(remote),
+        )?;
+        let seeded = ghostwave::session::replay_pane_log(log, &mut term.term, log_cap_bytes);
+        term.log_seed(&seeded);
+        term.exited = Some("disconnected (remote session)".to_string());
+        term.last_exit_code = Some(1);
+        term.reconnect = ReconnectState::Manual;
+        into_pane(term)
+    }
+
+    /// Reconnects a disconnected remote pane: forks its stored command again and
+    /// bridges the new pty, leaving the terminal and its history alone.
+    ///
+    /// False when the fork failed; the pane is then still disconnected, with the
+    /// reconnect state the caller decides.
+    pub fn respawn_remote(&mut self) -> bool {
+        if !self.term.respawn() {
+            return false;
+        }
+        if let Some(rx) = self.term.pty_rx.take() {
+            self.rx = pty_bridge::spawn(self.id, rx);
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// The host and daemon session this pane is bound to; `None` for a pane that
+    /// is not a remote pane.
+    pub fn remote_spec(&self) -> Option<(String, String)> {
+        self.term
+            .remote
+            .as_ref()
+            .map(|remote| (remote.host.clone(), remote.session.clone()))
+    }
+
+    /// Whether this pane is a remote pane with no live connection.
+    pub fn remote_disconnected(&self) -> bool {
+        self.term.remote.is_some() && self.term.exited.is_some()
     }
 
     /// Sets this pane's default foreground and background from `theme`.

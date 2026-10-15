@@ -7,6 +7,7 @@ use std::{
     os::unix::process::CommandExt,
     path::PathBuf,
     process::Command,
+    time::Duration,
 };
 
 use nix::{
@@ -252,18 +253,46 @@ impl Child {
     }
 }
 
+/// Close out the child without ever blocking the caller.
+///
+/// SIGHUP is what a shell normally dies of, but a child is free to catch or
+/// ignore it, and an unbounded `waitpid` here freezes whoever dropped the pane
+/// — the whole app when a pane or session is closed, and the test worker when a
+/// fixture is torn down. So the reap is polled with a deadline and escalated to
+/// SIGKILL; a child that still refuses to die is left to the process's exit
+/// rather than hanging the caller.
 impl Drop for Child {
     fn drop(&mut self) {
-        match *self {
-            Child::Active(pid) => {
-                let _ = signal::kill(pid, signal::SIGHUP);
-                let _ = wait::waitpid(pid, None);
-            }
-            Child::Exited(pid) => {
-                let _ = wait::waitpid(pid, None);
-            }
-            Child::Reaped(_) => {}
+        let pid = match *self {
+            Child::Active(pid) | Child::Exited(pid) => pid,
+            Child::Reaped(_) => return,
+        };
+        let _ = signal::kill(pid, signal::SIGHUP);
+        if reap_within(pid, Duration::from_millis(500)) {
+            return;
         }
+        let _ = signal::kill(pid, signal::SIGKILL);
+        let _ = reap_within(pid, Duration::from_millis(1500));
+    }
+}
+
+/// Poll-reap `pid` until it is collected or `budget` runs out.
+///
+/// True once the child is gone (including the `ECHILD` case: something else
+/// already reaped it). Never blocks longer than `budget`, never sleeps in a
+/// tight loop.
+fn reap_within(pid: Pid, budget: Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match wait::waitpid(pid, Some(wait::WaitPidFlag::WNOHANG)) {
+            Ok(wait::WaitStatus::StillAlive) => {}
+            Ok(_) | Err(Errno::ECHILD) => return true,
+            Err(_) => return false,
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 

@@ -338,23 +338,35 @@ impl TermPane {
     /// the line editor echoes them as caret-escaped garbage
     /// (`^[[?0u^[P>|ghostwave^[\…`). Draining synchronously right after
     /// spawn keeps the queries' responses inside the shell's timeout.
+    ///
+    /// Blocks for at most `PRIME_DEADLINE`. The burst is treated as over
+    /// after `PRIME_IDLE` of silence, but that clock only starts once the
+    /// child has actually written something: a child slow to emit its first
+    /// byte (fork/exec of a shell on a loaded box) must not be mistaken for
+    /// an idle one, or the drain returns before the output it exists to
+    /// catch has even been written. Also returns early once the child is
+    /// known to have exited.
     fn prime_pty(&mut self) {
+        // 1s bound on blocking the caller (pane creation / session restore);
+        // 60ms of silence with nothing more coming ends the burst.
+        const PRIME_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1000);
+        const PRIME_IDLE: std::time::Duration = std::time::Duration::from_millis(60);
+
         let start = std::time::Instant::now();
-        let mut idle = std::time::Duration::ZERO;
-        // Cap ~250ms: a shell's startup burst (config + terminal probes)
-        // can take a while, but we must not block pane creation forever.
-        while start.elapsed() < std::time::Duration::from_millis(250) {
+        let mut saw_output = false;
+        let mut last_output = std::time::Instant::now();
+        while start.elapsed() < PRIME_DEADLINE {
             let active = self.poll_pty();
             self.flush_response();
             if active {
-                idle = std::time::Duration::ZERO;
-            } else {
-                idle += std::time::Duration::from_millis(2);
-                if idle > std::time::Duration::from_millis(60) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                saw_output = true;
+                last_output = std::time::Instant::now();
+                continue;
             }
+            if self.exited.is_some() || (saw_output && last_output.elapsed() > PRIME_IDLE) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
 
@@ -1146,6 +1158,38 @@ mod tests {
         assert!(
             title.contains("PRIME-TEST"),
             "prime drain missed early child output (title={title:?})"
+        );
+    }
+
+    /// A child that is slow to write its FIRST byte must still be drained.
+    /// Under load a shell's fork/exec runs far longer than the 60ms idle
+    /// break, and a drain that starts counting idle time before any output
+    /// has arrived gives up there and loses exactly the startup burst the
+    /// prime exists to catch (that is what made
+    /// `prime_drains_early_child_output` fail on a loaded box). Deterministic
+    /// by construction: the child sleeps 200ms before printing, an order of
+    /// magnitude past the idle window whatever the box is doing.
+    #[test]
+    fn prime_drain_waits_out_a_slow_first_write() {
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
+        let pane = TermPane::new(
+            80,
+            24,
+            cell,
+            Some("/bin/sh"),
+            &["-c", "sleep 0.2; printf '\\033]0;SLOW-PRIME\\033\\\\'"],
+            None,
+            1000,
+            1024 * 1024,
+            true,
+            None,
+        )
+        .expect("pane with a slow-starting child");
+        let title = pane.title();
+        drop(pane);
+        assert!(
+            title.contains("SLOW-PRIME"),
+            "prime drain gave up before the child's first write (title={title:?})"
         );
     }
 

@@ -12,11 +12,11 @@
 //! Three deliberate differences from the reference, so the parity table can name
 //! them: sessions are not *parked* — switching saves the outgoing session and
 //! drops its panes, closing their ptys, instead of keeping them alive in the
-//! background; a pane saved with a durable remote binding is not restored (this
-//! front-end has no ssh/ghostd panes, and the binding stays in the file for the
-//! macroquad build); and the two-second autosave runs as a background
-//! subscription ([`crate::autosave`]), so a session file is written
-//! periodically as well as on a switch, a delete, a detach and on quit.
+//! background; a pane saved with a durable remote binding is restored
+//! DISCONNECTED (its history replays, no ssh runs until Enter connects it); and
+//! the two-second autosave runs as a background subscription
+//! ([`crate::autosave`]), so a session file is written periodically as well as on
+//! a switch, a delete, a detach and on quit.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -41,6 +41,28 @@ const RESTORE_ROWS: u16 = 24;
 /// The sorted names of the saved sessions.
 pub fn names() -> Vec<String> {
     core::list_sessions()
+}
+
+/// The saved sessions that contain a durable remote pane, which the picker marks
+/// with an `ssh` badge.
+///
+/// Read from the session files, as the reference did: the current session is
+/// written every two seconds, so a connection made in this run shows up in the
+/// list without the picker having to know about live panes.
+pub fn remote_names() -> HashSet<String> {
+    names()
+        .into_iter()
+        .filter(|name| core::has_remote(name))
+        .collect()
+}
+
+/// Relists an open picker from disk, keeping its selection on where the user is.
+pub fn refresh_picker(state: &mut AppState) {
+    let names = names();
+    let remotes = remote_names();
+    if let Some(picker) = state.session_picker.as_mut() {
+        picker.relist(names, remotes);
+    }
 }
 
 /// The name a session started now takes: `session-1`, `session-2`, … .
@@ -224,7 +246,7 @@ pub fn rename(state: &mut AppState, new_name: &str) {
 /// inside.
 pub fn open_picker(state: &mut AppState) {
     let current = state.current_session.clone();
-    state.session_picker = Some(SessionsOverlay::new(current, names()));
+    state.session_picker = Some(SessionsOverlay::new(current, names(), remote_names()));
 }
 
 /// Applies a picker message: navigation changes only the picker, and the action a
@@ -258,13 +280,15 @@ pub fn picker_message(state: &mut AppState, message: SessionsMessage) {
             if delete(state, &name) {
                 state.toast(format!("deleted session: {name}"));
                 let refreshed = names();
+                let remotes = remote_names();
                 if let Some(picker) = state.session_picker.as_mut() {
-                    picker.relist(refreshed);
+                    picker.relist(refreshed, remotes);
                 }
             } else {
                 state.toast("cannot delete the current session");
             }
         }
+        SessionsAction::KillRemotes(name) => state.kill_session_remotes(&name),
     }
 }
 
@@ -304,29 +328,40 @@ fn restore_fresh(state: &mut AppState) -> Result<()> {
     Ok(())
 }
 
-/// One tab of a session: its terminals respawned over their replayed history, and
-/// the grid its layout tree converts to. `None` when no pane could be built, or
-/// when all of them were remote bindings this front-end cannot host.
+/// One tab of a session: its terminals respawned over their replayed history, its
+/// remote panes brought back disconnected, and the grid its layout tree converts
+/// to. `None` when no pane could be built.
 fn tab_from_state(state: &AppState, saved: &TabState) -> Option<Tab> {
     let cap = state.config.max_log_mb * 1024 * 1024;
     let mut ids: Vec<PaneId> = Vec::new();
     let mut entries: Vec<PaneEntry> = Vec::new();
     for pane in &saved.panes {
-        if pane.remote.is_some() {
-            continue;
-        }
         let args: Vec<&str> = pane.args.iter().map(String::as_str).collect();
-        let restored = Pane::restore(
-            RESTORE_COLS,
-            RESTORE_ROWS,
-            state.cell,
-            state.config.scrollback,
-            cap,
-            pane.program.as_deref(),
-            &args,
-            pane.cwd.as_deref(),
-            &pane.log,
-        );
+        let restored = match &pane.remote {
+            Some(remote) => Pane::restore_remote(
+                RESTORE_COLS,
+                RESTORE_ROWS,
+                state.cell,
+                state.config.scrollback,
+                cap,
+                pane.program.as_deref(),
+                &args,
+                pane.cwd.as_deref(),
+                &pane.log,
+                remote.clone(),
+            ),
+            None => Pane::restore(
+                RESTORE_COLS,
+                RESTORE_ROWS,
+                state.cell,
+                state.config.scrollback,
+                cap,
+                pane.program.as_deref(),
+                &args,
+                pane.cwd.as_deref(),
+                &pane.log,
+            ),
+        };
         match restored {
             Ok(mut pane) => {
                 pane.apply_theme(&state.theme);
@@ -520,6 +555,66 @@ mod tests {
 
         core::delete(&outgoing);
         core::delete(&incoming);
+    }
+
+    #[test]
+    fn a_remote_pane_comes_back_disconnected_and_its_session_is_badged_ssh() {
+        let _guard = test_lock();
+        let mut s = state();
+        let name = unique("remote");
+        s.current_session = name.clone();
+        let saved = SessionState {
+            tabs: vec![TabState {
+                name: "ssh prod".to_string(),
+                panes: vec![PaneState {
+                    program: Some("/bin/sh".to_string()),
+                    args: vec!["-c".to_string(), "true".to_string()],
+                    cwd: None,
+                    remote: Some(ghostwave::term::RemoteSpec {
+                        host: "prod".to_string(),
+                        session: "ghostwave-prod".to_string(),
+                    }),
+                    log: "no-such-log".to_string(),
+                }],
+                root: None,
+                floating: vec![],
+            }],
+        };
+        core::save(&name, &saved);
+
+        assert!(
+            remote_names().contains(&name),
+            "a session holding a durable pane is badged ssh"
+        );
+        assert!(names().contains(&name) || remote_names().contains(&name));
+
+        let mut opened = state();
+        let scratch = unique("scratch");
+        opened.current_session = scratch.clone();
+        switch(&mut opened, &name);
+
+        assert_eq!(opened.current_session, name);
+        let handle = opened
+            .current()
+            .pane(0)
+            .cloned()
+            .expect("the remote pane came back");
+        let guard = handle.lock().unwrap();
+        assert!(guard.remote_disconnected(), "it restores disconnected");
+        assert_eq!(
+            guard.term.reconnect,
+            ghostwave::term::ReconnectState::Manual,
+            "it waits for Enter rather than connecting itself"
+        );
+        assert!(guard.term.child.is_none(), "no ssh is run at restore");
+        assert_eq!(
+            guard.remote_spec(),
+            Some(("prod".to_string(), "ghostwave-prod".to_string()))
+        );
+        drop(guard);
+
+        core::delete(&name);
+        core::delete(&scratch);
     }
 
     #[test]

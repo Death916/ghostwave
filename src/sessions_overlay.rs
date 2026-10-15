@@ -9,8 +9,10 @@
 use ghostwave::theme::{Rgb, Theme as GhostTheme};
 use iced::alignment::{Horizontal, Vertical};
 use iced::keyboard::{key::Named, Key, Modifiers};
-use iced::widget::{column, container, mouse_area, scrollable, text, Space};
+use iced::widget::{column, container, mouse_area, scrollable, text, Row, Space};
 use iced::{Background, Border, Color, Element, Length, Padding, Shadow, Vector};
+
+use std::collections::HashSet;
 
 /// Width of the modal, in px.
 const WIDTH: f32 = 460.0;
@@ -33,6 +35,8 @@ pub enum SessionsMessage {
     Rename,
     /// Deletes the selected session.
     Delete,
+    /// Kills the selected session's remote daemons.
+    KillRemotes,
     /// Dismisses the picker.
     Close,
 }
@@ -49,6 +53,8 @@ pub enum SessionsAction {
     Rename(String),
     /// Delete the named session.
     Delete(String),
+    /// Kill the remote daemons of the named session.
+    KillRemotes(String),
     /// Close the picker.
     Close,
 }
@@ -62,14 +68,20 @@ pub struct SessionsOverlay {
     pub current: String,
     /// Index into `entries` the keyboard acts on.
     pub selected: usize,
+    /// The entries that hold a durable remote pane, badged `ssh`.
+    pub remotes: HashSet<String>,
 }
 
 impl SessionsOverlay {
-    /// A picker over `names`, selecting `current`.
+    /// A picker over `names`, selecting `current`, with `remotes` badged `ssh`.
     ///
     /// The current name is added when the disk does not know it yet (a session
     /// created this run), so the list always shows where the user is.
-    pub fn new(current: impl Into<String>, names: Vec<String>) -> Self {
+    pub fn new(
+        current: impl Into<String>,
+        names: Vec<String>,
+        remotes: HashSet<String>,
+    ) -> Self {
         let current = current.into();
         let mut entries = names;
         if !entries.iter().any(|name| name == &current) {
@@ -84,6 +96,7 @@ impl SessionsOverlay {
             entries,
             current,
             selected,
+            remotes,
         }
     }
 
@@ -95,6 +108,11 @@ impl SessionsOverlay {
     /// Whether `name` is the session the workspace runs inside.
     pub fn is_current(&self, name: &str) -> bool {
         name == self.current
+    }
+
+    /// Whether `name` holds a durable remote pane.
+    pub fn is_remote(&self, name: &str) -> bool {
+        self.remotes.contains(name)
     }
 
     /// Applies a message: navigation moves the selection and asks for nothing,
@@ -121,6 +139,9 @@ impl SessionsOverlay {
             SessionsMessage::Delete => self
                 .selected_name()
                 .map(|name| SessionsAction::Delete(name.to_string())),
+            SessionsMessage::KillRemotes => self
+                .selected_name()
+                .map(|name| SessionsAction::KillRemotes(name.to_string())),
             SessionsMessage::Close => Some(SessionsAction::Close),
         }
     }
@@ -131,16 +152,18 @@ impl SessionsOverlay {
         self.selected = (self.selected as i32 + delta).clamp(0, last) as usize;
     }
 
-    /// Replaces the list, keeping the selection on the current session.
-    pub fn relist(&mut self, names: Vec<String>) {
+    /// Replaces the list and the `ssh` badges, keeping the selection on the
+    /// current session.
+    pub fn relist(&mut self, names: Vec<String>, remotes: HashSet<String>) {
         let current = self.current.clone();
-        *self = Self::new(current, names);
+        *self = Self::new(current, names, remotes);
     }
 }
 
 /// Translates a key into a picker message while the picker owns the keyboard.
 ///
-/// The binds are the reference manager's, minus its remote-only `k`.
+/// The binds are the reference manager's: `k` asks for the same remote-kill the
+/// reference's `k kill remote` hint promises.
 pub fn handle_key(key: &Key, modifiers: Modifiers) -> Option<SessionsMessage> {
     match key.as_ref() {
         Key::Named(Named::Escape) => Some(SessionsMessage::Close),
@@ -152,6 +175,7 @@ pub fn handle_key(key: &Key, modifiers: Modifiers) -> Option<SessionsMessage> {
                 "n" => Some(SessionsMessage::New),
                 "r" => Some(SessionsMessage::Rename),
                 "d" => Some(SessionsMessage::Delete),
+                "k" => Some(SessionsMessage::KillRemotes),
                 _ => None,
             }
         }
@@ -173,19 +197,34 @@ pub fn view<'a>(overlay: &'a SessionsOverlay, theme: &GhostTheme) -> Element<'a,
         let selected = index == overlay.selected;
         let current = overlay.is_current(name);
         let label = format!("{}{name}", if current { "● " } else { "  " });
-        let row = container(row_text(label, font, &theme, selected))
-            .width(Length::Fill)
-            .padding(Padding::from([4.0, 8.0]))
-            .style(move |_| container::Style {
-                background: selected.then(|| {
-                    Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.10))
-                }),
-                border: Border {
-                    radius: 3.0.into(),
-                    ..Border::default()
-                },
-                ..container::Style::default()
-            });
+        let mut cells: Vec<Element<'a, SessionsMessage>> =
+            vec![row_text(label, font, &theme, selected).into()];
+        if overlay.is_remote(name) {
+            cells.push(
+                text("ssh")
+                    .size(11.0)
+                    .font(font)
+                    .color(rgb(theme.search_match))
+                    .into(),
+            );
+        }
+        let row = container(
+            Row::with_children(cells)
+                .spacing(8.0)
+                .align_y(Vertical::Center),
+        )
+        .width(Length::Fill)
+        .padding(Padding::from([4.0, 8.0]))
+        .style(move |_| container::Style {
+            background: selected.then(|| {
+                Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.10))
+            }),
+            border: Border {
+                radius: 3.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        });
         rows.push(
             mouse_area(row)
                 .on_press(SessionsMessage::Select(index))
@@ -196,7 +235,8 @@ pub fn view<'a>(overlay: &'a SessionsOverlay, theme: &GhostTheme) -> Element<'a,
     let hint = if overlay.entries.is_empty() {
         "no sessions saved yet — n starts one".to_string()
     } else {
-        "↑/↓ select | Enter switch | n new | r rename | d delete | Esc close".to_string()
+        "↑/↓ select | Enter switch | n new | r rename | d delete | k kill remote | Esc close"
+            .to_string()
     };
 
     let body = column![
@@ -292,6 +332,7 @@ mod tests {
         SessionsOverlay::new(
             "default",
             vec!["default".to_string(), "work".to_string()],
+            HashSet::new(),
         )
     }
 
@@ -302,11 +343,23 @@ mod tests {
         assert_eq!(overlay.selected_name(), Some("default"));
         assert!(overlay.is_current("default"));
         assert!(!overlay.is_current("work"));
+        assert!(!overlay.is_remote("default"), "no ssh badge without remote panes");
+    }
+
+    #[test]
+    fn a_session_with_a_durable_remote_pane_is_badged_ssh() {
+        let overlay = SessionsOverlay::new(
+            "default",
+            vec!["default".to_string(), "ds-prod".to_string()],
+            HashSet::from(["ds-prod".to_string()]),
+        );
+        assert!(overlay.is_remote("ds-prod"));
+        assert!(!overlay.is_remote("default"));
     }
 
     #[test]
     fn an_unknown_current_session_is_added_to_the_list() {
-        let overlay = SessionsOverlay::new("session-7", vec!["work".to_string()]);
+        let overlay = SessionsOverlay::new("session-7", vec!["work".to_string()], HashSet::new());
         assert_eq!(overlay.entries, vec!["session-7", "work"]);
         assert_eq!(overlay.selected_name(), Some("session-7"));
     }
@@ -333,6 +386,7 @@ mod tests {
             ("n", SessionsMessage::New),
             ("r", SessionsMessage::Rename),
             ("d", SessionsMessage::Delete),
+            ("k", SessionsMessage::KillRemotes),
         ] {
             assert_eq!(handle_key(&Key::Character(c.into()), Modifiers::default()), Some(want));
         }
@@ -371,6 +425,10 @@ mod tests {
             overlay.update(SessionsMessage::Rename),
             Some(SessionsAction::Rename("work".to_string()))
         );
+        assert_eq!(
+            overlay.update(SessionsMessage::KillRemotes),
+            Some(SessionsAction::KillRemotes("work".to_string()))
+        );
         assert_eq!(overlay.update(SessionsMessage::New), Some(SessionsAction::New));
         assert_eq!(overlay.update(SessionsMessage::Close), Some(SessionsAction::Close));
     }
@@ -379,8 +437,12 @@ mod tests {
     fn a_relist_keeps_the_selection_on_the_current_session() {
         let mut overlay = picker();
         overlay.update(SessionsMessage::Select(1));
-        overlay.relist(vec!["a".to_string(), "default".to_string()]);
+        overlay.relist(
+            vec!["a".to_string(), "default".to_string()],
+            HashSet::from(["a".to_string()]),
+        );
         assert_eq!(overlay.selected_name(), Some("default"));
         assert_eq!(overlay.entries, vec!["a", "default"]);
+        assert!(overlay.is_remote("a"), "the badges come with the new list");
     }
 }
