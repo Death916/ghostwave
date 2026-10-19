@@ -102,6 +102,28 @@ fn dquoted(s: &str) -> String {
     out
 }
 
+/// `s` as one single-quoted shell word, with every `'` closed, escaped and
+/// reopened (`'\''`).
+///
+/// Single quotes are the only form that leaves every character alone — `$`,
+/// `` ` ``, `\`, `"` and `'` itself — and the helper composes: quoting its own
+/// output quotes that *text* as one word for a second shell. That is how the
+/// script below is handed to `sh -c`, and it is what makes a session name that
+/// contains a `'` unable to end the script early.
+fn sq(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// `s` with every POSIX ERE metacharacter backslash-escaped, so it only matches
 /// itself as a literal.
 fn regex_escape(s: &str) -> String {
@@ -161,16 +183,18 @@ pub fn attach_argv(host: &str, session: &str) -> Vec<String> {
 /// The version check compares the remote binary against this app's own version,
 /// so a rebuilt daemon is re-uploaded rather than reused. The session name is the
 /// only variable text, and it is quoted as data; no host text appears at all,
-/// which is what makes a quote-bearing host harmless here.
+/// which is what makes a quote-bearing host harmless here. The script itself is
+/// one single-quoted word ([`sq`]), so a name carrying a `'` cannot end it.
 pub fn attach_cmd(session: &str) -> String {
     let session = dquoted(session);
-    format!(
-        "sh -c 'BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
+    let script = format!(
+        "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
          if [ ! -x \"$BIN\" ] || [ \"$($BIN --version 2>/dev/null)\" != \"ghostd {ver}\" ]; then \
          echo \"ghostd missing/stale — reconnect to upload\"; exit 1; fi; \
-         \"$BIN\" attach {session} 2>/dev/null || {{ \"$BIN\" new {session} >/dev/null 2>&1 && exec \"$BIN\" attach {session}; }}'",
+         \"$BIN\" attach {session} 2>/dev/null || {{ \"$BIN\" new {session} >/dev/null 2>&1 && exec \"$BIN\" attach {session}; }}",
         ver = env!("CARGO_PKG_VERSION")
-    )
+    );
+    format!("sh -c {}", sq(&script))
 }
 
 /// The `pkill -f` pattern that sweeps a session's orphaned daemons: an actual
@@ -188,21 +212,33 @@ fn kill_pattern(session: &str) -> String {
     format!("(^|/)ghostd-[^ ]* new {}($| )", regex_escape(session))
 }
 
+/// The orphan sweep as `pkill -f` receives it: [`kill_pattern`] quoted as one
+/// shell word, so the shell that runs the sweep cannot take the anchor for a
+/// parameter expansion or split the regex.
+///
+/// Public so a test can assert on the pattern the shell will hand `pkill`,
+/// rather than on the quoting that carries it.
+pub fn sweep_pattern(session: &str) -> String {
+    dquoted(&kill_pattern(session))
+}
+
 /// The remote shell command that kills a durable session's daemon.
 ///
 /// Runs on its own ssh connection, so it works when the pane is dead or the
 /// daemon is wedged: the daemon escalates TERM → KILL for itself and the
 /// session's process group off its own pidfile, and the anchored `pkill` is the
-/// last resort for a daemon whose pidfile is already gone.
+/// last resort for a daemon whose pidfile is already gone. The script is one
+/// single-quoted word ([`sq`]), so a session name carrying a `'` cannot end it.
 pub fn kill_cmd(session: &str) -> String {
-    format!(
-        "sh -c 'BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
+    let script = format!(
+        "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
          if [ ! -x \"$BIN\" ]; then echo \"no ghostd binary on this host\"; exit 1; fi; \
          \"$BIN\" kill {session} 2>&1 || true; \
-         pkill -9 -f {pattern} 2>/dev/null || true; true'",
+         pkill -9 -f {pattern} 2>/dev/null || true; true",
         session = dquoted(session),
-        pattern = dquoted(&kill_pattern(session)),
-    )
+        pattern = sweep_pattern(session),
+    );
+    format!("sh -c {}", sq(&script))
 }
 
 /// What one ssh command produced.
@@ -872,7 +908,10 @@ mod tests {
         );
         assert!(cmd.contains("kill \"ghostwave-prod\""), "the pidfile kill is quoted: {cmd}");
         assert!(
-            cmd.contains(r#"pkill -9 -f "(^|/)ghostd-[^ ]* new ghostwave-prod($| )""#),
+            cmd.contains(&format!(
+                "pkill -9 -f {}",
+                sweep_pattern("ghostwave-prod")
+            )),
             "the sweep is anchored and leaves the name a literal: {cmd}"
         );
         assert!(cmd.ends_with("true'"), "the kill always reports success: {cmd}");
@@ -897,12 +936,20 @@ mod tests {
     #[test]
     fn a_session_name_that_is_not_a_literal_still_stays_data() {
         let hostile = "ghostwave-prod'; : > \"$HOME/injected\"; '";
-        let cmd = kill_cmd(hostile);
-        assert!(
-            cmd.contains(r#"kill "ghostwave-prod'; : > \"\$HOME/injected\"; '""#),
-            "the name is quoted as one word: {cmd}"
-        );
-        assert!(cmd.contains(r"\$HOME"), "even `$` is neutralised: {cmd}");
+        // The name is double-quoted for argv integrity, then every `'` in that
+        // word is escaped because the whole script is one single-quoted word.
+        let word = dquoted(hostile).replace('\'', "'\\''");
+        for cmd in [kill_cmd(hostile), attach_cmd(hostile)] {
+            assert!(
+                cmd.contains(&word),
+                "the name arrives as one quoted word: {cmd}"
+            );
+            assert!(
+                parses(&cmd),
+                "a quote in the name leaves the script syntactically whole: {cmd}"
+            );
+            assert!(cmd.contains(r"\$HOME"), "even `$` is neutralised: {cmd}");
+        }
     }
 
     /// Whether POSIX `grep -E` finds `pattern` in `line`. `pkill -f` matches its
@@ -922,6 +969,28 @@ mod tests {
             let _ = sink.write_all(line.as_bytes());
         }
         child.wait().map(|s| s.success()).unwrap_or(false)
+    }
+
+    /// The text a POSIX shell delivers for the shell word `word` — quote removal
+    /// and all — so a test can assert on `pkill`'s argument instead of on the
+    /// escaping that carries it.
+    fn shell_word(word: &str) -> String {
+        let out = Command::new("sh")
+            .args(["-c", &format!("printf %s {word}")])
+            .output()
+            .expect("sh runs");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Whether `cmd` looks like one complete command to a POSIX shell — parsed
+    /// but not run — which is what a session name breaking out of the script
+    /// would destroy.
+    fn parses(cmd: &str) -> bool {
+        Command::new("sh")
+            .args(["-n", "-c", cmd])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     #[test]
@@ -948,6 +1017,38 @@ mod tests {
             !grep_matches(&pattern, &kill_cmd("ghostwave-prod.example")),
             "the sweep does not match the shell that runs it"
         );
+    }
+
+    /// The sweep the shell actually hands `pkill`: the end-of-line anchor must
+    /// survive the quoting, or a daemon whose command line ends exactly at the
+    /// session name — the orphan this sweep exists for — is never matched.
+    #[test]
+    fn the_shell_hands_pkill_an_end_anchored_sweep() {
+        for session in ["ghostwave-prod", "ghostwave-prod.example"] {
+            let pattern = kill_pattern(session);
+            let delivered = shell_word(&sweep_pattern(session));
+
+            assert_eq!(
+                delivered, pattern,
+                "quote removal must leave the regex unchanged"
+            );
+            assert!(
+                !delivered.contains("\\$"),
+                "the `$` is the anchor, not a literal dollar: {delivered}"
+            );
+            assert!(
+                grep_matches(&delivered, &format!("/home/u/.cache/ghostwave/ghostd-x86_64 new {session}")),
+                "a cmdline that ends exactly at the session name is swept: {delivered}"
+            );
+            assert!(
+                grep_matches(&delivered, &format!("ghostd-aarch64 new {session} /bin/bash")),
+                "so is one that starts the session with a command: {delivered}"
+            );
+            assert!(
+                !grep_matches(&delivered, &format!("/home/u/.cache/ghostwave/ghostd-x86_64 new {session}2")),
+                "but not a longer session name: {delivered}"
+            );
+        }
     }
 
     #[test]
@@ -1014,7 +1115,7 @@ mod tests {
         assert!(out.status.success(), "the script ran: {out:?}");
         assert_eq!(
             stub.record("record").as_deref(),
-            Some(format!("attach {hostile}").as_str()),
+            Some(format!("attach {hostile}\n").as_str()),
             "the injected text arrived as one argument, not as commands"
         );
         assert!(
