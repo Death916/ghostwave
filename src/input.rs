@@ -2196,12 +2196,11 @@ mod tests {
             "the daemon is killed by its own pidfile: {:?}",
             calls[0].1
         );
+        let session = crate::remote::remote_session(TEST_HOST);
         assert!(
-            calls[0].1.contains("pkill -9 -f")
-                && calls[0].1.contains(&format!(
-                    "new {}($| )",
-                    crate::remote::remote_session(TEST_HOST).replace('.', "\\.")
-                )),
+            calls[0]
+                .1
+                .contains(&format!("pkill -9 -f {}", crate::remote::sweep_pattern(&session))),
             "and the orphan sweep is anchored to that one session: {:?}",
             calls[0].1
         );
@@ -2233,8 +2232,9 @@ mod tests {
 
         assert_eq!(s.current_session, format!("ssh-{TEST_HOST}"));
         assert_eq!(s.current().name, format!("ssh {TEST_HOST}"));
+        let (tab, pane) = (s.active_tab, s.current().active);
         assert_eq!(
-            s.remote_spec_of(0, 0),
+            s.remote_spec_of(tab, pane),
             Some((
                 TEST_HOST.to_string(),
                 crate::remote::remote_session(TEST_HOST)
@@ -2243,7 +2243,7 @@ mod tests {
         );
         assert_eq!(toast(&s), format!("durable ssh: {TEST_HOST}"));
         assert_eq!(
-            pane_program(&s, 0, 0).as_deref(),
+            pane_program(&s, tab, pane).as_deref(),
             Some("/bin/sh"),
             "the pane runs the ssh seam's stand-in, so no test dials a host"
         );
@@ -2260,10 +2260,24 @@ mod tests {
 
         execute(&mut s, Action::ConnectSsh(TEST_HOST.to_string()));
 
+        // A session left behind by another test in this process is restored on
+        // launch, so the action either starts this session or opens the pane
+        // beside the restored one. The pane it opened is the focused one either
+        // way, which is what the assertions below are about.
+        let (tab, pane) = (s.active_tab, s.current().active);
+
         assert_eq!(s.current_session, format!("ssh-{TEST_HOST}"));
-        assert_eq!(s.remote_spec_of(0, 0), None, "a plain ssh pane is not durable");
+        assert_eq!(
+            s.remote_spec_of(tab, pane),
+            None,
+            "a plain ssh pane is not durable"
+        );
         assert_eq!(toast(&s), format!("connecting to {TEST_HOST}"));
-        assert_eq!(pane_program(&s, 0, 0).as_deref(), Some("/bin/sh"));
+        assert_eq!(
+            pane_program(&s, tab, pane).as_deref(),
+            Some("/bin/sh"),
+            "the pane runs the ssh seam's stand-in, so no test dials a host"
+        );
         assert!(
             ssh.calls().is_empty(),
             "a plain ssh pane never uploads anything: {:?}",
