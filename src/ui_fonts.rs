@@ -21,13 +21,16 @@ pub fn init(preferred_family: Option<&str>) {
         let target_clean = target.trim();
         if !target_clean.is_empty() {
             if let Some((family, bytes)) = resolve_family(target_clean) {
-                eprintln!("[ghostwave] custom font configured: {family}");
+                eprintln!("{}", custom_font_message(&family));
                 let leaked_bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
                 let _ = ACTIVE_FAMILY.set(family);
                 let _ = ACTIVE_BYTES.set(Some(leaked_bytes));
                 return;
             } else {
-                eprintln!("[ghostwave] font '{target_clean}' not found on system; falling back to bundled JetBrains Mono");
+                eprintln!(
+                    "[ghostwave] font '{}' not found on system; falling back to bundled JetBrains Mono",
+                    loggable(target_clean)
+                );
             }
         }
     }
@@ -188,12 +191,41 @@ pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
     }
 
     let names: Vec<&str> = out.iter().map(|(f, _)| f.as_str()).collect();
-    eprintln!(
-        "[ghostwave] fallback fonts: {} ({})",
-        out.len(),
-        names.join(", ")
-    );
+    eprintln!("[ghostwave] fallback fonts: {}", fallback_summary(&names));
     out
+}
+
+/// Renders untrusted text safe for one terminal line.
+///
+/// Every Unicode control character — C0 (including ESC and BEL), DEL and the C1
+/// block U+0080–U+009F — is replaced by its `\u{...}` escape, so Fontconfig
+/// metadata cannot inject terminal escape sequences into the inherited stderr.
+/// Printable text passes through unchanged, so the diagnostic stays readable.
+fn loggable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            out.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The fallback summary line, e.g. `3 (DejaVu Sans Mono, Noto Sans Symbols 2)`.
+///
+/// Family names come straight from `fc-list`, so they go through [`loggable`].
+fn fallback_summary(names: &[&str]) -> String {
+    let escaped: Vec<String> = names.iter().map(|n| loggable(n)).collect();
+    format!("{} ({})", names.len(), escaped.join(", "))
+}
+
+/// The diagnostic logged when a configured family resolves to a system face.
+///
+/// The family is Fontconfig metadata, so it goes through [`loggable`].
+fn custom_font_message(family: &str) -> String {
+    format!("[ghostwave] custom font configured: {}", loggable(family))
 }
 
 struct Candidate {
@@ -387,5 +419,55 @@ mod tests {
         assert!(!is_font_bytes(b"wOFF____"));
         assert!(!is_font_bytes(b"ttf"));
         assert!(!is_font_bytes(&[]));
+    }
+
+    /// ESC, BEL, DEL and C1 must not survive into a log line; plain text must.
+    #[test]
+    fn loggable_escapes_control_bytes() {
+        let hostile = "Mono\u{1b}]0;pwned\u{7}\u{9b}2J\u{7f}\u{0}";
+        assert_eq!(
+            loggable(hostile),
+            "Mono\\u{1b}]0;pwned\\u{7}\\u{9b}2J\\u{7f}\\u{0}"
+        );
+        assert_eq!(loggable("DejaVu Sans Mono"), "DejaVu Sans Mono");
+    }
+
+    /// The whole `fc-list` → scoring → summary path stays inert for hostile
+    /// family metadata, while the selected name is still recognisable.
+    #[test]
+    fn fallback_summary_is_terminal_safe() {
+        let parsed = parse_fc_list(
+            "/x/evil.ttf: Mono\u{1b}[31m\u{7} Pwn Mono:style=Regular\n\
+             /x/DejaVuSansMono.ttf: DejaVu Sans Mono:style=Regular\n",
+        );
+        let names: Vec<&str> = parsed.iter().map(|(_, f)| f.as_str()).collect();
+        assert!(
+            names.iter().any(|n| score_family(n) == 50),
+            "hostile family must still score as a selectable fallback: {names:?}"
+        );
+
+        let summary = fallback_summary(&names);
+        assert!(
+            !summary.chars().any(char::is_control),
+            "summary leaked a control character: {summary:?}"
+        );
+        assert!(summary.starts_with("2 ("), "{summary:?}");
+        assert!(summary.contains("\\u{1b}[31m\\u{7}"), "{summary:?}");
+        assert!(summary.contains("DejaVu Sans Mono"), "{summary:?}");
+    }
+
+    /// The custom-font diagnostic takes the same treatment.
+    #[test]
+    fn custom_font_message_is_terminal_safe() {
+        let msg = custom_font_message("Evil\u{1b}[2J\u{7} Mono");
+        assert_eq!(
+            msg,
+            "[ghostwave] custom font configured: Evil\\u{1b}[2J\\u{7} Mono"
+        );
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        assert_eq!(
+            custom_font_message("DejaVu Sans Mono"),
+            "[ghostwave] custom font configured: DejaVu Sans Mono"
+        );
     }
 }
