@@ -97,11 +97,13 @@ pub fn click_to_pane_index(
 /// [`SPLIT_GRAB_W`].
 pub const SPACING: f32 = 0.0;
 
-/// Width of the band, in px, in which a split can be grabbed.
+/// Width of the band, in px, in which a split can be grabbed, with frames on.
 ///
 /// The grid has no spacing of its own to grab, so this is handed to iced as the
 /// split's leeway; iced makes the hit area `spacing + leeway` wide, centred on
-/// the split, which keeps the 4px band the old gutter gave.
+/// the split, which keeps the 4px band the old gutter gave. It is handed over
+/// only when frames are on: without them there is nothing to grab between the
+/// panes, and a band there would swallow the click that should focus the pane.
 pub const SPLIT_GRAB_W: f32 = 4.0;
 
 /// Inset of a pane's terminal area inside its cell, in px.
@@ -254,9 +256,11 @@ fn grid<'a>(state: &'a AppState, mouse_tracking: Vec<usize>) -> PaneGrid<'a, Mes
         let index = click_to_pane_index(&tab.grid, tab, pane).unwrap_or(tab.active);
         Message::FocusPane(index)
     })
-    .on_resize(SPLIT_GRAB_W, |event| Message::GridResize {
-        split: event.split,
-        ratio: event.ratio,
+    .on_resize(if frames { SPLIT_GRAB_W } else { 0.0 }, |event| {
+        Message::GridResize {
+            split: event.split,
+            ratio: event.ratio,
+        }
     })
     .on_drag(Message::GridDrag)
     .style(move |_theme| grid_style(&theme))
