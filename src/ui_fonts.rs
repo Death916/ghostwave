@@ -35,6 +35,15 @@ pub fn init(preferred_family: Option<&str>) {
     let _ = ACTIVE_BYTES.set(None);
 }
 
+/// The family the cells are measured from and the primary text is drawn in —
+/// i.e. the answer to a font query.
+///
+/// Falls back to the bundled face's family when [`init`] has not run or found
+/// no configured family on the system.
+pub fn active_family() -> &'static str {
+    ACTIVE_FAMILY.get().map(|s| s.as_str()).unwrap_or("JetBrains Mono")
+}
+
 /// Returns the active primary font for iced canvas and widget text.
 pub fn primary() -> iced::Font {
     let family = ACTIVE_FAMILY.get().map(|s| s.as_str()).unwrap_or("JetBrains Mono");
