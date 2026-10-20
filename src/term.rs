@@ -18,6 +18,7 @@ use libghostty_vt::{
     kitty::graphics::{self},
     mouse,
     render::{CellIterator, RenderState, RowIterator},
+    screen::Screen,
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     terminal::{
         ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
@@ -698,6 +699,19 @@ impl TermPane {
         self.force_repaint = true;
     }
 
+    /// Whether the pane is showing the primary screen, the one the scrollback
+    /// belongs to.
+    ///
+    /// Full-screen programs (`less`, `vim`, `htop`) switch to the alternate
+    /// screen while they run; the alternate screen keeps no history, so this is
+    /// also the answer to "does the pane have scrollback to scroll right now".
+    /// A failed read reports `false`: callers that take a key away from the
+    /// program use this, and a program that owns the key is safer than one that
+    /// silently loses it.
+    pub fn on_primary_screen(&self) -> bool {
+        matches!(self.term.active_screen(), Ok(Screen::Primary))
+    }
+
     pub fn clear_terminal(&mut self) -> Result<()> {
         self.term.reset();
         self.force_repaint = true;
@@ -1191,6 +1205,71 @@ mod tests {
             title.contains("SLOW-PRIME"),
             "prime drain gave up before the child's first write (title={title:?})"
         );
+    }
+
+    #[test]
+    fn page_keys_encode_to_the_bytes_a_program_reads() {
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
+        let mut pane = TermPane::new(
+            80,
+            24,
+            cell,
+            None,
+            &[],
+            None,
+            1000,
+            1024 * 1024,
+            false,
+            None,
+        )
+        .unwrap();
+
+        pane.handle_key(
+            Key::PageUp,
+            Mods::empty(),
+            Mods::empty(),
+            '\0',
+            None,
+            key::Action::Press,
+        )
+        .unwrap();
+        assert_eq!(pane.response, b"\x1b[5~", "PageUp reaches the program as CSI 5 ~");
+
+        pane.response.clear();
+        pane.handle_key(
+            Key::PageDown,
+            Mods::empty(),
+            Mods::empty(),
+            '\0',
+            None,
+            key::Action::Press,
+        )
+        .unwrap();
+        assert_eq!(pane.response, b"\x1b[6~", "PageDown reaches the program as CSI 6 ~");
+    }
+
+    #[test]
+    fn on_primary_screen_follows_the_alternate_screen_flag() {
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
+        let mut pane = TermPane::new(
+            80,
+            24,
+            cell,
+            None,
+            &[],
+            None,
+            1000,
+            1024 * 1024,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(pane.on_primary_screen(), "a fresh terminal is on its primary screen");
+        pane.term.vt_write(b"\x1b[?1049h");
+        assert!(!pane.on_primary_screen(), "1049h switches a program to the alternate screen");
+        pane.term.vt_write(b"\x1b[?1049l");
+        assert!(pane.on_primary_screen(), "1049l returns it to the primary screen");
     }
 
     #[test]

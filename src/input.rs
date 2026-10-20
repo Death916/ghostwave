@@ -82,6 +82,10 @@ pub fn key_press(state: &mut AppState, kp: KeyPress, action: key::Action) {
                 return;
             }
             if state.mode == Mode::Normal {
+                if let Some(action) = scrollback_page_key(state, &kp) {
+                    execute(state, action);
+                    return;
+                }
                 if kp.key == key::Key::ArrowUp && kp.mods == Mods::SHIFT {
                     execute(state, Action::ScrollUp(1));
                     return;
@@ -123,6 +127,33 @@ fn remote_dead_key(state: &mut AppState, kp: &KeyPress) -> bool {
     true
 }
 
+/// The scrollback action a plain page key stands for in Normal mode, if the
+/// focused pane is one where ghostwave's own scrollback is what PageUp/PageDown
+/// should move.
+///
+/// Only the plain keys qualify: `Shift+PageUp`/`Shift+PageDown` are global binds
+/// in the keymap table and never reach the pass-through path. A pane whose
+/// program is on the alternate screen is excluded — there the program owns the
+/// screen and its page keys, and the alternate screen has no history to scroll.
+///
+/// One predicate for press, repeat and release, so a page key that was consumed
+/// as a scroll can never have its release leak into the pty.
+fn scrollback_page_key(state: &AppState, kp: &KeyPress) -> Option<Action> {
+    if !kp.mods.is_empty() {
+        return None;
+    }
+    let action = match kp.key {
+        key::Key::PageUp => Action::PageUp,
+        key::Key::PageDown => Action::PageDown,
+        _ => return None,
+    };
+    let PaneEntry::Term(pane) = state.focused_entry()? else {
+        return None;
+    };
+    let primary = pane.lock().unwrap().term.on_primary_screen();
+    primary.then_some(action)
+}
+
 /// Sends a platform key repeat to the active pane, bypassing the bind table.
 ///
 /// In the modal modes repeats are dropped: the press there was consumed as an
@@ -133,6 +164,12 @@ pub fn repeat(state: &mut AppState, kp: KeyPress) {
     }
     if content_key(state, &kp) {
         return;
+    }
+    if state.mode == Mode::Normal {
+        if let Some(action) = scrollback_page_key(state, &kp) {
+            execute(state, action);
+            return;
+        }
     }
     send(state, &kp, key::Action::Repeat);
 }
@@ -155,6 +192,9 @@ pub fn key_release(state: &mut AppState, kp: KeyPress) {
             || keymap::entry_bind(k, m).is_some()
             || keymap::global_binds(k, m).is_some()
         {
+            return;
+        }
+        if scrollback_page_key(state, &kp).is_some() {
             return;
         }
         if let Some(pane) = state.active_pane() {
@@ -1006,6 +1046,104 @@ mod tests {
         ctrl(&mut s, Key::K);
         press(&mut s, Key::C, Mods::CTRL | Mods::SHIFT);
         assert_eq!(toast(&s), "nothing to copy");
+    }
+
+    /// Writes `lines` lines of output into the focused pane the way a running
+    /// program would, so the pane has scrollback to scroll.
+    fn fill_scrollback(state: &mut AppState, lines: usize) {
+        let pane = state.active_pane().expect("a terminal pane");
+        let mut guard = pane.lock().unwrap();
+        for i in 0..lines {
+            let _ = guard.term.term.vt_write(format!("line {i}\r\n").as_bytes());
+        }
+    }
+
+    /// The focused pane's scrollbar as (total rows, viewport offset, page rows).
+    fn scrollbar(state: &AppState) -> (u64, u64, u64) {
+        let pane = state.active_pane().expect("a terminal pane");
+        let sb = pane
+            .lock()
+            .unwrap()
+            .term
+            .term
+            .scrollbar()
+            .expect("a scrollbar");
+        (sb.total, sb.offset, sb.len)
+    }
+
+    /// Puts the focused pane's VT on the alternate screen, which is what a
+    /// full-screen program (`less`, `vim`) does when it starts.
+    fn enter_alternate_screen(state: &mut AppState) {
+        let pane = state.active_pane().expect("a terminal pane");
+        let mut guard = pane.lock().unwrap();
+        guard.term.term.vt_write(b"\x1b[?1049h");
+        assert!(
+            matches!(
+                guard.term.term.active_screen(),
+                Ok(libghostty_vt::screen::Screen::Alternate)
+            ),
+            "the pane should be on the alternate screen"
+        );
+    }
+
+    #[test]
+    fn plain_page_keys_scroll_ghostwaves_own_scrollback() {
+        let mut s = state();
+        fill_scrollback(&mut s, 100);
+        let (_, at_bottom, page) = scrollbar(&s);
+        assert!(page > 0, "the pane should have a visible page, got {page}");
+
+        press(&mut s, Key::PageUp, Mods::empty());
+        let (_, after_up, _) = scrollbar(&s);
+        assert!(
+            after_up < at_bottom,
+            "plain PageUp must scroll ghostwave's scrollback up: {at_bottom} -> {after_up}"
+        );
+
+        press(&mut s, Key::PageDown, Mods::empty());
+        let (_, after_down, _) = scrollbar(&s);
+        assert!(
+            after_down > after_up,
+            "plain PageDown must scroll back down: {after_up} -> {after_down}"
+        );
+    }
+
+    #[test]
+    fn a_held_page_key_keeps_scrolling() {
+        let mut s = state();
+        fill_scrollback(&mut s, 100);
+        let (_, at_bottom, _) = scrollbar(&s);
+
+        press(&mut s, Key::PageUp, Mods::empty());
+        let (_, after_press, _) = scrollbar(&s);
+        repeat(
+            &mut s,
+            KeyPress {
+                key: Key::PageUp,
+                mods: Mods::empty(),
+                text: None,
+            },
+        );
+        let (_, after_repeat, _) = scrollbar(&s);
+        assert!(
+            after_press < at_bottom && after_repeat < after_press,
+            "a held PageUp must keep scrolling: {at_bottom} -> {after_press} -> {after_repeat}"
+        );
+    }
+
+    #[test]
+    fn page_keys_go_to_a_program_on_the_alternate_screen() {
+        let mut s = state();
+        fill_scrollback(&mut s, 100);
+        enter_alternate_screen(&mut s);
+        let before = scrollbar(&s);
+
+        press(&mut s, Key::PageUp, Mods::empty());
+        let after = scrollbar(&s);
+        assert_eq!(
+            after, before,
+            "a full-screen program's page key must not be taken by ghostwave"
+        );
     }
 
     #[test]
