@@ -146,12 +146,46 @@ pub fn load(name: &str) -> Option<SessionState> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// What a saved session's panes say about how its connection was made: a
+/// durable (ghostd-bound) remote pane, a plain `ssh` one, or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteKind {
+    /// At least one pane carries a [`RemoteSpec`](crate::term::RemoteSpec).
+    Durable,
+    /// No durable pane, but some pane runs the `ssh` program (what a plain
+    /// `ssh <host>` connection spawns).
+    PlainSsh,
+}
+
+/// The remote kind of the session saved under `name`.
+///
+/// A durable pane wins over a plain one, so a session that holds both is
+/// `Durable`. `None` when no pane is either, and for a session that does not
+/// load.
+pub fn remote_kind(name: &str) -> Option<RemoteKind> {
+    let session = load(name)?;
+    let mut plain = false;
+    for tab in &session.tabs {
+        for pane in &tab.panes {
+            if pane.remote.is_some() {
+                return Some(RemoteKind::Durable);
+            }
+            if pane.program.as_deref() == Some("ssh") {
+                plain = true;
+            }
+        }
+    }
+    if plain {
+        Some(RemoteKind::PlainSsh)
+    } else {
+        None
+    }
+}
+
 /// Whether any pane in the session is a durable remote (ssh) connection —
-/// used by the session manager to show an "ssh" marker.
+/// used by the session manager to show a durable marker.
 pub fn has_remote(name: &str) -> bool {
-    load(name).is_some_and(|s| {
-        s.tabs.iter().any(|t| t.panes.iter().any(|p| p.remote.is_some()))
-    })
+    remote_kind(name) == Some(RemoteKind::Durable)
 }
 
 /// All durable remote (host, daemon-session) pairs in a saved session —
@@ -167,6 +201,19 @@ pub fn remote_specs(name: &str) -> Vec<(String, String)> {
         }
     }
     v
+}
+
+/// Every durable remote (host, daemon-session) pair across ALL saved sessions,
+/// in session-name order — the palette's inventory of durable targets.
+///
+/// A host bound by several sessions appears once per session; the caller
+/// dedupes by host the way the session manager's kill path does.
+pub fn all_remote_specs() -> Vec<(String, String)> {
+    let mut specs = Vec::new();
+    for name in list_sessions() {
+        specs.extend(remote_specs(&name));
+    }
+    specs
 }
 
 /// True when EVERY pane in the saved session is a durable remote pane —
@@ -493,5 +540,77 @@ mod tests {
     fn load_missing_returns_none() {
         let name = unique_sess("does-not-exist-zzz");
         assert!(load(&name).is_none(), "missing session should be None");
+    }
+
+    /// Saves a one-pane session under `name`; the caller deletes it.
+    fn save_one_pane(name: &str, program: Option<&str>, remote: Option<crate::term::RemoteSpec>) {
+        let state = SessionState {
+            tabs: vec![TabState {
+                name: "remote".into(),
+                panes: vec![PaneState {
+                    program: program.map(String::from),
+                    args: vec![],
+                    cwd: None,
+                    remote,
+                    log: format!("{name}.log"),
+                }],
+                root: None,
+                floating: vec![],
+            }],
+        };
+        save(name, &state);
+    }
+
+    fn durable_spec(host: &str) -> crate::term::RemoteSpec {
+        crate::term::RemoteSpec {
+            host: host.to_string(),
+            session: format!("ghostwave-{host}"),
+        }
+    }
+
+    #[test]
+    fn a_durable_pane_makes_the_session_durable() {
+        let name = unique_sess("test-kind-durable");
+        save_one_pane(&name, Some("ssh"), Some(durable_spec("prod")));
+        assert_eq!(remote_kind(&name), Some(RemoteKind::Durable));
+        assert!(has_remote(&name), "a durable pane is a remote binding");
+        delete(&name);
+    }
+
+    #[test]
+    fn a_plain_ssh_pane_is_ssh_and_not_durable() {
+        let name = unique_sess("test-kind-plain");
+        save_one_pane(&name, Some("ssh"), None);
+        assert_eq!(remote_kind(&name), Some(RemoteKind::PlainSsh));
+        assert!(!has_remote(&name), "a plain ssh pane has no daemon binding");
+        delete(&name);
+    }
+
+    #[test]
+    fn neither_pane_kind_is_neither() {
+        let name = unique_sess("test-kind-none");
+        save_one_pane(&name, None, None);
+        assert_eq!(remote_kind(&name), None, "a local shell is neither kind");
+        assert!(!has_remote(&name));
+        let missing = unique_sess("test-kind-missing");
+        assert_eq!(remote_kind(&missing), None, "a session that does not load is neither");
+        delete(&name);
+    }
+
+    #[test]
+    fn all_remote_specs_lists_a_durable_binding() {
+        // The real data dir may hold the owner's sessions, so this asserts
+        // membership, never list equality.
+        let name = unique_sess("test-all-specs");
+        save_one_pane(&name, Some("ssh"), Some(durable_spec("all-specs-host")));
+        assert!(
+            all_remote_specs().contains(&("all-specs-host".to_string(), "ghostwave-all-specs-host".to_string())),
+            "the durable binding of a saved session is listed"
+        );
+        delete(&name);
+        assert!(
+            !all_remote_specs().contains(&("all-specs-host".to_string(), "ghostwave-all-specs-host".to_string())),
+            "the binding is gone once the session is deleted"
+        );
     }
 }

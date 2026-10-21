@@ -46,6 +46,21 @@ impl PaletteItem {
     }
 }
 
+/// Category every durable-session item carries, so the two ways to reach a host
+/// are readable in the palette at a glance.
+const DURABLE_CATEGORY: &str = "Remote — durable";
+
+/// The palette item for a known durable session: connecting to it reuses the
+/// host's daemon session.
+fn durable_item(host: &str, session: &str) -> PaletteItem {
+    PaletteItem::new(
+        format!("Durable session: {host} — {session}"),
+        DURABLE_CATEGORY,
+        None,
+        Action::ConnectDurableSsh(host.to_string()),
+    )
+}
+
 /// State for the command palette overlay widget.
 #[derive(Clone, Debug)]
 pub struct PaletteState {
@@ -55,6 +70,9 @@ pub struct PaletteState {
     pub selected: usize,
     /// Full catalog of registered action items.
     pub items: Vec<PaletteItem>,
+    /// The durable sessions the palette can offer: `(host, daemon session)`,
+    /// handed in by the caller (the palette never reads the disk).
+    pub durables: Vec<(String, String)>,
 }
 
 impl Default for PaletteState {
@@ -64,24 +82,37 @@ impl Default for PaletteState {
 }
 
 impl PaletteState {
-    /// Creates a new [`PaletteState`] with the specified items.
+    /// Creates a new [`PaletteState`] with the specified items, knowing no
+    /// durable sessions.
     pub fn new(items: Vec<PaletteItem>) -> Self {
+        Self::with_durables(items, Vec::new())
+    }
+
+    /// Creates a new [`PaletteState`] that can list the given durable sessions,
+    /// each a `(host, daemon session)` pair.
+    pub fn with_durables(items: Vec<PaletteItem>, durables: Vec<(String, String)>) -> Self {
         Self {
             query: String::new(),
             selected: 0,
             items,
+            durables,
         }
     }
 
     /// Returns filtered action items matching the current search query.
     ///
-    /// Supports dynamic command prefixes (`open `, `ssh `, `ds `), theme filtering,
-    /// and fuzzy/substring matching across title, category, and keybinding shortcuts.
+    /// Supports dynamic command prefixes (`open `, `ssh `, `ds `, `durable`),
+    /// theme filtering, and fuzzy/substring matching across title, category,
+    /// and keybinding shortcuts. `ds <host>` and `ssh <host>` also offer the
+    /// durable session of a host the palette was told about, and `durable` lists
+    /// those sessions, so the difference between the two connections is visible
+    /// before one is made.
     pub fn filtered_items(&self) -> Vec<PaletteItem> {
         let trimmed = self.query.trim();
         if trimmed.is_empty() {
             return self.items.clone();
         }
+        let lower = trimmed.to_lowercase();
 
         if let Some(path) = self.query.strip_prefix("open ") {
             let p = path.trim();
@@ -95,27 +126,51 @@ impl PaletteState {
             }
         }
 
-        if let Some(host) = self.query.strip_prefix("ssh ") {
-            let h = host.trim();
-            if !h.is_empty() {
+        if lower.starts_with("ds ") {
+            let host = trimmed["ds ".len()..].trim();
+            if !host.is_empty() {
                 return vec![PaletteItem::new(
-                    format!("Connect SSH: {h}"),
-                    "Remote",
+                    format!("Durable SSH (ghostd): {host}"),
+                    DURABLE_CATEGORY,
                     None,
-                    Action::ConnectSsh(h.to_string()),
+                    Action::ConnectDurableSsh(host.to_string()),
                 )];
             }
         }
 
-        if let Some(host) = self.query.strip_prefix("ds ") {
-            let h = host.trim();
-            if !h.is_empty() {
-                return vec![PaletteItem::new(
-                    format!("Durable SSH (ghostd): {h}"),
-                    "Remote",
+        if lower == "durable" && !self.durables.is_empty() {
+            return self.durable_items("");
+        }
+
+        if lower.starts_with("durable ") {
+            let text = trimmed["durable ".len()..].trim();
+            let mut items = self.durable_items(text);
+            if !text.is_empty() {
+                items.push(PaletteItem::new(
+                    format!("New durable SSH (ghostd): {text}"),
+                    DURABLE_CATEGORY,
                     None,
-                    Action::ConnectDurableSsh(h.to_string()),
+                    Action::ConnectDurableSsh(text.to_string()),
+                ));
+            }
+            return items;
+        }
+
+        if lower.starts_with("ssh ") {
+            let host = trimmed["ssh ".len()..].trim();
+            if !host.is_empty() {
+                let mut items = vec![PaletteItem::new(
+                    format!("Connect SSH: {host}"),
+                    "Remote — not durable",
+                    None,
+                    Action::ConnectSsh(host.to_string()),
                 )];
+                for (target, session) in &self.durables {
+                    if target == host {
+                        items.push(durable_item(target, session));
+                    }
+                }
+                return items;
             }
         }
 
@@ -137,6 +192,21 @@ impl PaletteState {
 
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         scored.into_iter().map(|(_, item)| item).collect()
+    }
+
+    /// The palette items for the known durable sessions whose host or daemon
+    /// session contains `text`, in the order the caller handed them in.
+    fn durable_items(&self, text: &str) -> Vec<PaletteItem> {
+        let needle = text.to_lowercase();
+        self.durables
+            .iter()
+            .filter(|(host, session)| {
+                needle.is_empty()
+                    || host.to_lowercase().contains(&needle)
+                    || session.to_lowercase().contains(&needle)
+            })
+            .map(|(host, session)| durable_item(host, session))
+            .collect()
     }
 
     /// Returns the currently highlighted item, clamped to valid filtered bounds.
@@ -469,7 +539,7 @@ pub fn view<'a>(state: &'a PaletteState, theme: &GhostTheme) -> Element<'a, Pale
 
     let list_content = if filtered.is_empty() {
         column![container(
-            text("No matching commands (try: open <path> | ssh <host> | theme <name>)")
+            text("No matching commands (try: open <path> | ssh <host> | ds <host> | durable | theme <name>)")
                 .size(14.0)
                 .font(crate::ui_fonts::primary())
                 .color(rgb(theme.tab_inactive_text))
@@ -862,6 +932,83 @@ mod tests {
         p.set_query("ds ");
         let bare = p.filtered_items();
         assert!(bare.iter().all(|i| !matches!(i.action, Action::ConnectDurableSsh(_))));
+    }
+
+    fn durable_hosts() -> Vec<(String, String)> {
+        vec![
+            ("orac".to_string(), "ghostwave-orac".to_string()),
+            ("prod".to_string(), "ghostwave-prod".to_string()),
+        ]
+    }
+
+    #[test]
+    fn typing_durable_lists_the_known_durable_sessions() {
+        let mut p = PaletteState::with_durables(test_palette(&["Unrelated"]).items, durable_hosts());
+        p.set_query("durable");
+        let out = p.filtered_items();
+        assert_eq!(out.len(), 2, "one item per known durable session");
+        assert_eq!(out[0].title, "Durable session: orac — ghostwave-orac");
+        assert_eq!(out[0].category, DURABLE_CATEGORY);
+        assert!(matches!(&out[0].action, Action::ConnectDurableSsh(h) if h == "orac"));
+        assert_eq!(out[1].title, "Durable session: prod — ghostwave-prod");
+        assert!(matches!(&out[1].action, Action::ConnectDurableSsh(h) if h == "prod"));
+    }
+
+    #[test]
+    fn durable_with_a_host_offers_the_new_session_below_the_known_ones() {
+        let mut p = PaletteState::with_durables(test_palette(&["Unrelated"]).items, durable_hosts());
+        p.set_query("durable ora");
+        let out = p.filtered_items();
+        assert_eq!(out.len(), 2, "the known match, then the new session");
+        assert_eq!(out[0].title, "Durable session: orac — ghostwave-orac");
+        assert_eq!(out[1].title, "New durable SSH (ghostd): ora");
+        assert_eq!(out[1].category, DURABLE_CATEGORY);
+        assert!(matches!(&out[1].action, Action::ConnectDurableSsh(h) if h == "ora"));
+
+        p.set_query("durable ghostwave-prod");
+        let by_session = p.filtered_items();
+        assert!(
+            by_session.iter().any(|i| i.title == "Durable session: prod — ghostwave-prod"),
+            "the daemon session name is searchable too"
+        );
+    }
+
+    #[test]
+    fn ssh_beside_a_known_durable_target_offers_the_durable_session() {
+        let mut p = PaletteState::with_durables(test_palette(&["Unrelated"]).items, durable_hosts());
+        p.set_query("ssh orac");
+        let out = p.filtered_items();
+        assert_eq!(out.len(), 2, "the plain connection, then its durable twin");
+        assert_eq!(out[0].title, "Connect SSH: orac");
+        assert_eq!(out[0].category, "Remote — not durable");
+        assert!(matches!(&out[0].action, Action::ConnectSsh(h) if h == "orac"));
+        assert_eq!(out[1].title, "Durable session: orac — ghostwave-orac");
+        assert!(matches!(&out[1].action, Action::ConnectDurableSsh(h) if h == "orac"));
+
+        p.set_query("ssh unknown-host");
+        let unknown = p.filtered_items();
+        assert_eq!(unknown.len(), 1, "no durable twin for a host nothing knows");
+        assert!(matches!(&unknown[0].action, Action::ConnectSsh(h) if h == "unknown-host"));
+    }
+
+    #[test]
+    fn a_bare_durable_with_an_empty_inventory_lists_nothing_durable() {
+        let mut p = test_palette(&["Unrelated"]);
+        p.set_query("durable");
+        assert!(
+            p.filtered_items()
+                .iter()
+                .all(|i| !matches!(i.action, Action::ConnectDurableSsh(_))),
+            "with nothing to list, the normal filtering answer stands"
+        );
+
+        p.set_query("durable ");
+        assert!(
+            p.filtered_items()
+                .iter()
+                .all(|i| !matches!(i.action, Action::ConnectDurableSsh(_))),
+            "a bare 'durable ' offers no create item either"
+        );
     }
 
     #[test]
