@@ -120,7 +120,9 @@ fn remote_dead_key(state: &mut AppState, kp: &KeyPress) -> bool {
     let (tab, pane) = (state.active_tab, state.current().active);
     match kp.key {
         key::Key::Enter => state.connect_remote_pane(tab, pane),
-        key::Key::K => state.kill_remote_pane(tab, pane),
+        key::Key::K => {
+            state.kill_remote_pane(tab, pane);
+        }
         key::Key::Escape => state.stop_remote_reconnect(),
         _ => {}
     }
@@ -2228,6 +2230,20 @@ mod tests {
     /// instantly, so the background kills these tests start die at once.
     const TEST_HOST: &str = "127.0.0.1";
 
+    /// Arms the workspace's ssh seam with a recorder, so the test can assert on
+    /// the remote operations it asks for without dialing a host.
+    fn record_ssh(s: &mut AppState) -> std::sync::Arc<crate::remote::testing::FakeSsh> {
+        let ssh = std::sync::Arc::new(crate::remote::testing::FakeSsh::default());
+        s.ssh = ssh.clone();
+        ssh
+    }
+
+    /// The program the live pane at `(tab, pane)` runs, from its spawn metadata.
+    fn pane_program(s: &AppState, tab: usize, pane: usize) -> Option<String> {
+        let id = s.tabs[tab].pane(pane)?.lock().unwrap().id;
+        crate::pane::with_pane_meta(id, |meta| meta.program.clone()).flatten()
+    }
+
     /// Replaces the focused tab with one DISCONNECTED remote pane running
     /// `program`, and returns its handle.
     fn install_disconnected_remote(s: &mut AppState, program: &str, args: &[&str]) -> SharedPane {
@@ -2296,6 +2312,7 @@ mod tests {
     fn k_on_a_disconnected_remote_pane_kills_its_remote_session() {
         let _guard = crate::ui_session::test_lock();
         let mut s = state();
+        let ssh = record_ssh(&mut s);
         let handle = install_disconnected_remote(&mut s, "/bin/sh", &["-c", "true"]);
 
         typed(&mut s, Key::K, 'k');
@@ -2307,6 +2324,23 @@ mod tests {
         assert!(
             handle.lock().unwrap().remote_disconnected(),
             "killing the remote session leaves the local pane as it was"
+        );
+        let calls = ssh.wait_calls(1, std::time::Duration::from_secs(5));
+        assert_eq!(calls.len(), 1, "the kill is exactly one ssh command: {calls:?}");
+        assert_eq!(calls[0].0, TEST_HOST, "it goes to the pane's host");
+        assert_eq!(calls[0].2, 0, "the kill streams nothing on stdin");
+        assert!(
+            calls[0].1.contains(&format!("kill \"ghostwave-{TEST_HOST}\"")),
+            "the daemon is killed by its own pidfile: {:?}",
+            calls[0].1
+        );
+        let session = crate::remote::remote_session(TEST_HOST);
+        assert!(
+            calls[0]
+                .1
+                .contains(&format!("pkill -9 -f {}", crate::remote::sweep_pattern(&session))),
+            "and the orphan sweep is anchored to that one session: {:?}",
+            calls[0].1
         );
     }
 
@@ -2330,13 +2364,15 @@ mod tests {
     fn the_durable_ssh_action_opens_its_own_session_and_binds_the_pane() {
         let _guard = crate::ui_session::test_lock();
         let mut s = state();
+        let ssh = record_ssh(&mut s);
 
         execute(&mut s, Action::ConnectDurableSsh(TEST_HOST.to_string()));
 
         assert_eq!(s.current_session, format!("ssh-{TEST_HOST}"));
         assert_eq!(s.current().name, format!("ssh {TEST_HOST}"));
+        let (tab, pane) = (s.active_tab, s.current().active);
         assert_eq!(
-            s.remote_spec_of(0, 0),
+            s.remote_spec_of(tab, pane),
             Some((
                 TEST_HOST.to_string(),
                 crate::remote::remote_session(TEST_HOST)
@@ -2344,18 +2380,63 @@ mod tests {
             "the pane is bound to the host's ghostd session"
         );
         assert_eq!(toast(&s), format!("durable ssh: {TEST_HOST}"));
+        assert_eq!(
+            pane_program(&s, tab, pane).as_deref(),
+            Some("/bin/sh"),
+            "the pane runs the ssh seam's stand-in, so no test dials a host"
+        );
+        let calls = ssh.wait_calls(1, std::time::Duration::from_secs(5));
+        assert_eq!(calls.len(), 1, "the upload checks the architecture once: {calls:?}");
+        assert_eq!(calls[0].1, "uname -m");
     }
 
     #[test]
     fn the_plain_ssh_action_opens_its_session_without_a_ghostd_binding() {
         let _guard = crate::ui_session::test_lock();
         let mut s = state();
+        let ssh = record_ssh(&mut s);
 
         execute(&mut s, Action::ConnectSsh(TEST_HOST.to_string()));
 
+        // A session left behind by another test in this process is restored on
+        // launch, so the action either starts this session or opens the pane
+        // beside the restored one. The pane it opened is the focused one either
+        // way, which is what the assertions below are about.
+        let (tab, pane) = (s.active_tab, s.current().active);
+
         assert_eq!(s.current_session, format!("ssh-{TEST_HOST}"));
-        assert_eq!(s.remote_spec_of(0, 0), None, "a plain ssh pane is not durable");
+        assert_eq!(
+            s.remote_spec_of(tab, pane),
+            None,
+            "a plain ssh pane is not durable"
+        );
         assert_eq!(toast(&s), format!("connecting to {TEST_HOST}"));
+        assert_eq!(
+            pane_program(&s, tab, pane).as_deref(),
+            Some("/bin/sh"),
+            "the pane runs the ssh seam's stand-in, so no test dials a host"
+        );
+        assert!(
+            ssh.calls().is_empty(),
+            "a plain ssh pane never uploads anything: {:?}",
+            ssh.calls()
+        );
+    }
+
+    #[test]
+    fn a_host_that_is_not_an_ssh_destination_opens_no_pane() {
+        let _guard = crate::ui_session::test_lock();
+        let mut s = state();
+        let ssh = record_ssh(&mut s);
+        let before = live_panes(&s);
+        let session_before = s.current_session.clone();
+
+        execute(&mut s, Action::ConnectDurableSsh("prod'; rm -rf ~; '".to_string()));
+
+        assert_eq!(toast(&s), "not an ssh destination: prod'; rm -rf ~; '");
+        assert_eq!(live_panes(&s), before, "no pane was opened for it");
+        assert_eq!(s.current_session, session_before, "and no session was switched");
+        assert!(ssh.calls().is_empty(), "and nothing was run");
     }
 
     #[test]

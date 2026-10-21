@@ -1283,3 +1283,51 @@ merge-base. Not merged and not pushed — the merge is the owner's call.
   `folio_wait_bit_common` and the loopback `juicefs` daemon was the only busy process on the box.
   Root was at 96 % the whole time and the mount runs `--free-space-ratio 0.15`, so the write-back
   cache was throttled throughout — expect the same wall-clock for any future full-suite run here.
+
+### Remote/SSH hardening after the security gate (branch `wt/remote-ssh-secfix`)
+
+Stage 5 (audit card `t_f1f2aac0`) tripped on the ported remote subsystem and filed six findings;
+this branch answers them. Parity behaviour is unchanged: the same `sh -c '…'` wrapper, the same
+attach-with-`|| new` fallback, the same bounded reconnect pass, `k` still kills the daemon of the
+pane it is pressed in.
+
+Two of the six were injection paths into the remote login shell, so the fix is structural rather
+than escaping-at-the-last-minute:
+
+- **No host text in a remote command.** `attach_cmd`/`kill_cmd` used to interpolate `host` into the
+  `sh -c` payload (a host with a `'` closed the wrapper). The host is now an argv element of the
+  local `ssh` and nothing else, and it must pass `ghostwave::term::host_is_valid` — the documented
+  destination forms (alias, `user@host`, `host:port`, `[v6]:port`, `ssh://user@host:port`) are
+  accepted, whitespace and shell metacharacters are not. `connect_ssh`/`connect_durable_ssh` toast
+  and open nothing for a host that fails it.
+- **The stored session name is derived data.** `RemoteSpec` no longer deserializes `session`
+  verbatim: a hand-written `Deserialize` rederives it from `host` (`ghostwave::term::remote_session`),
+  so a session file can not name what a later command line or `pkill` pattern contains.
+  `remote::binding_is_valid(host, session)` gates every binding that did not come out of this
+  process — the pane kill and the session-manager `k` both refuse instead of sending. The name is
+  also quoted as data (`dquoted`) in both commands.
+- **The orphan sweep is anchored and literal.** `pkill -9 -f "ghostd-$(uname -m) new <name>"`
+  matched a regex against any command line, so the `.` in a generated name also matched `-`
+  (`ghostwave-prod.example` vs `ghostwave-prod-example` = a different session's daemon, SIGKILLed).
+  The pattern is now `(^|/)ghostd-[^ ]* new <escaped name>($| )`: the name is escaped to a literal
+  and the match is pinned to a `ghostd …` invocation whose `new <name>` argument ends or is followed
+  by the next argument. The pidfile kill (`ghostd kill <name>`, TERM then KILL on daemon + child
+  group) remains the primary path.
+- **Unit tests do not dial.** `remote::SshRunner` is the seam: `SystemSsh` execs ssh, tests inject
+  `remote::testing::FakeSsh`, which records (host, command, stdin length) and answers from a script.
+  The pane's own program comes from the same seam (`pane_command`), so `ds`/`ssh` tests fork a local
+  stand-in rather than a real `ssh` to 127.0.0.1, and the `k` test no longer runs the remote sweep on
+  the test machine. The command lines themselves are exercised through a real POSIX shell
+  (`sh -c` exactly as a remote login shell parses them) against a stub `ghostd` in a throwaway
+  `$HOME`.
+- **Uploads are per-host and verified.** `AppState::ensure_remote_binary` keeps an in-flight set, so
+  a second request for a host joins the first instead of starting a second upload; each upload
+  writes a unique remote temp (`ghostd-<arch>.new.<pid>.<n>`) and publishes it with one `mv -f`, so
+  the old binary survives a dropped connection, and the install only counts once the remote reports
+  the version just sent. `UploadReport` (Drop-guarded) guarantees the front-end hears back even if
+  the upload thread panics — the old code could leave `uploads_in_flight > 0` forever and pin
+  `tick_rate` at Slow.
+- **Every ssh child has a deadline and a cap.** `ConnectTimeout` bounds only the connection, so
+  `run_bounded` gives each command an overall deadline (15 s; 120 s for an upload), signals it on
+  expiry and reaps it before returning; a process-wide `SlotPool` holds at most 4 ssh children, so
+  repeated kills against a hung host queue instead of accumulating.
