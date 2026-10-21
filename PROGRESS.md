@@ -1331,3 +1331,67 @@ than escaping-at-the-last-minute:
   `run_bounded` gives each command an overall deadline (15 s; 120 s for an upload), signals it on
   expiry and reaps it before returning; a process-wide `SlotPool` holds at most 4 ssh children, so
   repeated kills against a hung host queue instead of accumulating.
+
+### Font query answered: xterm's `OSC 50` (branch `wt/t_c989ef4e`)
+
+The card asked for "the font query (**OSC 12**)" so that `fastfetch` would show ghostwave's real
+font. Both halves are wrong, and the premise was corrected before any code was written
+(`PLAN.md` §0, reviewed and approved at stage 2):
+
+- **OSC 12 is the cursor colour**, not a font (ghostty.org docs map `n=12` to *Cursor color*). The
+  pinned VT answers it itself through `on_pty_write` — `term.rs`'s own
+  `terminal_responds_to_probes` test relies on that — so a second reply would break colour
+  queries for every program.
+- **`fastfetch` never sends an OSC font query on Linux.** Its only escape-sequence font path is
+  `XTGETTCAP` inside `detectKitty()`, gated on the terminal's process name being `kitty`; a
+  ghostwave pane falls through to `Unknown terminal: ghostwave` in the `terminalfont` module, and
+  the "Noto Sans" comes from the separate `font` module's fontconfig path. No escape sequence a
+  terminal emits can change either: making `fastfetch -c examples/N.jsonc` print the real font
+  needs an upstream `ghostwave` matcher entry, which is hermz's call and out of scope here.
+
+What was actually missing, and is now built, is the real xterm font *query*. A program writes
+`ESC ] 50 ; ? ST` (or `BEL` for `ST`) and gets `ESC ] 50 ; <family> <same terminator>` back.
+
+- **Traced inbound path** (unchanged by this work): pty reader thread →
+  `PtyMsg::Data` → live iced path `main.rs` `Message::Output` → `Pane::ingest`
+  (`src/pane.rs`) → `vt_write`; and the prime/restore path `TermPane::poll_pty`
+  (`src/term.rs`) → `vt_write`, drained by `prime_pty`. Both hooks now run the scanner
+  first: `self.term.scan_queries(data)` before `vt_write`, and `ingest` additionally calls
+  `flush_response()` — the iced path had no response flush of its own, and a font reply is
+  useless sitting in a buffer.
+- **`src/font_query.rs`** (new, std only, house pattern of `program_status.rs`): `Scanner::feed`
+  keeps state across chunks so a query split by the reader is answered once; retains at most 64
+  body bytes, so an OSC 8 hyperlink or a clipboard payload is abandoned rather than buffered; and
+  answers **only** the exact body `50;?` — `50;<font>` (xterm's *set* command) and every other OSC
+  are ignored. The VT parses no OSC 50 at all, so nothing double-replies.
+- **The family is never hardcoded**: `TermPane` captures `ui_fonts::active_family()` once at
+  construction (`Config.font_family` → `ui_fonts::init` → `ACTIVE_FAMILY`, fallback "JetBrains
+  Mono"), so a pane answers what the app is actually configured to use.
+- **`ui_fonts` moved into the library crate** (`src/lib.rs`), because `TermPane` lives there and
+  the binary-crate module was unreachable from it — the compile-blocking gap stage 2 found and
+  carried as amendment A1. `main.rs` now does `use ghostwave::ui_fonts;`, and the `crate::ui_fonts`
+  paths in the bin modules resolve to that alias.
+- **Not touched, deliberately**: `session::replay_pane_log` writes straight into the VT, so
+  replayed history never reaches the scanner (answering a recorded query would inject replies into
+  a fresh shell); `src/input.rs`, `libghostty-vt`, and every other dependency are untouched.
+- **Suite**: green through the build gate — 218 tests (baseline on this base was **211**, not the
+  216 the plan assumed: lib 50 + bin 154 + 1 + 6; the 3 `ui_fonts` tests moved with the module
+  from the bin target to the lib target). Seven new tests: six in `font_query::tests` and
+  `term::tests::pane_answers_the_font_query`.
+- **Not exercised by hand**: the end-to-end check needs the GUI — in a ghostwave pane,
+  `printf '\033]50;?\033\\'; timeout 1 cat -v` should print `^[]50;JetBrains Mono^[\` (or the
+  configured family). That is `NEEDS-VULCAN:`, not a stage-3 acceptance.
+
+### Branch hygiene: bring a branch forward onto `master` *before* review is requested (card `t_750774cc`)
+
+The two PRs that produced this rule are PR #16 (`wt/t_2a5f5dab`, frames on shared pane edges) and
+PR #17 (`wt/t_c989ef4e`, the OSC 50 font-family sanitise above): #16 was merged as `46c1ce1`, then
+PR #15 as `c8b7404`, and by then PR #17 no longer merged — it was closed without merge at
+2026-10-20 23:57 with `mergeable: false`, its whole fix stranded off `master`. The conflicts were
+mechanical (`PLAN.md` add/add, `PROGRESS.md` both-sides-added; `src/term.rs` auto-merged), i.e. they
+were purely drift, and drift is fixable at any time — *before* a human spends a review, not instead of
+one. So, from card `t_750774cc` on: **a branch is brought forward onto the current `origin/master`
+and its `mergeable` flag is checked (`GET /api/v1/repos/death916/ghostwave/pulls/<n>`) before a
+review is requested**; if `master` moves while a PR is open, the branch comes forward again before
+the next card touches it. Rebase or merge is the author's choice — the rule is only that it happens
+and that the resulting tree was verified, never that the reviewer should discover the conflict.

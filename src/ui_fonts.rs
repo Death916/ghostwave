@@ -21,18 +21,30 @@ pub fn init(preferred_family: Option<&str>) {
         let target_clean = target.trim();
         if !target_clean.is_empty() {
             if let Some((family, bytes)) = resolve_family(target_clean) {
-                eprintln!("[ghostwave] custom font configured: {family}");
+                eprintln!("{}", custom_font_message(&family));
                 let leaked_bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
                 let _ = ACTIVE_FAMILY.set(family);
                 let _ = ACTIVE_BYTES.set(Some(leaked_bytes));
                 return;
             } else {
-                eprintln!("[ghostwave] font '{target_clean}' not found on system; falling back to bundled JetBrains Mono");
+                eprintln!(
+                    "[ghostwave] font '{}' not found on system; falling back to bundled JetBrains Mono",
+                    loggable(target_clean)
+                );
             }
         }
     }
     let _ = ACTIVE_FAMILY.set("JetBrains Mono".to_string());
     let _ = ACTIVE_BYTES.set(None);
+}
+
+/// The family the cells are measured from and the primary text is drawn in —
+/// i.e. the answer to a font query.
+///
+/// Falls back to the bundled face's family when [`init`] has not run or found
+/// no configured family on the system.
+pub fn active_family() -> &'static str {
+    ACTIVE_FAMILY.get().map(|s| s.as_str()).unwrap_or("JetBrains Mono")
 }
 
 /// Returns the active primary font for iced canvas and widget text.
@@ -179,12 +191,61 @@ pub fn fallback_bytes(limit: usize) -> Vec<(String, Vec<u8>)> {
     }
 
     let names: Vec<&str> = out.iter().map(|(f, _)| f.as_str()).collect();
-    eprintln!(
-        "[ghostwave] fallback fonts: {} ({})",
-        out.len(),
-        names.join(", ")
-    );
+    eprintln!("[ghostwave] fallback fonts: {}", fallback_summary(&names));
     out
+}
+
+/// Renders untrusted text safe for one terminal line.
+///
+/// Every Unicode control character — C0 (including ESC and BEL), DEL and the C1
+/// block U+0080–U+009F — and every bidirectional formatting control (U+061C,
+/// U+200E–U+200F, U+202A–U+202E, U+2066–U+2069) is replaced by its `\u{...}`
+/// escape, so Fontconfig metadata cannot inject terminal escape sequences into
+/// the inherited stderr, nor reorder the diagnostic to spoof its own family and
+/// list boundaries in a bidi-capable terminal. Printable text passes through
+/// unchanged, so the diagnostic stays readable.
+fn loggable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() || is_bidi_control(ch) {
+            out.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Whether `ch` is a Unicode `Bidi_Control` property character.
+///
+/// These are category `Cf`, not `Cc`, so [`char::is_control`] misses them, yet
+/// they are invisible and can visually reorder a line in a bidi-capable
+/// terminal — including the overrides U+202D/U+202E and the isolates
+/// U+2066–U+2069. They must be escaped like any other control.
+fn is_bidi_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'                  // ARABIC LETTER MARK
+            | '\u{200e}'            // LEFT-TO-RIGHT MARK
+            | '\u{200f}'            // RIGHT-TO-LEFT MARK
+            | '\u{202a}'..='\u{202e}' // LRE, RLE, PDF, LRO, RLO
+            | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+    )
+}
+
+/// The fallback summary line, e.g. `3 (DejaVu Sans Mono, Noto Sans Symbols 2)`.
+///
+/// Family names come straight from `fc-list`, so they go through [`loggable`].
+fn fallback_summary(names: &[&str]) -> String {
+    let escaped: Vec<String> = names.iter().map(|n| loggable(n)).collect();
+    format!("{} ({})", names.len(), escaped.join(", "))
+}
+
+/// The diagnostic logged when a configured family resolves to a system face.
+///
+/// The family is Fontconfig metadata, so it goes through [`loggable`].
+fn custom_font_message(family: &str) -> String {
+    format!("[ghostwave] custom font configured: {}", loggable(family))
 }
 
 struct Candidate {
@@ -378,5 +439,121 @@ mod tests {
         assert!(!is_font_bytes(b"wOFF____"));
         assert!(!is_font_bytes(b"ttf"));
         assert!(!is_font_bytes(&[]));
+    }
+
+    /// ESC, BEL, DEL and C1 must not survive into a log line; plain text must.
+    #[test]
+    fn loggable_escapes_control_bytes() {
+        let hostile = "Mono\u{1b}]0;pwned\u{7}\u{9b}2J\u{7f}\u{0}";
+        assert_eq!(
+            loggable(hostile),
+            "Mono\\u{1b}]0;pwned\\u{7}\\u{9b}2J\\u{7f}\\u{0}"
+        );
+        assert_eq!(loggable("DejaVu Sans Mono"), "DejaVu Sans Mono");
+    }
+
+    /// Bidi formatting controls are `Cf`, so `char::is_control` misses them and
+    /// they would otherwise reorder the line in a bidi-capable terminal.
+    #[test]
+    fn loggable_escapes_bidi_controls() {
+        let hostile = "Mono\u{202e}emans\u{202d}\u{202c}\u{2066}\u{2069}\u{200f}\u{200e}\u{061c}";
+        assert_eq!(
+            loggable(hostile),
+            "Mono\\u{202e}emans\\u{202d}\\u{202c}\\u{2066}\\u{2069}\\u{200f}\\u{200e}\\u{61c}"
+        );
+        assert_no_hostile_controls(&loggable(hostile));
+        assert_eq!(loggable("Noto Sans Mono"), "Noto Sans Mono");
+        assert_eq!(loggable("JetBrains Mono"), "JetBrains Mono");
+    }
+
+    /// The whole `fc-list` → scoring → summary path stays inert for hostile
+    /// family metadata, while the selected name is still recognisable.
+    #[test]
+    fn fallback_summary_is_terminal_safe() {
+        let parsed = parse_fc_list(
+            "/x/evil.ttf: Mono\u{1b}[31m\u{7} Pwn Mono:style=Regular\n\
+             /x/DejaVuSansMono.ttf: DejaVu Sans Mono:style=Regular\n",
+        );
+        let names: Vec<&str> = parsed.iter().map(|(_, f)| f.as_str()).collect();
+        assert!(
+            names.iter().any(|n| score_family(n) == 50),
+            "hostile family must still score as a selectable fallback: {names:?}"
+        );
+
+        let summary = fallback_summary(&names);
+        assert!(
+            !summary.chars().any(char::is_control),
+            "summary leaked a control character: {summary:?}"
+        );
+        assert!(summary.starts_with("2 ("), "{summary:?}");
+        assert!(summary.contains("\\u{1b}[31m\\u{7}"), "{summary:?}");
+        assert!(summary.contains("DejaVu Sans Mono"), "{summary:?}");
+    }
+
+    /// Bidi controls in an `fc-list` family reach neither `stderr` raw via the
+    /// fallback summary nor move the neighbouring printable text.
+    #[test]
+    fn fallback_summary_escapes_bidi_controls() {
+        let parsed = parse_fc_list(
+            "/x/evil.ttf: Mono\u{202e}Pwn\u{2066}\u{2069} Mono:style=Regular\n\
+             /x/DejaVuSansMono.ttf: DejaVu Sans Mono:style=Regular\n",
+        );
+        let names: Vec<&str> = parsed.iter().map(|(_, f)| f.as_str()).collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+
+        let summary = fallback_summary(&names);
+        assert_no_hostile_controls(&summary);
+        assert!(summary.contains("\\u{202e}"), "{summary:?}");
+        assert!(summary.contains("\\u{2066}\\u{2069}"), "{summary:?}");
+        assert!(summary.contains("DejaVu Sans Mono"), "{summary:?}");
+        let tail = summary.rsplit(", ").next().unwrap();
+        assert_eq!(
+            tail.trim_end_matches(')'),
+            "DejaVu Sans Mono",
+            "{summary:?}"
+        );
+    }
+
+    /// The custom-font diagnostic takes the same treatment.
+    #[test]
+    fn custom_font_message_is_terminal_safe() {
+        let msg = custom_font_message("Evil\u{1b}[2J\u{7} Mono");
+        assert_eq!(
+            msg,
+            "[ghostwave] custom font configured: Evil\\u{1b}[2J\\u{7} Mono"
+        );
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        assert_eq!(
+            custom_font_message("DejaVu Sans Mono"),
+            "[ghostwave] custom font configured: DejaVu Sans Mono"
+        );
+    }
+
+    /// A configured family carrying a right-to-left override must be escaped in
+    /// the same diagnostic, with ordinary family text left untouched.
+    #[test]
+    fn custom_font_message_escapes_bidi_controls() {
+        let msg = custom_font_message("\u{202e}Mono\u{2067}\u{61c}");
+        assert_eq!(
+            msg,
+            "[ghostwave] custom font configured: \\u{202e}Mono\\u{2067}\\u{61c}"
+        );
+        assert_no_hostile_controls(&msg);
+        assert_eq!(
+            custom_font_message("Noto Sans Mono"),
+            "[ghostwave] custom font configured: Noto Sans Mono"
+        );
+    }
+
+    /// Asserts that no raw Cc, DEL/C1 or bidi formatting control survived.
+    fn assert_no_hostile_controls(text: &str) {
+        let raw: Vec<char> = text
+            .chars()
+            .filter(|c| c.is_control() || is_bidi_control(*c))
+            .collect();
+        assert!(
+            raw.is_empty(),
+            "raw control(s) {raw:?} survived in {text:?}"
+        );
     }
 }

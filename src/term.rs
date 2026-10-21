@@ -170,6 +170,13 @@ pub struct TermPane {
     mouse_encoder: mouse::Encoder<'static>,
     mouse_event: mouse::Event<'static>,
     pub response: Vec<u8>,
+    /// Scanner for inbound font queries (`OSC 50`); its replies land in
+    /// `response` and leave with `flush_response`.
+    font_query: crate::font_query::Scanner,
+    /// The family a font query is answered with, captured at construction from
+    /// `ui_fonts::active_family()` so a pane answers what the app is actually
+    /// configured to use.
+    pub font_family: String,
     selection: SelectionState<'static>,
     /// None when the pane is in a disconnected state (no child process).
     pub pty: Option<Pty>,
@@ -367,6 +374,8 @@ impl TermPane {
             mouse_encoder,
             mouse_event,
             response: Vec::with_capacity(64),
+            font_query: crate::font_query::Scanner::new(),
+            font_family: crate::ui_fonts::active_family().to_string(),
             selection: SelectionState::new()?,
             pty,
             pty_rx,
@@ -505,7 +514,7 @@ impl TermPane {
             return false;
         }
 
-        let Some(rx) = self.pty_rx.as_ref() else {
+        let Some(rx) = self.pty_rx.take() else {
             return false;
         };
 
@@ -517,6 +526,7 @@ impl TermPane {
                         if let Some(log) = self.log.as_mut() {
                             log.write(&data);
                         }
+                        self.scan_queries(&data);
                         self.term.vt_write(&data);
                         had_activity = true;
                     }
@@ -533,6 +543,7 @@ impl TermPane {
                 }
             }
         }
+        self.pty_rx = Some(rx);
         had_activity
     }
 
@@ -593,6 +604,14 @@ impl TermPane {
         if let Some(log) = self.log.as_mut() {
             log.seed(data);
         }
+    }
+
+    /// Scans inbound pty bytes for a font query and queues the reply in
+    /// `response`, which `flush_response` writes back to the pty. The bytes
+    /// themselves are not consumed — the VT still receives them unchanged.
+    pub fn scan_queries(&mut self, data: &[u8]) {
+        let replies = self.font_query.feed(data, &self.font_family);
+        self.response.extend_from_slice(&replies);
     }
 
     pub fn flush_response(&mut self) {
@@ -1285,6 +1304,41 @@ mod tests {
             title.contains("SLOW-PRIME"),
             "prime drain gave up before the child's first write (title={title:?})"
         );
+    }
+
+    /// A font query arriving on the pane's inbound path is answered with the
+    /// family the app is configured to use, in the terminator the query used.
+    /// Feeds the same `scan_queries` entry point both live hook points
+    /// (`TermPane::poll_pty`, `Pane::ingest`) call.
+    #[test]
+    fn pane_answers_the_font_query() {
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
+        let mut pane = TermPane::new(
+            80,
+            24,
+            cell,
+            None,
+            &[],
+            None,
+            1000,
+            1024 * 1024,
+            false,
+            None,
+        )
+        .expect("pane without a child");
+
+        let family = crate::ui_fonts::active_family().to_string();
+        pane.response.clear();
+        pane.scan_queries(b"\x1b]50;?\x1b\\");
+
+        let mut expected = b"\x1b]50;".to_vec();
+        expected.extend_from_slice(family.as_bytes());
+        expected.extend_from_slice(b"\x1b\\");
+        assert_eq!(
+            pane.response, expected,
+            "font query should be answered with the configured family"
+        );
+        assert_eq!(pane.font_family, family, "pane captured the active family");
     }
 
     #[test]
