@@ -664,3 +664,535 @@ Both commands stay: `ssh <host>` keeps spawning a plain ssh pty, `ds <host>` kee
 The plan only *labels* them and offers the durable twin next to a plain `ssh <host>` when a durable session for
 that host is already known (§3 D3). No command is renamed, removed, or made durable by default, and no
 `ssh-plain` alias is introduced — the owner has explicitly said `ds` works and the gap is discoverability.
+
+---
+
+# PLAN — a pane's canvas must not paint over its frame stroke
+
+relay: job=t_b6e8cb0c · stage 1 (PLAN), **revision 3** (this card: `t_142a44ce`) · stage-2 verdict
+that produced it: changes-required on `t_69b8f4cd` (round 2) · branch `wt/t_b6e8cb0c` (based on
+`master` @ `a9c2f97`) · owner report: "pane still overlaps border. the canvas seems to go over the
+border line but you can see a small bit of it on the left" · screenshot `https://ibb.co/VWvPmKyj`
+· **owner answer to §9 arrived mid-review, quoted verbatim in §9**
+
+This card arrived from the dashboard with **no body and no plan stage bought**; the previous card in
+this series (`t_2a5f5dab`, PR #16, merged as `46c1ce1`) fixed the *missing* frame line where two
+panes touch. This one is the residual report: the frame line is there, but a pane's **canvas paints
+over it**. *Revision 3 corrects that reading with the owner's own answer (§9): the covered stroke is
+on the edge two **stacked** panes share, which §1.3 shows no canvas paint can reach — so this plan
+fixes a real overhang defect that is **not** the owner's report, and says so everywhere.*
+
+## Revision 3 — what changed (this card `t_142a44ce`)
+
+Stage 2 round 2 (`t_69b8f4cd`) accepted the geometry and the clip finding and returned three
+blocking defects plus four minors. Revision 3 is those fixes and nothing else: **no measured number
+from revision 2 changed**, and no design change follows from the fixes except one extra test.
+
+1. **B1 — §5's full-suite expectation was false.** Revision 2 said `220 passed` / "218 today". Enumerated
+   here, at the base commit `a9c2f97` (the two plan commits touch PLAN.md only):
+
+   ```
+   grep -rho '#\[test\]' src/   | wc -l   → 252      (72 lib-target + 180 bin-target modules)
+   grep -rho '#\[test\]' tests/ | wc -l   →   7      (flood_throughput 1, term_core 6)
+   #[ignore] anywhere / cfg(feature in src/ / doctest code fences in the lib modules → 0 / 0 / 0
+   ```
+
+   **259 test functions**, not 218. The 218 was PR #16's tree (`46c1ce1`) — two merges stale
+   (`c8b7404` +24, `a9c2f97` +17), and the same stale `PROGRESS.md:1377` source that revision 1 got
+   its count from. §5 now says *measure the base run, then expect exactly +3* (262), and separately
+   why the increment is +3 and not the +2 stage 2 counted: B2 adds a third test (§4).
+2. **B2 — the shared edge, which is where the owner's report lives, is now computed.** New §1.3
+   derives the gap from a pane's painted fill to its own and its neighbour's stroke at a stacked
+   split's boundary, states why §1.1's fill row and §1.2's marker threshold are unchanged there, and
+   pins the painted excursion with a new test. The layout-level half is already pinned
+   (`framed_panes_carry_their_frame_on_shared_edges`); §1.3 says so rather than duplicating it.
+3. **B3 — §9's question is answered, and the answer refutes revision 2's mapping.** The owner's
+   sentence is quoted verbatim in §9. It places the covered stroke at the **shared edge of a
+   vertically stacked split**, which §1.3 proves is not something `paint_pane` can paint. §9's "a
+   pane frame → the clamp is the whole fix" mapping is replaced by the truth: **stage 3 does not
+   address the reported symptom under any configuration this plan computes.** The symptom becomes
+   its own card — first lead PR #16 (`46c1ce1`), merged against this same report — with the owner's
+   `font_size` / `padding` / `show_frames` and an unscaled capture still owed (§9).
+4. **Minors, applied verbatim.** M1: §1.1's cursor row is now an explicit *assumption* with the FFI
+   citation and the font size at which it would matter. M2: §1.2's `padding = 0` case opens at
+   `font_size ≥ 6`, not "any font". M3: the `font_size 12` row says the marker **is** drawn — in the
+   gutter, on screen, simply not touching a stroke — which is what §3's no-clip finding implies.
+   M4: the `NEEDS-OWNER-VERIFY` move is stated canvas-local (`−1.2 → 0`), the only form that holds
+   for focused and unfocused panes alike.
+
+## Revision 2 — what changed, and against what evidence
+
+1. **Withdrawn: §1's old causal claim.** Revision 1 said the `origin_offset` paint rect can extend
+   the pane's background fill "up to 0.5 px past the canvas onto the cell's stroke". It cannot: with
+   frames on the canvas edge is `inset = 4.0` px inside the stroke's inner edge, and a ≤0.5 px
+   overhang lands in that gap, which is painted the same `theme.bg` the fill uses. Zero visible pixel
+   in every configuration (§1.1). Stage 2 was right and revision 1 was wrong.
+2. **Added: what actually leaves the canvas.** `paint_pane` paints five things; four are provably
+   inside it, and one — the search rows' left gutter marker — leaves it by up to
+   `cell.w − config.padding` px and does reach the stroke, but only when a cell is wider than the
+   gutter (§1.2). That threshold is now measured, not asserted: `cw = 0.600 · font_size` from the
+   bundled face, so the marker's path to a stroke opens at `font_size ≥ 16` (unfavourable layout
+   phase) / `≥ 18` (any phase) at the default `padding = 6.0` — and at `font_size ≥ 6` if the owner
+   runs `padding = 0` (revision 3 corrects this sentence in §1.2; that claim of "any font" was loose).
+3. **Withdrawn: the whole-paint `with_clip`.** Stage 2 called it a crop of the marker; measured, it
+   is worse — at the defaults the marker's ink lies **entirely outside** the canvas
+   (canvas-local `−1.2 … −0.3`), visible only because iced gives the canvas no clip, so
+   `with_clip(ORIGIN .. bounds.size())` around `paint_pane` would **delete the search marker**. The
+   clip is replaced by a clamp on the one primitive that leaves (§3).
+4. **§9 is asked with this card**, not after stage 3: at the defaults nothing in `paint_pane` touches
+   a stroke, so the screenshot's element is still unidentified and only the owner can identify it.
+
+§5 is still the acceptance; §10 now lists what stage 2 has to judge **revision 3** on.
+
+## 0. PREMISE CHECK (measured, not assumed — unchanged from revision 1, re-verified by stage 2)
+
+* `https://ibb.co/VWvPmKyj` → image `https://i.ibb.co/0jfdtwND/image.png`, HTTP 200, **1492x922**.
+  Decoded with a stdlib PNG reader and measured column-by-column (scripts kept at
+  `~/.hermes/profiles/dev/cache/scratch/{pngtool,peaks,colprof,rgb2}.py`). Stage 2 re-fetched and
+  re-measured it independently and got the same numbers.
+* The image is a **downscaled crop of a screen, not a window capture**: every 1 px feature is a
+  3–4 px luminance ramp; the only full-height bright line, `x 1424..1427`, ramps
+  `(65,61,73) → (130,101,57) → (109,82,51)`.
+* **No theme frame colour appears in the image.** Dracula's active stroke `#bd93f9` → 0 px at a ±20
+  tolerance; tokyonight `#7aa2f7` likewise 0 px. `theme.frame` (`#44475a` for dracula) matches
+  13 996 px, but they are glyph antialiasing scattered over the text area, not a stroke.
+* The one full-height line at `x≈1424–1427` is **warm brown/orange** — dracula `search_match`
+  `#ffb86c` blended ~50 % with the pane background, not a frame colour.
+* Nothing in `master` draws a persistent right-hand panel: `src/main.rs:610-650` is a `Column` of
+  tab bar / pane grid / status bar, with floats, toast, the search overlay
+  (`OverlayPosition::TopRight`) and the *centred* sessions modal stacked above.
+* This tree has **no scrollbar painting at all** (`scrollbar()` in `src/term.rs` is the VT's
+  scroll-offset query, not a widget), so the right-edge line is not a scrollbar either.
+
+**Verdict: PREMISE UNRESOLVED for the exact element — and revision 2 adds that no `paint_pane`
+primitive can draw a full-height line, so the screenshot's element is not inside a pane's canvas at
+all.** §1.2's marker is one row tall and `cw/8` wide; it cannot produce `x≈1424–1427`. What *is*
+provable is a real overhang defect in `paint_pane` (§1.2); it is not necessarily the owner's.
+
+Revision 3 adds the owner's own answer (§9, verbatim): the covered stroke is the **shared edge of a
+two-pane stacked split**. That is the same conclusion from the other end — §1.3 computes that edge
+and shows `paint_pane` stops ≥ 3.5 px short of even the pane's *own* stroke there, so the report is
+not this diff's defect and not this diff's fix.
+
+## 1. The geometry, from the constants up (traced, not inferred)
+
+Given for frames on: `PANE_GAP = 4.0` (`src/panes_grid.rs:49`), `PANE_INSET = 2.0` (`:52`),
+`SPACING = 0.0` (`:98`), `FRAME_ACTIVE_W = 2.0` / `FRAME_INACTIVE_W = 1.0`
+(`src/pane_canvas.rs:23-25`):
+
+* `inset(frames)` = `PANE_INSET + PANE_GAP/2` = **4.0 px** (`src/panes_grid.rs:113-119`); `0.0` with
+  frames off.
+* `cell_metrics` = `{ frame: 1.0 unfocused / 2.0 focused, padding: inset + frame }` = **5.0 / 6.0
+  px** (`src/panes_grid.rs:135-146`).
+* The terminal body is `container(Canvas::new(PaneCanvas).width(Fill).height(Fill)).padding(metrics.padding)`
+  (`src/panes_grid.rs:202-221`), and iced hands `Canvas::draw` that child's layout bounds
+  (`iced_widget-0.14.2/src/canvas.rs:291`, `let bounds = layout.bounds();`). So **canvas-local 0 is
+  `metrics.padding` px inside the cell**, and the stroke — the `Content` border on the cell's
+  outermost `frame` px (`src/panes_grid.rs:242-250`) — has its **inner edge `inset = 4.0` px outside
+  the canvas**.
+* The region between the canvas edge and the stroke is painted `theme.bg` by `Content::style`
+  (`src/panes_grid.rs:243`), the same colour `paint_pane` fills with
+  (`default_bg = rgb(theme.bg)`, `src/pane_canvas.rs:178,180-184`).
+* The painter's own `padding` is **not** `metrics.padding`: `PaneCanvas.padding` is
+  `state.config.padding` (`src/panes_grid.rs:189`, `src/main.rs:550`, default `6.0` at
+  `src/config.rs:161`), so text and markers are laid out against `config.padding` inside a canvas
+  that is inset by `metrics.padding`. At the defaults that is 6.0 vs 5.0 unfocused / 6.0 focused —
+  a 1 px disagreement in unfocused panes, noted in §7 as out of scope.
+* `rect` = the paint rect: `origin_offset = bounds.round() - bounds`, `pane_rect = Rectangle::new(origin_offset, bounds.size())`
+  (`src/panes_grid.rs:502-503`). So in canvas-local coordinates `rect.x ∈ (−0.5, 0.5]` and
+  `rect.x + rect.width = bounds.width + rect.x` — up to 0.5 px past the right/bottom edge and up to
+  0.5 px before the left/top edge.
+
+### 1.1 Every primitive `paint_pane` paints, against those numbers
+
+`cw = cell.w`, `p = config.padding` (6.0 default), `rect.x ∈ (−0.5, 0.5]`.
+
+| primitive | code | horizontal extent, canvas-local | can it reach the stroke (inner edge at `−4.0`)? |
+|---|---|---|---|
+| background fill | `src/pane_canvas.rs:180-184` | `rect.x … rect.x + width` = `−0.5 … width + 0.5` | **no** — 4.0 px of `theme.bg` gap between the canvas edge and the stroke, and the fill is `theme.bg`: zero visible pixel, all four edges, every configuration |
+| cell background / glyph / underline / strike | `src/pane_canvas.rs:234-266` | `x = ox + col·cw` for `col < cols`, `cols = ⌊(w − 2p)/cw⌋` (`src/panes_grid.rs:61-68`) → the last ink ends at `rect.x + w − p` | **no** — ≥ 5.5 px inside the right edge; the same arithmetic bounds rows at the bottom |
+| cursor block / bar / underline | `src/pane_canvas.rs:302-320` | `ox + vp.x·cw`, ink `… + cw`; `vp.x < cols` is an **assumption**, see below | **no, on that assumption** — inside the text area |
+| **search-row left marker** | `src/pane_canvas.rs:285-295` | `x = ox − cw = rect.x + p − cw`, ink `x … x + cw/8` | **yes**, when `cw > p + inset + rect.x` |
+
+**M1 — the cursor row's "no" is an assumption, not a measured invariant, and it is written down as
+one.** `vp` is `snapshot.cursor_viewport()`, used at `src/pane_canvas.rs:302-305` as
+`cx = ox + vp.x as f32 * cw` with no clamp. That call hands libghostty's FFI values straight
+through: `libghostty-vt-0.2.1/src/render.rs:495-505` reads `CURSOR_VIEWPORT_X` and constructs
+`CursorViewport { x, .. }` unchanged, and the only contract in the tree is the binding's field
+comment, `libghostty-vt-sys-0.2.1/src/bindings.rs:2797-2798` — "Cursor viewport x position in cells
+(uint16_t). Only valid when CURSOR_VIEWPORT_HAS_VALUE is true." The C/Zig side that would have to
+guarantee `x < cols` is **not vendored** in either crate, so `vp.x < cols` cannot be verified from
+this tree; it is assumed, on the reading that a *viewport* position is a position inside the
+viewport. If `x == cols` ever arrives (pending-wrap is the usual way), the block's ink right edge is
+`rect.x + p + (vp.x + 1)·cw`, which passes the canvas edge by up to `cw − p` and reaches the stroke
+at `cw > p + inset` — worst phase `font_size ≥ 17` at the defaults, the marker's defect class one
+axis over. (At the defaults it would already pass the canvas edge, but into the `theme.bg` gap —
+invisible, same colour — so the visible symptom needs the stroke, i.e. `font_size ≥ 17`.) Round 2
+estimated `≥ 21`; same class, different truncation case. Either way it is not
+this diff's defect: it is recorded here so a later card starts from an assumption instead of from
+the false "no" revision 2 shipped.
+
+With frames off (`inset = 0`, `metrics.padding = 0`, `SPACING = 0`) the canvas fills the cell and the
+≤0.5 px overhang lands on the neighbour's own `theme.bg` area, which carries no ink before
+`cell-local p = 6` — still zero visible pixel, and there is no stroke to cover.
+
+### 1.2 The marker is the only path, and its threshold is measured
+
+`cw` is not free: `cell_dims` measures `font.metrics('M', font_px).advance_width`
+(`src/pane.rs:803-816`) from the primary face. For the bundled `assets/JetBrainsMono-Medium.ttf`,
+read straight out of the TTF (upem 1000; advance 600 units for `M`, `█` U+2588 *and* `▏` U+258F;
+script `~/.hermes/profiles/dev/cache/scratch/fontadv.py`):
+
+```
+upem=1000  'M' advance=600 → ratio 0.600
+font_size 12 → cw 7.200      16 → cw 9.600      20 → cw 12.000
+font_size 15 → cw 9.000      17 → cw 10.200     24 → cw 14.400
+```
+
+The marker's ink left edge is `p − cw` (plus `rect.x`) from the canvas edge; the stroke's inner edge
+is `inset = 4.0` px out. So it crosses the stroke when `cw > p + inset + rect.x`, i.e. at the
+defaults `cw > 10.0 + rect.x`: **≥ 16 px from the best layout phase (`rect.x ≈ −0.5`, `cw 9.6`),
+≥ 18 px from every phase (`rect.x = +0.5`, `cw 10.8`)**. Clearance of the marker's left ink edge from
+the stroke's inner edge at `rect.x = 0` is `p + inset − cw = 10.0 − cw`:
+
+| `font_size` | `cw` | clearance from stroke | where the ink lands |
+|---|---|---|---|
+| 12 (default) | 7.2 | **+2.8 px** | drawn 1.2 px left of the canvas edge, in the gutter — on screen (iced clips nothing, §3), simply not touching the stroke |
+| 15 | 9.0 | +1.0 px | gutter, 1 px short of the stroke |
+| 16 | 9.6 | +0.4 px (worst phase `−0.1`) | touches the stroke only at `rect.x ≈ −0.5` |
+| 17 | 10.2 | **−0.2 px** | 0.2 px of `search_match` orange on the 1 px stroke |
+| 18 | 10.8 | −0.8 px | covers the unfocused stroke, reaches the cell edge |
+| 20 | 12.0 | −2.0 px | past the 1 px stroke and past the cell edge, into the neighbour's gutter |
+| 24 | 14.4 | −4.4 px | 3.4 px into the neighbouring cell |
+
+The threshold moves with the configured padding: `cw > padding + 4.0 + rect.x` — `padding = 4` opens it
+at `font_size ≥ 13` (best phase), `padding = 2` at `font_size ≥ 10`, and `padding = 0` at
+`cw > 4.0 + rect.x`, i.e. `font_size ≥ 6` from the best layout phase (`≥ 8` from the worst) — not
+"at any font". A
+configured font family (`ui_fonts::init`, `src/ui_fonts.rs:19-45`) changes the ratio and moves the
+threshold with it; the fix in §3 does not depend on the ratio.
+
+The marker is **one row tall and `cw/8` wide** (0.9 px wide, one cell row tall, at the defaults). So: a real, visible
+overhang defect — but a per-row sliver, not the full-height line at `x≈1424–1427` in the screenshot.
+
+### 1.3 The shared edge — where the owner's report actually is
+
+§1.1 measures one pane's canvas against **its own** stroke. The owner's answer (§9) puts the covered
+stroke at the edge two stacked panes **share**, where one pane's paint meets the *neighbour's*
+stroke — a case §1.1 never writes down. With `SPACING = 0.0` (`src/panes_grid.rs:98`) the cells
+touch, so for a stacked split at boundary `S` (A above, B below, `S = a.y + a.height = b.y`):
+
+* A's stroke band is `[S − frameA, S]`, B's is `[S, S + frameB]`: the two meet exactly on `S`. That
+  **layout-level** invariant is already pinned — `framed_panes_carry_their_frame_on_shared_edges`
+  (`src/panes_grid.rs:831-865`) runs the stacked case through `assert_framed_shared_edge` (`:738`),
+  which asserts the cells touch (`gap ≈ 0`), the strokes touch (`stroke_gap ≈ 0`) and neither cell's
+  terminal area reaches under a stroke. Nothing here duplicates it; what it does not pin is what is
+  **painted**.
+* A's canvas bottom edge sits `metrics.padding = inset + frame = 4.0 + frameA` above `S`
+  (`src/panes_grid.rs:113-119,135-146,202-221`), i.e. at `S − 4.0 − frameA`. The fill's overhang is
+  ≤ 0.5 px (§1.1 — `origin_offset ∈ (−0.5, 0.5]`), so it reaches at best **`S − 3.5 − frameA`**:
+  **3.5 px clear of A's own stroke band, and `3.5 + frameA` px clear of B's** (which begins at `S`;
+  its far edge is a further `frameB` on, i.e. `3.5 + frameA + frameB`). At the defaults — A
+  unfocused, B focused — that is 3.5 px clear of A's stroke and 4.5 px clear of B's.
+* So **§1.1's fill row is unchanged at the shared edge: zero visible pixel, every configuration.**
+  The distance to a stroke only *grows* there, because the neighbour's stroke is on the far side of
+  a boundary the canvas is already `4.0 + frameA` away from.
+* **§1.2's marker threshold is unchanged too, and the neighbour's stroke is strictly harder to
+  reach than the pane's own.** The marker's ink left edge is `p − cw + rect.x` from the canvas edge.
+  It touches the pane's own stroke at `cw > p + inset + rect.x = p + 4.0 + rect.x` (§1.2); reaching a
+  neighbour across a shared edge means clearing the pane's own stroke band **and** the boundary,
+  i.e. `cw > p + 4.0 + frameA + rect.x` — the same inequality plus `frameA > 0`. Every font that
+  touches a neighbour's stroke already touches the pane's own, so §1.2's table and its
+  `font_size ≥ 16…18` verdict stand at a shared edge. (The marker only leaves a canvas on its
+  **left**, so this is the side-by-side case; a vertically stacked pane's left edge is a window edge
+  or another split, same arithmetic.)
+* With frames off there are no strokes (`frame = 0`, `inset = 0`, `metrics.padding = 0`): the fills
+  meet, both are `theme.bg`, and there is nothing to cover (§1.1).
+
+**Consequence for stage 3, stated before it starts: nothing this plan changes is at a shared
+edge.** `paint_rect` moves no pixel (§3), and the marker clamp moves an x that already has
+`p + inset − cw ≥ 2.8 px` of clearance from the nearest stroke at the defaults (§1.2). The paint
+excursion is pinned by a new test (§4, test 3) — deliberately *not* by extending
+`framed_panes_carry_their_frame_on_shared_edges`, which reasons about cell and terminal-area rects
+and would stay green through a paint change that walked a fill out over a stroke.
+
+## 2. Candidates, ranked, with the evidence that decides them
+
+| # | Cause | Evidence | Verdict |
+|---|---|---|---|
+| C1 | background fill overhang from `origin_offset` (`§1.1`) | ≤ 0.5 px into a 4.0 px `theme.bg` gap, same colour | **cannot produce any visible pixel** — hygiene only |
+| C2 | the terminal keeps one more row/column than fits | `cols = ⌊(w − 2p)/cw⌋` → the last cell ends ≥ 5.5 px inside | **ruled out** by arithmetic (`bounds_to_cols_rows_calculations` already covers the fit) |
+| C3 | the search rows' gutter marker (`§1.2`) | `x = ox − cw`; crosses the inset at `cw > p + inset + rect.x`, measured `font_size ≥ 16…18` at defaults, `≥ 10` at `padding = 2` | **the only primitive in `paint_pane` that reaches a stroke** — real, configuration-dependent, not the screenshot |
+| C4 | the reported line is not a pane frame at all but chrome/overlay (tab bar, status bar, search overlay, sessions modal), or something outside this tree | nothing in `master` places a full-height line at the image's right edge (`§0`) | **only the owner can say** — §9, asked with this card |
+| C5 | **the shared edge of a stacked split** (the owner's own answer, §9): a stroke that is missing/covered *where two panes touch* | §1.3: no `paint_pane` primitive gets within 3.5 px of a shared edge at any configuration, so the paint cannot be the cause; PR #16 (`46c1ce1`) was merged against this exact symptom — "fix(panes): draw the frame on the edges two panes share (owner: frames are missing where panes touch)" | **the owner's report, and outside this diff** — first lead of its own card: an incomplete/regressed PR #16 fix, or a layer above the canvas (container `Border` with `frame_w`, `pane_grid`'s cell rects) |
+
+## 3. Decision — design for stage 3
+
+Two changes; the first is the defect fix, the second is hygiene that makes "a pane paints only inside
+its canvas" true by construction. **Neither touches the shared-edge symptom** (§1.3, §2 C5): this
+diff is the fix for a real overhang that is not the owner's report, and stage 3 must not present it
+as one.
+
+1. **Bound the search marker (the real defect, `src/pane_canvas.rs`).** The marker belongs in the
+   gutter left of the text origin, but the gutter is only `p` wide, so a cell wider than the gutter
+   puts it outside the canvas. Clamp it:
+
+   ```rust
+   /// The x a search row's gutter marker is drawn at: one cell left of the text
+   /// origin, but never outside the canvas.
+   ///
+   /// The gutter is only `padding` wide, so a cell wider than the gutter would
+   /// otherwise put the marker's ink past the canvas edge and onto the pane's own
+   /// frame stroke. Clamping keeps the marker visible and the stroke intact.
+   fn marker_x(padding: f32, cell_w: f32) -> f32 {
+       (padding - cell_w).max(0.0)
+   }
+   ```
+
+   used at `src/pane_canvas.rs:289` in place of `ox - cw` (`ox = rect.x + padding`, `:166`). While
+   `cell_w ≤ padding` — `font_size ≤ 10` at the defaults — the value is `padding − cell_w` exactly,
+   i.e. today's position; above that the marker stops at the canvas edge instead of marching toward
+   the stroke (and, from `font_size 18`, into the neighbour). In between it moves right by
+   `cell_w − padding`: 1.2 px at the default `font_size 12`.
+
+2. **Keep the painted rect inside the canvas (hygiene, `src/panes_grid.rs`).** Extract the inline
+   math into a documented helper
+
+   ```rust
+   /// The rect a pane paints into: the canvas' bounds, snapped to whole pixels
+   /// without growing past them.
+   fn paint_rect(bounds: Rectangle) -> Rectangle
+   ```
+
+   returning `Rectangle { x: fx, y: fy, width: bounds.width - fx, height: bounds.height - fy }` where
+   `fx = bounds.x.round() - bounds.x`, `fy = bounds.y.round() - bounds.y`. It keeps the "rounded
+   origin" intent the module was built around and stops the rect growing past the edge. **It moves no
+   pixel** (§1.1) and the plan says so rather than selling it as the fix; it is what makes the
+   invariant checkable in a unit test.
+
+**Deliberately not done: `frame.with_clip(...)` around `paint_pane`.** Revision 1 proposed it and §7
+claimed it changed no content; both were wrong. Measured: at the defaults the marker's ink is at
+canvas-local `−1.2 … −0.3`, i.e. **entirely outside the canvas**, and it is on screen only because
+iced hands the canvas no clip (`iced_widget-0.14.2/src/canvas.rs:290-312`, `_viewport` unused;
+`container::clip(true)` only narrows the viewport, `container.rs:351-372`). A clip over the canvas
+bounds would therefore **delete the search marker on every pane at default metrics** — a regression
+traded for nothing, because the only other thing that leaves the canvas is the fill overhang, which
+is invisible and already removed by change 2. `Frame::with_clip` exists
+(`iced_graphics-0.14.0/src/geometry/frame.rs:145-155`) and its region is frame-local, so the
+mechanism is available and correctly understood — it is simply the wrong instrument here.
+
+## 4. Tests (assertable without a display)
+
+* New `panes_grid::tests::paint_rect_stays_inside_the_canvas` — table of bounds: integer
+  (`x: 592.0, y: 24.0, 597.0x640.0` → rect == bounds exactly), both-fractional
+  (`x: 592.5, y: 24.25, 597.75x640.5`), and the worst cases `x.999`/`y.999`; assert
+  `rect.x >= b.x`, `rect.y >= b.y`, `rect.x + rect.width <= b.x + b.width`,
+  `rect.y + rect.height <= b.y + b.height`, `rect.x.fract() == 0.0`, `rect.y.fract() == 0.0`.
+  **RED against today's code**: with `x: 592.5, width: 597.75` the shipped rect ends at `1190.75`
+  while the canvas ends at `1190.25`. Run it against the current `draw()` body first (temporary
+  `#[cfg(test)]` copy of the inline math, or run it before the helper exists) and paste the failure.
+* New `pane_canvas::tests::search_marker_stays_inside_the_canvas` — table over `(padding, cell_w)`:
+  `(6.0, 7.2)` → today `−1.2`, expected `0.0`; `(6.0, 9.6)` → `−3.6` → `0.0`; `(6.0, 10.8)` →
+  `−4.8` → `0.0`; `(6.0, 20.0)` → `−14.0` → `0.0`; `(12.0, 7.2)` → `4.8` unchanged; and a sweep
+  `cell_w 1.0 … 32.0` at `padding 6.0` asserting `x >= 0.0` and `x + cell_w/8.0 <= 6.0 + cell_w`
+  (the marker never leaves the canvas on any font). **RED evidence**: the same table evaluated
+  against today's `padding - cw` expression, pasted on the card — four negative rows.
+* New `panes_grid::tests::painted_fill_cannot_reach_a_shared_edge` — the **painted** half of §1.3,
+  for the owner's own configuration: a **stacked** split (`SplitDir::Vertical`, the setup the layout
+  test already uses at `:845-850`), `frames = true`, both focus combinations. From `regions()`
+  (`:697-703`, the engine's own layout) with `a` above `b`: `S = b.y` (assert
+  `b.y − (a.y + a.height) ≈ 0`, i.e. the cells touch), `canvas_bottom = a.y + a.height − m_a.padding`,
+  `fill_reach = canvas_bottom + 0.5` (§1.1's worst-case overhang). Assert
+  `fill_reach <= a.y + a.height − m_a.frame − 3.5 + 0.01` (clear of A's own stroke band) **and**
+  `fill_reach <= S − (3.5 + m_a.frame) + 0.01` (clear of B's); mirror both on `x` for the
+  side-by-side split. **This one is GREEN on today's tree** — it pins a property the tree already
+  has, so unlike the other two it is not a RED test: write it first, watch it pass, and say so on
+  the card instead of dressing it up as a failure. It is a guard, not a discovery, and a real one:
+  `S` comes from `pane_grid`'s own layout (`regions()`), not from this crate's formula, so the test
+  fails the day `SPACING` stops being 0, a cell is handed out short/overlapping, or `cell_metrics`
+  stops including the frame and the 4.0 px inset in `padding` — exactly the changes that would let a
+  fill reach a stroke.
+* Everything after PR #16 must stay green: `framed_panes_carry_their_frame_on_shared_edges`,
+  `frameless_panes_touch_with_no_gutter`, `click_to_pane_index_mapping`,
+  `stack_label_string_formatting`, `bounds_to_cols_rows_calculations`.
+
+## 5. Verification (stage 3 runs these and pastes the real output)
+
+Through the build gate, per-card target dir, never a bare `cargo`:
+
+```sh
+CARGO_TARGET_DIR=/var/build/ghostwave/t_b6e8cb0c \
+  bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell --run 'cargo test --locked panes_grid::'
+# expect: 7 passed / 0 failed  (5 existing + paint_rect_stays_inside_the_canvas + painted_fill_cannot_reach_a_shared_edge)
+
+CARGO_TARGET_DIR=/var/build/ghostwave/t_b6e8cb0c \
+  bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell --run 'cargo test --locked pane_canvas::'
+# expect: 1 passed / 0 failed  (the new marker test; pane_canvas has no other unit tests)
+
+CARGO_TARGET_DIR=/var/build/ghostwave/t_b6e8cb0c \
+  bash ~/.hermes/scripts/build_gate.sh nix-shell --run 'cargo test --locked'
+# expect: 0 failed / 0 ignored, and passed == whatever this same command reports on the base + 3
+#   measured at the base a9c2f97, by enumeration: 259 test functions
+#   (grep -rho '#\[test\]' src/ = 252, tests/ = 7; #[ignore] = 0, cfg(feature = 0, no doctests)
+#   → 262 after the three new tests. Do NOT reuse 218: that is PR #16's tree (46c1ce1), two
+#   merges stale (c8b7404 +24, a9c2f97 +17). Run the base count yourself and paste both numbers.
+
+CARGO_TARGET_DIR=/var/build/ghostwave/t_b6e8cb0c \
+  bash ~/.hermes/scripts/build_gate.sh nix-shell --run 'cargo clippy --locked --all-targets'
+# expect: rc 0, no new warnings (any pre-existing warning in a touched file is recorded, not fixed)
+```
+
+Gate exit 3 = another build holds the lock → comment and block the card `transient`; exit 4 = not
+enough RAM → retry. Never compile around the gate.
+
+**Not verifiable here, by construction:** orac is headless (`nixos` aarch64, no display, no GPU/EGL
+surface), so the *visual* result cannot be produced on this box. Stage 3 must state on the card, and
+must not claim a pixel moved:
+
+```
+NEEDS-OWNER-VERIFY: at font_size 12 / padding 6 (defaults) the only intended visible change is the
+search marker moving 1.2 px right, canvas-local -1.2 -> 0 (unfocused cell-local 3.8 -> 5.0,
+focused 4.8 -> 6.0 - state the canvas-local number, it is the one that does not move with focus);
+nothing else should look different. At font_size >= 17 a search row's orange gutter marker used to
+sit on the pane's frame stroke and must now stop at the pane's edge. This diff does NOT address the
+owner's report: the covered stroke is at the shared edge of a stacked split (PLAN.md 1.3 and 9),
+where nothing this diff paints changes - that symptom is its own card, first lead PR #16 (46c1ce1).
+```
+
+## 6. Risks / traps
+
+* **The owner's symptom is not in this diff at all — now confirmed, not suspected.** The owner's
+  answer (§9) puts it at the shared edge of a stacked split, and §1.3 shows no `paint_pane`
+  primitive reaches such an edge at any configuration. The symptom becomes its own card (§9); this
+  plan does not chase it, and stage 3 must not describe its diff as closing the report.
+* **The marker's clamp is a small visible move** at `cell_w > padding` (≤ 1.2 px at the defaults) —
+  unavoidable, since the alternative that keeps it still is letting it paint over the stroke.
+  Do not "improve" it by clipping: that deletes the marker at the defaults (§3).
+* **`cw` depends on the font.** The clamp is ratio-independent, but the *threshold* at which the
+  defect shows is not: 0.600 for the bundled face, different for a configured family. Do not hardcode
+  0.6 anywhere in the fix or tests beyond documenting the measured number.
+* **Two paddings disagree** (`config.padding` 6.0 in the painter vs `metrics.padding` 5.0/6.0 in the
+  layout). It does not cross a stroke at the defaults and is out of scope (§7); do not "fix" it here
+  by feeding `metrics.padding` into the painter — that would move every glyph in every pane.
+* **Do not "fix" this by widening `PANE_INSET`.** The gap already exists (4 px + stroke) and PR #16's
+  shared-edge invariant (`framed_panes_carry_their_frame_on_shared_edges`) would have to move with it.
+* **`paint_rect` changes no pixel.** If stage 2 wants a one-change diff, dropping it leaves the
+  marker fix intact; keeping it costs six lines and makes the invariant testable.
+
+## 7. NOT doing (explicit)
+
+* No `with_clip` around `paint_pane` or around the fill — measured to crop the search marker at the
+  defaults and to fix nothing else (§3).
+* No change to `SPACING`, `PANE_GAP`, `PANE_INSET`, `TITLE_H`, the stroke widths or any theme colour.
+* No redesign of the grid, the title band, the frames-off path, floats, or the overlay stack.
+* No patch or vendoring of iced; `Cargo.lock` untouched.
+* No change to `src/pane_canvas.rs`'s painting content beyond the marker's x (§3, change 1) — cell
+  colours, glyphs, cursor and the text origin stay as they are. Revision 1 claimed "containment
+  only"; that was false both ways (the clip changed content, the clamp is a content change) and is
+  withdrawn.
+* No fix for the `config.padding` / `metrics.padding` disagreement; no scrollbar, chrome or overlay
+  work; the screenshot's element is §9's.
+* **No work on the shared-edge symptom** (§1.3, §2 C5) — not in this branch, not in this diff. It is
+  carved out to its own card in §9, with PR #16 `46c1ce1` as its first lead.
+* No merge, no push to `master`; the PR is stage 3's, and `death916/ghostwave` is public so the merge
+  is the owner's.
+
+## 8. Ordered work items for stage 3
+
+1. In `/home/death916/code/ghostwave/.worktrees/t_b6e8cb0c` (branch `wt/t_b6e8cb0c`, already merged
+   up to `master` @ `a9c2f97`), confirm `git status` is clean and `git log -1` is this plan commit.
+2. **Measure the base count first**, before touching `src/`: run the full suite through the gate on
+   the base commit and record `N passed / 0 failed / 0 ignored`; expect 259 (the enumeration in §5).
+   That number, +3, is §5's acceptance — never a quoted constant from an older card.
+3. Paste the RED evidence for the two defect tests before adding either helper: the current inline
+   rect math for `paint_rect_stays_inside_the_canvas`, and `padding − cell_w` for
+   `search_marker_stays_inside_the_canvas` (§4). Run `panes_grid::` through the gate, record the
+   failures, then delete the temporary copies. Test 3 (`painted_fill_cannot_reach_a_shared_edge`) is
+   the exception: add it first and record that it **passes on the base tree** (§4).
+4. Add `fn marker_x(padding: f32, cell_w: f32) -> f32` in `src/pane_canvas.rs` with the doc comment
+   and use it at `:289`; add its test.
+5. Add `fn paint_rect(bounds: Rectangle) -> Rectangle` in `src/panes_grid.rs` with the doc comment and
+   use it in `draw()`; add its test.
+6. Run §5's four commands; paste `N passed / M failed`, clippy rc, and `rustfmt --check` on the two
+   touched files (this module has pre-existing import-order hunks — say so, do not "fix" them).
+7. `PROGRESS.md`: one dated entry in the repo's running-log style, recording the revision-3
+   arithmetic (4 px inset, 0 visible px for the fill, 3.5 px clearance at a shared edge, the marker
+   threshold, the rejected clip) and the fact that the owner's shared-edge report is **not** this
+   diff's — with PR #16 named as its first lead.
+8. One commit for the behaviour (`fix(panes): keep a pane's canvas inside its frame`), push the
+   branch through `~/.hermes/scripts/fleet_push.sh dev "$PWD" origin wt/t_b6e8cb0c`, open the PR
+   against `master` and read it back (state, head sha, base, mergeable).
+9. Mark the card `NEEDS-OWNER-VERIFY` with §5's wording (headless box), repeat in the summary that
+   the owner's shared-edge report is carved out (§9) and not closed by this PR, and hand stage 4 to
+   `review`.
+
+## 9. OWNER QUESTION — answered mid-review; the answer reframes the job
+
+Revision 2 asked which border in `https://ibb.co/VWvPmKyj` is being covered, because §0 finds no
+theme frame colour in the image to measure. The owner answered on the dashboard while round 2 was in
+review — **verbatim**:
+
+> "it was a 2 pane split one above the other the black canvas ( it hink) overlaps the border.
+>  i cans ee the border highlight color all around the pane escept where they touch"
+
+Read literally: a **two-pane split, one pane above the other**; the frame highlight is intact on every
+side **except the shared edge**. That is exactly the configuration §1.3 computes and §0/§1.1 never
+addressed.
+
+**What the answer buys — and what it does not.** Revision 2's mapping, "'a pane frame' → stage 3's
+marker clamp plus the snap is the whole fix", is **withdrawn: it is refuted by this answer and by
+this plan's own arithmetic.** At a shared edge a pane's fill stops ≥ 3.5 px short of its own stroke
+and ≥ 3.5 + frameA px short of the neighbour's (and 3.5 + frameA + frameB short of the neighbour's
+far edge — §1.3); the marker is a one-row, `cw/8`-wide
+sliver that at `font_size ≤ 15` never leaves the gutter (§1.2). **Nothing stage 3 changes is painted
+at a shared edge, so stage 3 does not close the owner's report under any configuration this plan
+computes.** Any wording that says otherwise is wrong and must not reach stage 3 or stage 4.
+
+**The sharper lead:** this is the *same symptom* PR #16 was merged for. `46c1ce1` — "fix(panes): draw
+the frame on the edges two panes share (owner: frames are missing where panes touch)" — and
+`framed_panes_carry_their_frame_on_shared_edges` (`src/panes_grid.rs:831`) pins the layout that fix
+produced. The owner reporting the shared edge again therefore points at an **incomplete or regressed
+PR #16 fix, or at a layer above the canvas** — the container `Border` with `frame_w`
+(`src/panes_grid.rs:242-250`), the cell rects `pane_grid` hands out, or the stroke's colour/alpha —
+not at a new mystery, and certainly not at `paint_pane`.
+
+**Carve-out — the shared-edge symptom is its own card, not this branch's.** Spec recorded here so
+the card needs no re-derivation:
+
+* **title:** `a pane frame is still covered on the edge two stacked panes share`
+* **first lead:** PR #16 `46c1ce1`, `framed_panes_carry_their_frame_on_shared_edges` and
+  `assert_framed_shared_edge` (`src/panes_grid.rs:738`) — note what the test asserts (layout rects
+  only: cells touch, strokes touch, no terminal area under a stroke) and therefore what it cannot
+  catch (anything painted), then check whether the container `Border` is drawn on the shared edge at
+  all and with which colour and alpha.
+* **still owed by the owner before it starts:** `font_size`, `padding` and `show_frames` from
+  `~/.config/ghostwave/config.toml` (defaults 12.0 / 6.0 / on — `src/config.rs:157,161`) and an
+  unscaled capture of the stacked split. The supplied image is resampled to 1492x922 and carries no
+  theme frame colour at all (§0), so it cannot be measured to the pixel.
+* **where it lives:** its own branch and card, raised by the orchestrator against the owner's answer.
+  Not `wt/t_b6e8cb0c`, not stage 3, not this PR.
+
+The honest statement stays, and is repeated in §5's `NEEDS-OWNER-VERIFY` and in stage 3's summary:
+**stage 3 must not be sold as closing the owner's report.**
+
+## 10. What stage 2 has to judge **revision 3** on
+
+1. **B1:** is §5's full-suite expectation now true at the base commit — measured-then-incremented
+   (+3, 262 at `a9c2f97`), with the measurement shown rather than quoted — and are the per-module
+   rows (`panes_grid::` 5 → 7, `pane_canvas::` 0 → 1) still right? Is the move from +2 to +3
+   justified by §4's third test rather than smuggled in?
+2. **B2:** is §1.3's arithmetic right for the stacked case — canvas edge at `S − 4.0 − frameA`, fill
+   reach `S − 3.5 − frameA`, clearances `3.5` / `3.5 + frameA` / `3.5 + frameA + frameB` — and is it
+   right that the marker's own-stroke threshold is met strictly before the neighbour's? Is §4's test
+   3 the right pin, and is the plan honest that it is **green before** the diff?
+3. **B3:** does §9 carry the owner's sentence verbatim, withdraw the "the clamp is the whole fix"
+   mapping, name PR #16 `46c1ce1` as the first lead, and carve the symptom into its own card with the
+   owed inputs? Is there anywhere left in this plan that sells stage 3 as closing the report?
+4. **M1–M4:** is the cursor row now an explicit assumption with its FFI citation and its own
+   threshold (not a fake "no")? Does `padding = 0` open at `font_size ≥ 6`? Does the `font_size 12`
+   row stop calling a visible gutter marker invisible? Is the `NEEDS-OWNER-VERIFY` move stated
+   canvas-local (`−1.2 → 0`)?
+5. **Standing:** §1.1's four rows, §1.2's table, §3's two changes, §4's RED/GREEN expectations, the
+   scope in §7, and the no-clip finding that decides against `with_clip`.
