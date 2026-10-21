@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use ghostwave::keymap::Mode;
-use ghostwave::session::{self as core, PaneState, SessionState, TabState};
+use ghostwave::session::{self as core, PaneState, RemoteKind, SessionState, TabState};
 use iced::widget::pane_grid;
 
 use crate::app::{AppState, GridPane, Result, Tab};
@@ -43,25 +43,25 @@ pub fn names() -> Vec<String> {
     core::list_sessions()
 }
 
-/// The saved sessions that contain a durable remote pane, which the picker marks
-/// with an `ssh` badge.
+/// The saved sessions that hold a remote pane, with the kind of remote it is,
+/// which the picker badges `ds` or `ssh`.
 ///
 /// Read from the session files, as the reference did: the current session is
 /// written every two seconds, so a connection made in this run shows up in the
 /// list without the picker having to know about live panes.
-pub fn remote_names() -> HashSet<String> {
+pub fn remote_kinds() -> HashMap<String, RemoteKind> {
     names()
         .into_iter()
-        .filter(|name| core::has_remote(name))
+        .filter_map(|name| core::remote_kind(&name).map(|kind| (name, kind)))
         .collect()
 }
 
 /// Relists an open picker from disk, keeping its selection on where the user is.
 pub fn refresh_picker(state: &mut AppState) {
     let names = names();
-    let remotes = remote_names();
+    let kinds = remote_kinds();
     if let Some(picker) = state.session_picker.as_mut() {
-        picker.relist(names, remotes);
+        picker.relist(names, kinds);
     }
 }
 
@@ -246,7 +246,7 @@ pub fn rename(state: &mut AppState, new_name: &str) {
 /// inside.
 pub fn open_picker(state: &mut AppState) {
     let current = state.current_session.clone();
-    state.session_picker = Some(SessionsOverlay::new(current, names(), remote_names()));
+    state.session_picker = Some(SessionsOverlay::new(current, names(), remote_kinds()));
 }
 
 /// Applies a picker message: navigation changes only the picker, and the action a
@@ -280,9 +280,9 @@ pub fn picker_message(state: &mut AppState, message: SessionsMessage) {
             if delete(state, &name) {
                 state.toast(format!("deleted session: {name}"));
                 let refreshed = names();
-                let remotes = remote_names();
+                let kinds = remote_kinds();
                 if let Some(picker) = state.session_picker.as_mut() {
-                    picker.relist(refreshed, remotes);
+                    picker.relist(refreshed, kinds);
                 }
             } else {
                 state.toast("cannot delete the current session");
@@ -558,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_pane_comes_back_disconnected_and_its_session_is_badged_ssh() {
+    fn a_remote_pane_comes_back_disconnected_and_its_session_is_badged_durable() {
         let _guard = test_lock();
         let mut s = state();
         let name = unique("remote");
@@ -582,11 +582,14 @@ mod tests {
         };
         core::save(&name, &saved);
 
-        assert!(
-            remote_names().contains(&name),
-            "a session holding a durable pane is badged ssh"
+        assert_eq!(
+            remote_kinds().get(&name),
+            Some(&RemoteKind::Durable),
+            "a session holding a durable pane is badged durable"
         );
-        assert!(names().contains(&name) || remote_names().contains(&name));
+        assert!(
+            names().contains(&name) || remote_kinds().get(&name) == Some(&RemoteKind::Durable)
+        );
 
         let mut opened = state();
         let scratch = unique("scratch");
