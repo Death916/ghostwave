@@ -408,3 +408,214 @@ number wins and the card records the difference.
    progress log — the `wt/osc7501` branch shows the shape).
 9. Commit PLAN.md and the implementation separately (plan commit is already on the branch), report
    branch + commit hashes; **do not push**.
+
+# PLAN — a pane's canvas must not paint over its frame stroke
+
+relay: job=t_b6e8cb0c · stage 1 (PLAN) · card: `t_b6e8cb0c` · branch `wt/t_b6e8cb0c` (based on
+`master` @ `a9c2f97`) · owner report: "pane still overlaps border. the canvas seems to go over the
+border line but you can see a small bit of it on the left" · screenshot `https://ibb.co/VWvPmKyj`
+
+This card arrived from the dashboard with **no body and no plan stage bought**; the previous card in
+this series (`t_2a5f5dab`, PR #16, merged as `46c1ce1`) fixed the *missing* frame line where two
+panes touch. This one is the residual report: the frame line is there, but a pane's **canvas paints
+over it**, leaving a sliver of the line visible at one edge. §9 carries the one scope question a
+reviewer has to settle before stage 3 widens the fix; §5 is the acceptance.
+
+## 0. PREMISE CHECK (measured, not assumed)
+
+* `https://ibb.co/VWvPmKyj` → image `https://i.ibb.co/0jfdtwND/image.png`, HTTP 200, **1492x922**.
+  Decoded with a stdlib PNG reader and measured column-by-column (scripts kept at
+  `~/.hermes/profiles/dev/cache/scratch/{pngtool,peaks,colprof,rgb2}.py`).
+* The image is a **downscaled crop of a screen, not a window capture**: every 1 px feature is a
+  3–4 px luminance ramp (the darkest column run, `x 1443..1491`, is 49 px of flat `(10,8,14)`, and
+  the only full-height bright line, `x 1424..1427`, ramps `(65,61,73) → (130,101,57) → (109,82,51)`).
+  Pixel conclusions from it are good to ±2 px only.
+* **No theme frame colour appears in the image.** Dracula's active stroke `#bd93f9` → 0 px at a ±20
+  tolerance; tokyonight `#7aa2f7` and the other six themes' `frame_active` values likewise produce
+  no coherent run. `theme.frame` (`#44475a` for dracula) matches 13 996 px, but they are glyph
+  antialiasing scattered over the text area (busiest "column" has 125 hits out of 922 rows), not a
+  stroke.
+* The one full-height line at `x≈1424–1427` is **warm brown/orange** — `(130,101,57)` and
+  `(131,110,77)` at y=100/400/700, brighter `(133,113,84)` at y=880 — which is dracula
+  `search_match` `#ffb86c` blended ~50 % with the pane background, not a frame colour. Right of it:
+  `x 1428..1438` a red-brown strip, `x 1440..1441` a grey line `(66,60,55)`, then near-black to the
+  image edge. Left of it: the terminal text area.
+* Nothing in `master` draws a persistent right-hand panel: `src/main.rs:610-650` is a `Column` of
+  tab bar / pane grid / status bar, with floats, toast, the search overlay
+  (`OverlayPosition::TopRight`) and the *centred* sessions modal stacked above. The sessions modal's
+  title is `"SESSIONS — current: …"` in `search_match` (`src/sessions_overlay.rs:243`), centred at a
+  fixed `WIDTH` — so the `SESSI…`-like fragment at the image's right edge cannot be placed in
+  ghostwave from this tree with confidence.
+
+**Verdict: PREMISE UNRESOLVED for the exact element, PREMISE OK for the defect class.** The words
+("the canvas seems to go over the border line") name a real, provable gap in the code (§2), and the
+fix for it is correct whatever the element in the screenshot turns out to be.
+
+## 1. What the code does today (traced, not inferred)
+
+* `src/panes_grid.rs:193-252` `grid()` — each cell's body is `container(Canvas::new(PaneCanvas)).padding(metrics.padding)`;
+  the cell's own `Border { width: frame }` is the stroke (`1.0` px unfocused, `2.0` px focused,
+  `src/pane_canvas.rs:23-25`), painted by `Content` inside the cell's outermost pixels.
+* `src/panes_grid.rs:486-517` `PaneCanvas::draw` — `Frame::new(renderer, bounds.size())`, then
+
+  ```rust
+  let origin_offset = Point::new(bounds.x.round() - bounds.x, bounds.y.round() - bounds.y);
+  let pane_rect = Rectangle::new(origin_offset, bounds.size());
+  ```
+
+  so the painted rect starts at `bounds.x.round()` while keeping **`bounds.size()`**: it can extend up
+  to `0.5` px past the canvas' right/bottom edge (onto the cell's stroke) and start up to `0.5` px
+  inside its left/top edge (leaving the pixel under it untouched — the reported "small bit … on the
+  left").
+* `src/pane_canvas.rs:180-184` `paint_pane` fills exactly that rect with the default background, and
+  `src/pane_canvas.rs:285-295` draws the search-row marker one whole column (`ox - cw`) left of the
+  text area — both outside anything that clips.
+* **iced gives the canvas no clipping of its own**: `iced_widget-0.14.2/src/canvas.rs:298-312` wraps
+  the program in `renderer.with_translation(...)` only and `Canvas::draw` ignores its `_viewport`
+  argument, so the geometry is drawn on the layer with the window's clip. `.clip(true)` on a
+  `container` cannot help either — it only narrows the `viewport` handed to children
+  (`iced_widget-0.14.2/src/container.rs:351-372`), which the canvas throws away.
+* `iced_graphics-0.14.0/src/geometry/frame.rs:141-155` — `Frame::with_clip(region, f)` exists and is
+  the supported way to bound a canvas' geometry.
+* The merged PR #16 test (`panes_grid::tests::framed_panes_carry_their_frame_on_shared_edges`)
+  asserts **layout boxes only** (`pane_grid::State::layout()` → `pane_regions`). It cannot see a
+  painted rect, so a canvas overhang is outside everything it proves.
+
+## 2. Candidates, ranked, with the evidence that discriminates them
+
+| # | Cause | Why it matches the words | Discriminator |
+|---|-------|--------------------------|---------------|
+| C1 | Unclipped canvas + `origin_offset` paint rect (`§1`) | "the canvas goes over the border line"; a ≤0.5 logical px overhang is a whole physical pixel at 2×, i.e. half an unfocused 1 px stroke, and the surviving 0.5 px on the opposite edge is exactly "a small bit of it" | a `pane_rect` that leaves the canvas bounds — decidable headless (§4) |
+| C2 | the terminal keeps one more row/column than fits, so the last one is painted outside | a whole cell of ink/glyph over the stroke | `bounds_to_cols_rows` arithmetic (§4 test) + the existing `GHOST_ICED_DEBUG` dump (`src/pane_canvas.rs:328-337`, prints `rect` per pane) |
+| C3 | the reported line is not a pane frame at all but a chrome/overlay border (tab bar, status bar, search overlay, sessions modal) | "still overlaps border" after a pane fix | only the owner can say which line (§9) |
+
+C1 is a defect in the code whatever C2/C3 turn out to be, and closing it makes a pane's canvas
+incapable of covering *any* border. That is the smallest honest scope for stage 3.
+
+## 3. Decision — design for stage 3
+
+Two changes, both in `src/panes_grid.rs`, no constants touched:
+
+1. **Keep the painted rect inside the canvas.** Extract the inline math into a documented helper
+
+   ```rust
+   /// The rect a pane paints into: the canvas' bounds, snapped to whole pixels
+   /// without growing past them.
+   fn paint_rect(bounds: Rectangle) -> Rectangle
+   ```
+
+   returning `Rectangle { x: fx, y: fy, width: bounds.width - fx, height: bounds.height - fy }` where
+   `fx = bounds.x.round() - bounds.x`, `fy = bounds.y.round() - bounds.y` (i.e. today's offset with
+   the size **reduced** by it, never increased).
+2. **Clip the whole paint to the canvas.** Wrap the `paint_pane` call in
+   `frame.with_clip(Rectangle::new(Point::ORIGIN, bounds.size()), |frame| …)` so a glyph, the cursor
+   block, or the search marker cannot reach the stroke either.
+
+`paint_rect` also fixes the snapping intent: the origin still lands on a whole pixel (the
+"rounded-origin sub-blur" the module was built around), it just stops extending past the edge.
+
+## 4. Tests (assertable without a display)
+
+* New `panes_grid::tests::paint_rect_stays_inside_the_canvas` — table of bounds:
+  integer (`x: 592.0, y: 24.0, 597.0x640.0` → rect == bounds exactly), both-fractional
+  (`x: 592.5, y: 24.25, 597.75x640.5`), and the worst cases `x.999`/`y.999`; assert
+  `rect.x >= b.x`, `rect.y >= b.y`, `rect.x + rect.width <= b.x + b.width`,
+  `rect.y + rect.height <= b.y + b.height`, and `rect.x.fract() == 0.0`, `rect.y.fract() == 0.0`.
+  **RED against today's code**: with `x: 592.5, width: 597.75` the shipped rect ends at `1190.75`
+  while the canvas ends at `1190.25` — 0.5 px over the stroke. The test must be run against the
+  current `draw()` body first (temporary `#[cfg(test)]` copy of the inline math, or run it before the
+  helper exists) and its failure pasted on the card.
+* `bounds_to_cols_rows` (C2 discriminator, already covered by
+  `panes_grid::tests::bounds_to_cols_rows_calculations`): add one case with the *frame* padding
+  (`padding = 6.0` focused / `5.0` unfocused at `cell 8x16`) showing `cols*cell.w + 2*padding <= width`
+  for the widths iced actually hands over (597.0, 597.75, 598.0) — expected: the grid already fits,
+  so C2 is ruled out unless this fails.
+* Everything after PR #16 must stay green: `framed_panes_carry_their_frame_on_shared_edges`,
+  `frameless_panes_touch_with_no_gutter`, `click_to_pane_index_mapping`,
+  `stack_label_string_formatting`, `bounds_to_cols_rows_calculations`.
+
+## 5. Verification (stage 3 runs these and pastes the real output)
+
+Through the build gate, per-card target dir, never a bare `cargo`:
+
+```sh
+CARGO_TARGET_DIR=/var/build/ghostwave/t_b6e8cb0c \
+  bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell --run 'cargo test --locked panes_grid::'
+# expect: 6 passed / 0 failed  (5 existing + paint_rect_stays_inside_the_canvas)
+
+CARGO_TARGET_DIR=/var/build/ghostwave/t_b6e8cb0c \
+  bash ~/.hermes/scripts/build_gate.sh nix-shell --run 'cargo test --locked'
+# expect: 219 passed / 0 failed / 0 ignored (218 today + the new test)
+
+CARGO_TARGET_DIR=/var/build/ghostwave/t_b6e8cb0c \
+  bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell --run 'cargo clippy --locked --all-targets'
+# expect: rc 0, no new warnings (the pre-existing unnecessary_cast in this file stays)
+```
+
+Gate exit 3 = another build holds the lock → comment and block the card `transient`; exit 4 = not
+enough RAM → retry. Never compile around the gate.
+
+**Not verifiable here, by construction:** orac is headless (`nixos` aarch64, no display, no
+GPU/EGL surface), so the *visual* result cannot be produced on this box. Stage 3 must state that on
+the card as `NEEDS-OWNER-VERIFY: run wt/t_b6e8cb0c with frames on and two panes side by side; the
+frame line must be unbroken on all four edges of both panes` — and must not claim the pixels moved.
+
+## 6. Risks / traps
+
+* **0.5 px is small; the owner may be reporting something bigger.** If the owner's answer to §10 says
+  the covered line is a chrome or overlay border, C1 alone will not close the card — file the
+  discriminated element as its own card rather than widening this diff.
+* **`with_clip` inside a `Frame` drafts and pastes a sub-frame** (`frame.rs:141-155`). The clip region
+  is in frame-local coordinates, so `Rectangle::new(Point::ORIGIN, bounds.size())` is right — an
+  absolute `bounds` would clip everything away.
+* **Do not "fix" this by widening `PANE_INSET`.** The gap already exists (4 px + stroke) and PR #16's
+  shared-edge invariant (`panes_grid::tests::framed_panes_carry_their_frame_on_shared_edges`) would
+  have to move with it.
+* The `origin_offset` snapping exists for a reason (fractional layout origins blur glyphs); deleting
+  it would trade a 1 px border defect for blurry text everywhere. Keep the snap, bound the rect.
+
+## 7. NOT doing (explicit)
+
+* No change to `SPACING`, `PANE_GAP`, `PANE_INSET`, `TITLE_H`, the stroke widths or any theme colour.
+* No redesign of the grid, the title band, the frames-off path, floats, or the overlay stack.
+* No patch or vendoring of iced; `Cargo.lock` untouched.
+* No change to `src/pane_canvas.rs`'s painting *content* (cells, cursor, marker positions) — only its
+  containment.
+* No merge, no push to `master`; the PR is stage 3's, and `death916/ghostwave` is public so the merge
+  is the owner's.
+
+## 8. Ordered work items for stage 3
+
+1. In `/home/death916/code/ghostwave/.worktrees/t_b6e8cb0c` (branch `wt/t_b6e8cb0c`, already merged
+   up to `master` @ `a9c2f97`), confirm `git status` is clean and `git log -1` is the plan commit.
+2. Paste the RED evidence: copy the current inline math into a `#[cfg(test)]` case, run
+   `panes_grid::` through the gate, record the failure, then delete the copy.
+3. Add `fn paint_rect(bounds: Rectangle) -> Rectangle` with a doc comment (contract: same origin snap,
+   never larger than `bounds`); use it in `draw()`.
+4. Wrap the `paint_pane` call in `frame.with_clip(Rectangle::new(Point::ORIGIN, bounds.size()), …)`.
+5. Add `paint_rect_stays_inside_the_canvas` and the frame-padding `bounds_to_cols_rows` case (§4).
+6. Run §5's three commands; paste `N passed / M failed`, clippy rc, `rustfmt --check` on the touched
+   file (this file has pre-existing import-order hunks — say so, do not "fix" them).
+7. `PROGRESS.md`: one entry, dated, in the repo's running-log style (this repo keeps one).
+8. One commit for the behaviour (`fix(panes): keep a pane's canvas inside its frame`), push the
+   branch through `~/.hermes/scripts/fleet_push.sh dev "$PWD" origin wt/t_b6e8cb0c`, open the PR
+   against `master` and read it back (state, head sha, base, mergeable).
+9. Mark the card `NEEDS-OWNER-VERIFY` in the summary (headless box, §5) and hand stage 4 to `review`.
+
+## 9. SCOPE QUESTION (for stage 2 / hermz — do not guess past it)
+
+The card has no body. Stage 3's fix is safe and correct for the "canvas over its own frame stroke"
+class, but before it grows, one answer is needed:
+
+> Which border in `https://ibb.co/VWvPmKyj` is the one being covered — a **pane frame** (the 1–2 px
+> stroke inside the pane's own edge, i.e. between two panes or around a single pane), the **tab bar's
+> or status bar's** border, or the **search / sessions overlay** edge — and is the window a **2-pane
+> side-by-side split** at the time? A full-resolution (unscaled) screenshot of just the ghostwave
+> window would settle it in one look; the supplied image is resampled to 1492x922 and carries no
+> theme frame colour at all (§0), so it cannot be measured to the pixel.
+
+If the answer is "a pane frame", stage 3 as written is the whole fix. If it is chrome or an overlay,
+this plan's C1 is still worth landing (defence in depth) and the real element becomes its own card.
+
