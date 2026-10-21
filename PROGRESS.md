@@ -1381,3 +1381,17 @@ What was actually missing, and is now built, is the real xterm font *query*. A p
 - **Not exercised by hand**: the end-to-end check needs the GUI — in a ghostwave pane,
   `printf '\033]50;?\033\\'; timeout 1 cat -v` should print `^[]50;JetBrains Mono^[\` (or the
   configured family). That is `NEEDS-VULCAN:`, not a stage-3 acceptance.
+
+### Branch hygiene: bring a branch forward onto `master` *before* review is requested (card `t_750774cc`)
+
+The two PRs that produced this rule are PR #16 (`wt/t_2a5f5dab`, frames on shared pane edges) and
+PR #17 (`wt/t_c989ef4e`, the OSC 50 font-family sanitise above): #16 was merged as `46c1ce1`, then
+PR #15 as `c8b7404`, and by then PR #17 no longer merged — it was closed without merge at
+2026-10-20 23:57 with `mergeable: false`, its whole fix stranded off `master`. The conflicts were
+mechanical (`PLAN.md` add/add, `PROGRESS.md` both-sides-added; `src/term.rs` auto-merged), i.e. they
+were purely drift, and drift is fixable at any time — *before* a human spends a review, not instead of
+one. So, from card `t_750774cc` on: **a branch is brought forward onto the current `origin/master`
+and its `mergeable` flag is checked (`GET /api/v1/repos/death916/ghostwave/pulls/<n>`) before a
+review is requested**; if `master` moves while a PR is open, the branch comes forward again before
+the next card touches it. Rebase or merge is the author's choice — the rule is only that it happens
+and that the resulting tree was verified, never that the reviewer should discover the conflict.
