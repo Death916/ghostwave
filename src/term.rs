@@ -18,6 +18,7 @@ use libghostty_vt::{
     kitty::graphics::{self},
     mouse,
     render::{CellIterator, RenderState, RowIterator},
+    screen::Screen,
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     terminal::{
         ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
@@ -58,13 +59,93 @@ pub struct CellDims {
     pub baseline: f32,
 }
 
+/// Session-name prefix of a remote ghostd session: `ghostwave-<host token>`.
+pub const REMOTE_SESSION_PREFIX: &str = "ghostwave-";
+
+/// Longest ssh destination accepted, so a session file cannot feed an unbounded
+/// token into a command line.
+pub const HOST_MAX_LEN: usize = 255;
+
+/// Whether `host` is a usable ssh destination.
+///
+/// The accepted characters are exactly what the supported forms need — an alias,
+/// `user@host`, `host:port`, `[v6]:port`, `user@[v6]:port` and
+/// `ssh://user@host:port` — so a destination can be handed to `ssh` as an argv
+/// element and would still be plain data if it ever reached a shell. Whitespace,
+/// control characters, quotes and shell metacharacters are all refused at this
+/// boundary; the port (`%` for a zone id) is the only punctuation beyond the URI
+/// set.
+pub fn host_is_valid(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= HOST_MAX_LEN
+        && host.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '-' | '_' | '@' | ':' | '/' | '[' | ']' | '%')
+        })
+}
+
+/// The host as a filesystem-safe token, for session names.
+pub fn sanitize_host(host: &str) -> String {
+    host.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect()
+}
+
+/// The ghostd session a durable pane binds to on `host`: `ghostwave-<host>`.
+///
+/// This is the only source of a session name — a name stored in a session file
+/// is rederived from its host ([`RemoteSpec::rederived`]) rather than trusted.
+pub fn remote_session(host: &str) -> String {
+    format!("{REMOTE_SESSION_PREFIX}{}", sanitize_host(host))
+}
+
 /// A durable remote session binding (ghostd). Saved with the session so
 /// restore can re-show the pane in a disconnected state.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+///
+/// `session` is derived data: it is serialized for readability and backwards
+/// compatibility, but deserialization rederives it from `host`, so a crafted
+/// session file cannot choose the name that later reaches a remote command line
+/// or a `pkill` pattern.
+#[derive(Serialize, Clone, Debug)]
 pub struct RemoteSpec {
     pub host: String,
-    /// Session name on the remote host.
+    /// Session name on the remote host; always [`remote_session`] of `host`.
     pub session: String,
+}
+
+impl RemoteSpec {
+    /// The binding for `host`, with the session name derived from it.
+    pub fn for_host(host: &str) -> Self {
+        Self {
+            host: host.to_string(),
+            session: remote_session(host),
+        }
+    }
+
+    /// This binding with the session name rederived from its host.
+    ///
+    /// Used wherever a binding comes from outside the process — a session file,
+    /// a hand-edited config — so nothing downstream has to trust a stored name.
+    pub fn rederived(&self) -> Self {
+        Self::for_host(&self.host)
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored {
+            host: String,
+            /// Accepted from the file format, then ignored: the name is derived.
+            #[serde(default)]
+            #[allow(dead_code)]
+            session: String,
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        Ok(RemoteSpec::for_host(&stored.host))
+    }
 }
 
 /// Reconnect state machine for remote (ssh/ghostd) panes.
@@ -717,6 +798,19 @@ impl TermPane {
         self.force_repaint = true;
     }
 
+    /// Whether the pane is showing the primary screen, the one the scrollback
+    /// belongs to.
+    ///
+    /// Full-screen programs (`less`, `vim`, `htop`) switch to the alternate
+    /// screen while they run; the alternate screen keeps no history, so this is
+    /// also the answer to "does the pane have scrollback to scroll right now".
+    /// A failed read reports `false`: callers that take a key away from the
+    /// program use this, and a program that owns the key is safer than one that
+    /// silently loses it.
+    pub fn on_primary_screen(&self) -> bool {
+        matches!(self.term.active_screen(), Ok(Screen::Primary))
+    }
+
     pub fn clear_terminal(&mut self) -> Result<()> {
         self.term.reset();
         self.force_repaint = true;
@@ -1245,6 +1339,71 @@ mod tests {
             "font query should be answered with the configured family"
         );
         assert_eq!(pane.font_family, family, "pane captured the active family");
+    }
+
+    #[test]
+    fn page_keys_encode_to_the_bytes_a_program_reads() {
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
+        let mut pane = TermPane::new(
+            80,
+            24,
+            cell,
+            None,
+            &[],
+            None,
+            1000,
+            1024 * 1024,
+            false,
+            None,
+        )
+        .unwrap();
+
+        pane.handle_key(
+            Key::PageUp,
+            Mods::empty(),
+            Mods::empty(),
+            '\0',
+            None,
+            key::Action::Press,
+        )
+        .unwrap();
+        assert_eq!(pane.response, b"\x1b[5~", "PageUp reaches the program as CSI 5 ~");
+
+        pane.response.clear();
+        pane.handle_key(
+            Key::PageDown,
+            Mods::empty(),
+            Mods::empty(),
+            '\0',
+            None,
+            key::Action::Press,
+        )
+        .unwrap();
+        assert_eq!(pane.response, b"\x1b[6~", "PageDown reaches the program as CSI 6 ~");
+    }
+
+    #[test]
+    fn on_primary_screen_follows_the_alternate_screen_flag() {
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
+        let mut pane = TermPane::new(
+            80,
+            24,
+            cell,
+            None,
+            &[],
+            None,
+            1000,
+            1024 * 1024,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(pane.on_primary_screen(), "a fresh terminal is on its primary screen");
+        pane.term.vt_write(b"\x1b[?1049h");
+        assert!(!pane.on_primary_screen(), "1049h switches a program to the alternate screen");
+        pane.term.vt_write(b"\x1b[?1049l");
+        assert!(pane.on_primary_screen(), "1049l returns it to the primary screen");
     }
 
     #[test]
