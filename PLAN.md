@@ -143,20 +143,22 @@ affordance is not this card.
 
 1. `src/session.rs` — add `RemoteKind`, `remote_kind`, `all_remote_specs`, `has_remote` on top of `remote_kind`.
    `all_remote_specs` is a thin fan-out over the **existing** `session::remote_specs(name)` (`src/session.rs:157`,
-   today per-session, used by the manager's kill path) over `list()` — reuse it rather than re-walking the JSON.
+   today per-session, used by the manager's kill path) over `list_sessions()` (`src/session.rs:113`, already the
+   enumerator behind `core::list_sessions()` at `src/ui_session.rs:43`) — reuse it rather than re-walking the JSON.
    Tests (in the existing `mod tests`, which runs against the real data dir with unique names + cleanup —
    see §6 Risks): `a_durable_pane_makes_the_session_durable`, `a_plain_ssh_pane_is_ssh_and_not_durable`,
    `neither_pane_kind_is_neither` (`remote_kind` → `None`), `all_remote_specs_lists_a_durable_binding`
    (assert `contains`, never list equality — the real dir may hold the owner's sessions).
-2. `src/ui_session.rs` — `remote_kinds()`, and the three call sites (`open_picker` :62, `refresh_picker`
+2. `src/ui_session.rs` — `remote_kinds()`, and the three call sites (`refresh_picker` :62, `open_picker`
    :249, the delete branch of `picker_message` :283). Rename/retarget the test
    `a_remote_pane_comes_back_disconnected_and_its_session_is_badged_ssh` (:561) → `…_is_badged_durable`, and in
    the same test retarget **both** `remote_names()` assertions — :586 `remote_names().contains(&name)` and :589
    `names().contains(&name) || remote_names().contains(&name)` — onto `remote_kinds()`
    (`remote_kinds().get(&name) == Some(&RemoteKind::Durable)`, and the :589 fallback likewise).
 3. `src/sessions_overlay.rs` — `kinds: HashMap<String, RemoteKind>`, `is_durable`, `kind`, badges, header.
-   The third argument of `new`/`relist` is passed in **five** places and every one of them changes (`remotes:
-   HashSet<String>` → `kinds: HashMap<String, RemoteKind>`), plus the four `is_remote` assertions:
+   The third argument of `new`/`relist` is constructed at **four** sites in this file and every one of them changes
+   (`remotes: HashSet<String>` → `kinds: HashMap<String, RemoteKind>`); the tree's other three third-arg sites are
+   the production calls in `src/ui_session.rs` (:64, :249, :285 — §4.2). Plus the four `is_remote` assertions:
 
    | site | line | edit |
    |---|---|---|
@@ -202,7 +204,7 @@ bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --a
 - **The real edit set, so stage 3 knows what must move** (no test is deleted; every edit below is either a
   signature ripple or an assertion retarget, and any *other* test that needs touching is a plan defect — report
   it, do not silently widen the diff):
-  - `src/sessions_overlay.rs`: the third argument of `new`/`relist` is constructed at **five** sites
+  - `src/sessions_overlay.rs`: the third argument of `new`/`relist` is constructed at **four** sites
     (`picker()` :331-338, `an_unknown_current_session_is_added_to_the_list` :362 — both mechanical
     `HashSet::new()` → `HashMap::new()`; `…_is_badged_ds` :351-355, `a_relist_…` :440-443 — value changes), and
     the four `is_remote` assertions (:346, :356, :357, :446) become `is_durable`;
