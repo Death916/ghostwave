@@ -138,6 +138,16 @@ fn remote_status(pane: &Pane) -> Option<String> {
     }
 }
 
+/// The x a search row's gutter marker is drawn at: one cell left of the text
+/// origin, but never outside the canvas.
+///
+/// The gutter is only `padding` wide, so a cell wider than the gutter would
+/// otherwise put the marker's ink past the canvas edge and onto the pane's own
+/// frame stroke. Clamping keeps the marker visible and the stroke intact.
+fn marker_x(padding: f32, cell_w: f32) -> f32 {
+    (padding - cell_w).max(0.0)
+}
+
 /// Paints one pane's terminal content into `rect`, in frame-local coordinates.
 pub(crate) fn paint_pane(
     frame: &mut Frame,
@@ -286,7 +296,7 @@ pub(crate) fn paint_pane(
             draw_glyph(
                 frame,
                 MARKER_GLYPH,
-                ox - cw,
+                rect.x + marker_x(padding, cw),
                 y + cell.baseline,
                 match_band,
                 font_px,
@@ -425,4 +435,55 @@ fn strip_ignorables(s: &mut String) {
             '\u{FE00}'..='\u{FE0F}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'
         )
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The marker's ink stays on the canvas, whatever the font makes a cell.
+    ///
+    /// It is drawn one cell left of the text origin and the gutter is only
+    /// `padding` wide, so from `cell_w > padding` on that position is outside
+    /// the canvas; from `cell_w > padding + inset` (font_size >= 17 at the
+    /// defaults) the ink reaches the pane's frame stroke. The x is canvas-local,
+    /// so `0.0` is the canvas edge.
+    #[test]
+    fn search_marker_stays_inside_the_canvas() {
+        // (padding, cell_w) -> where the ink starts, canvas-local.
+        let cases: [(f32, f32, f32); 5] = [
+            (6.0, 7.2, 0.0),
+            (6.0, 9.6, 0.0),
+            (6.0, 10.8, 0.0),
+            (6.0, 20.0, 0.0),
+            (12.0, 7.2, 4.8),
+        ];
+        for (padding, cell_w, want) in cases {
+            let x = marker_x(padding, cell_w);
+            assert!(
+                (x - want).abs() < 1e-4,
+                "marker_x({padding}, {cell_w}) = {x}, want {want}"
+            );
+            assert!(
+                x >= 0.0,
+                "marker_x({padding}, {cell_w}) = {x}, left of the canvas edge"
+            );
+        }
+
+        // No font at the default padding puts the ink past the canvas either.
+        let mut cell_w = 1.0;
+        while cell_w <= 32.0 {
+            let x = marker_x(6.0, cell_w);
+            assert!(
+                x >= 0.0,
+                "marker_x(6.0, {cell_w}) = {x}, left of the canvas edge"
+            );
+            assert!(
+                x + cell_w / 8.0 <= 6.0 + cell_w,
+                "marker ink at cell_w {cell_w} runs past the canvas: {x} + {}",
+                cell_w / 8.0
+            );
+            cell_w += 0.125;
+        }
+    }
 }

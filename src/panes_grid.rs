@@ -146,6 +146,25 @@ pub fn cell_metrics(frames: bool, focused: bool) -> CellMetrics {
     }
 }
 
+/// The rect a pane paints into: the canvas' bounds snapped to whole pixels,
+/// without growing past them.
+///
+/// iced hands the canvas fractional bounds and the painter draws in the canvas'
+/// own coordinates, so the origin moves to the nearest pixel and the size gives
+/// back whatever it moved. The fill covers the same pixels as before, but its
+/// far edge can no longer sit up to half a pixel past the canvas edge — which is
+/// the canvas' `theme.bg` band in front of the pane's frame stroke.
+fn paint_rect(bounds: Rectangle) -> Rectangle {
+    let fx = bounds.x.round() - bounds.x;
+    let fy = bounds.y.round() - bounds.y;
+    Rectangle {
+        x: fx,
+        y: fy,
+        width: bounds.width - fx,
+        height: bounds.height - fy,
+    }
+}
+
 /// The grid axis a split direction splits along. `SplitDir::Horizontal` is
 /// side-by-side, which is iced's vertical axis: the two enums are crossed.
 pub fn axis(dir: SplitDir) -> Axis {
@@ -499,8 +518,7 @@ impl canvas::Program<Message> for PaneCanvas {
             bounds_to_cols_rows(bounds.width, bounds.height, self.cell, self.padding);
         guard.resize(cols, rows, self.cell);
 
-        let origin_offset = Point::new(bounds.x.round() - bounds.x, bounds.y.round() - bounds.y);
-        let pane_rect = Rectangle::new(origin_offset, bounds.size());
+        let pane_rect = paint_rect(bounds);
 
         pane_canvas::paint_pane(
             &mut frame,
@@ -918,5 +936,177 @@ mod tests {
         );
         assert_eq!(body_a.y, body_b.y);
         assert_eq!(body_a.height, body_b.height);
+    }
+
+    /// The painted half of the shared edge: what a pane's fill can reach has to
+    /// stay clear of both strokes on the edge two cells share.
+    ///
+    /// The boundary comes from the engine's own layout ([`regions`]), not from
+    /// this module's arithmetic, so this fails the day [`SPACING`] stops being
+    /// zero, a cell is handed out short or overlapping, or [`cell_metrics`]
+    /// stops adding the frame to the inset — the changes that would let a fill
+    /// reach a stroke. The reach is the canvas' own edge plus the worst-case
+    /// overhang of the paint rect, whose origin may sit half a pixel out.
+    #[test]
+    fn painted_fill_cannot_reach_a_shared_edge() {
+        // Stacked: `a` above `b`, both focus combinations.
+        let (mut grid, root) = pane_grid::State::new(GridPane::single(PaneId(1)));
+        let (bottom, _split) = grid
+            .split(axis(SplitDir::Vertical), root, GridPane::single(PaneId(2)))
+            .expect("split succeeds");
+        let cells = regions(&grid);
+        let (a, b) = (cells[&root], cells[&bottom]);
+        assert!(
+            (b.y - (a.y + a.height)).abs() <= 0.01,
+            "the stacked cells must touch on the shared edge: {a:?} | {b:?}",
+        );
+        for focused_a in [true, false] {
+            let m_a = cell_metrics(true, focused_a);
+            let boundary = b.y;
+            let fill_reach = a.y + a.height - m_a.padding + 0.5;
+            assert!(
+                fill_reach <= a.y + a.height - m_a.frame - 3.5 + 0.01,
+                "the fill reaches this pane's own stroke: reach {fill_reach}, \
+                 stroke starts at {}",
+                a.y + a.height - m_a.frame,
+            );
+            assert!(
+                fill_reach <= boundary - (3.5 + m_a.frame) + 0.01,
+                "the fill reaches the neighbour's stroke: reach {fill_reach}, \
+                 boundary {boundary}",
+            );
+        }
+
+        // Side by side: `a` left of `b`, both focus combinations.
+        let (mut grid, root) = pane_grid::State::new(GridPane::single(PaneId(1)));
+        let (right, _split) = grid
+            .split(
+                axis(SplitDir::Horizontal),
+                root,
+                GridPane::single(PaneId(2)),
+            )
+            .expect("split succeeds");
+        let cells = regions(&grid);
+        let (a, b) = (cells[&root], cells[&right]);
+        assert!(
+            (b.x - (a.x + a.width)).abs() <= 0.01,
+            "the side-by-side cells must touch on the shared edge: {a:?} | {b:?}",
+        );
+        for focused_a in [true, false] {
+            let m_a = cell_metrics(true, focused_a);
+            let boundary = b.x;
+            let fill_reach = a.x + a.width - m_a.padding + 0.5;
+            assert!(
+                fill_reach <= a.x + a.width - m_a.frame - 3.5 + 0.01,
+                "the fill reaches this pane's own stroke: reach {fill_reach}, \
+                 stroke starts at {}",
+                a.x + a.width - m_a.frame,
+            );
+            assert!(
+                fill_reach <= boundary - (3.5 + m_a.frame) + 0.01,
+                "the fill reaches the neighbour's stroke: reach {fill_reach}, \
+                 boundary {boundary}",
+            );
+        }
+    }
+
+    /// The painted rect never grows past its canvas, on any layout phase.
+    ///
+    /// [`paint_rect`] answers in the canvas' own coordinates, so its result is
+    /// put back into window coordinates here before it is compared with the
+    /// bounds — the space the canvas' edge and the pane's frame stroke live in.
+    /// Snapping the origin to the nearest pixel can move it up to half a pixel
+    /// *before* the bounds' origin; what must never happen is the far edge
+    /// passing the canvas' far edge, which is what used to let the fill reach
+    /// the stroke's side of the canvas.
+    #[test]
+    fn paint_rect_stays_inside_the_canvas() {
+        let cases: [(&str, Rectangle); 4] = [
+            (
+                "integer",
+                Rectangle {
+                    x: 592.0,
+                    y: 24.0,
+                    width: 597.0,
+                    height: 640.0,
+                },
+            ),
+            (
+                "both fractional",
+                Rectangle {
+                    x: 592.5,
+                    y: 24.25,
+                    width: 597.75,
+                    height: 640.5,
+                },
+            ),
+            (
+                "y rounds up",
+                Rectangle {
+                    x: 592.25,
+                    y: 24.75,
+                    width: 597.75,
+                    height: 640.5,
+                },
+            ),
+            (
+                "worst phase",
+                Rectangle {
+                    x: 592.999,
+                    y: 24.999,
+                    width: 597.75,
+                    height: 640.5,
+                },
+            ),
+        ];
+
+        for (name, b) in cases {
+            let local = paint_rect(b);
+            let rect = Rectangle {
+                x: b.x + local.x,
+                y: b.y + local.y,
+                width: local.width,
+                height: local.height,
+            };
+            assert_eq!(
+                rect.x.fract(),
+                0.0,
+                "{name}: x is not on a pixel: {}",
+                rect.x
+            );
+            assert_eq!(
+                rect.y.fract(),
+                0.0,
+                "{name}: y is not on a pixel: {}",
+                rect.y
+            );
+            assert!(
+                (rect.x - b.x).abs() <= 0.5 && (rect.y - b.y).abs() <= 0.5,
+                "{name}: the origin moved more than half a pixel: {rect:?} vs {b:?}",
+            );
+            assert!(
+                rect.x + rect.width <= b.x + b.width + 1e-3,
+                "{name}: the rect ends at {} past the canvas edge {}: {rect:?}",
+                rect.x + rect.width,
+                b.x + b.width,
+            );
+            assert!(
+                rect.y + rect.height <= b.y + b.height + 1e-3,
+                "{name}: the rect ends at {} past the canvas edge {}: {rect:?}",
+                rect.y + rect.height,
+                b.y + b.height,
+            );
+        }
+
+        // Whole-pixel bounds map to themselves.
+        let b = cases[0].1;
+        let local = paint_rect(b);
+        let rect = Rectangle {
+            x: b.x + local.x,
+            y: b.y + local.y,
+            width: local.width,
+            height: local.height,
+        };
+        assert_eq!(rect, b, "integer bounds must map to themselves");
     }
 }

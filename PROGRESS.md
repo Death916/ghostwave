@@ -1395,3 +1395,51 @@ and its `mergeable` flag is checked (`GET /api/v1/repos/death916/ghostwave/pulls
 review is requested**; if `master` moves while a PR is open, the branch comes forward again before
 the next card touches it. Rebase or merge is the author's choice — the rule is only that it happens
 and that the resulting tree was verified, never that the reviewer should discover the conflict.
+
+### A pane's canvas stays inside its frame stroke — the marker clamp, and a paint rect that cannot grow (card `t_7af5cd5a`, 2026-10-21)
+
+The search row's gutter marker is drawn one cell left of the text origin, and the gutter is only
+`padding` wide, so a cell wider than the gutter put the marker's ink outside the canvas — and from
+`font_size ≥ 17` at the defaults (`cw > padding + 4.0 + rect.x`) onto the pane's own frame stroke,
+from `font_size ≥ 18` into the neighbour's gutter. `marker_x(padding, cell_w) = (padding - cell_w)
+.max(0.0)` (`src/pane_canvas.rs`) clamps it to the canvas edge; while `cell_w ≤ padding` (font_size
+≤ 10 at the defaults) the marker does not move at all.
+
+The paint rect (`src/panes_grid.rs`) now gives back whatever it moved when it snaps the canvas'
+fractional origin to the nearest pixel (`paint_rect`), so its far edge can no longer sit up to half
+a pixel past the canvas. That is a **hygiene** change, not a visible one: the canvas' edge is
+`inset = 4.0 px` outside the body (`PANE_INSET 2.0 + PANE_GAP/2`), the stroke is a further `frame`
+out, and the fill is the same `theme.bg` as that band — 0 visible px on every edge, measured before
+the change and unchanged by it. At the shared edge of two touching cells the fill's worst reach is
+`S − 3.5 − frameA`, i.e. **3.5 px clear of the pane's own stroke band and 3.5 + frameA px clear of
+the neighbour's**, so nothing this card paints is at a stroke there either.
+
+`Frame::with_clip` was **rejected**: iced hands the canvas no clip, and the marker's ink at the
+defaults (`canvas-local −1.2 … −0.3`) is entirely outside the canvas bounds by design, so a clip
+over the canvas would have deleted the search marker on every pane and traded a regression for
+nothing.
+
+- **Owner's shared-edge report is NOT this diff.** The covered stroke is on the shared edge of a
+  stacked split, where nothing here paints; that symptom has its own card and its first lead is
+  **PR #16 (`46c1ce1`)**. Recorded so the next card starts from the measured edge, not from this
+  commit's title.
+- **Tests** (all three without a display): `pane_canvas::tests::search_marker_stays_inside_the_canvas`
+  and `panes_grid::tests::paint_rect_stays_inside_the_canvas` were **RED first** — the old
+  expressions evaluated in place gave four negative marker rows (`−1.2 / −3.6 / −4.8 / −14.0`) and a
+  paint rect ending at `1190.75` on a canvas ending at `1190.25`. `panes_grid::tests::
+  painted_fill_cannot_reach_a_shared_edge` is the third: **green before the change** by design, a
+  guard that takes its boundary from `pane_grid`'s own `regions()` layout rather than from this
+  module's arithmetic.
+- **Suite**: base measured on `a9c2f97` through the gate — **259 passed / 0 failed / 0 ignored**
+  (72 lib + 180 bin + 1 + 6), matching the plan's enumeration; after the change **262**, i.e. base
+  + 3. `cargo clippy --all-targets` rc 0; the two warnings in the touched files
+  (`paint_pane`'s argument count, `self.cell.h as f32`) are pre-existing and left alone.
+- **One PLAN.md §4 assertion did not hold and was not copied.** §3's `paint_rect` snaps the origin
+  to the *nearest* pixel, so the origin may move up to half a pixel *before* `bounds.x/y` (the
+  plan's own `y: 24.25` row rounds to `24.0`); the test asserts pixel alignment, a ≤ 0.5 px origin
+  move and the far edges staying inside, instead of the plan's `rect.x >= bounds.x`, which that
+  helper cannot satisfy. The RED evidence the plan predicted is unchanged.
+- **Not exercised by hand**: the visual result needs the GUI (orac is headless). `NEEDS-OWNER-VERIFY`:
+  at `font_size 12` / `padding 6` the only intended visible change is the search marker moving
+  1.2 px right (canvas-local `−1.2 → 0`); at `font_size ≥ 17` its orange gutter marker must stop at
+  the pane's edge instead of sitting on the stroke.
