@@ -290,6 +290,19 @@ fn visualizer_key(pane: &mut crate::visualizer::VisualizerPane, kp: &KeyPress) -
     }
 }
 
+/// The durable targets the command palette lists: the live panes' bindings plus
+/// every saved session's, one per host, in host order.
+///
+/// Action path only — `AppState::live_remote_specs` takes the pane mutexes, so
+/// this must never run from a render path.
+fn durable_targets(state: &AppState) -> Vec<(String, String)> {
+    let mut specs = AppState::live_remote_specs(&state.tabs);
+    specs.extend(ghostwave::session::all_remote_specs());
+    let mut targets = crate::remote::dedupe_hosts(specs);
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    targets
+}
+
 /// Arms whose feature is not implemented yet raise a toast instead of acting.
 ///
 /// Shared with the overlay key path in [`crate::main`], so an action reached from
@@ -456,8 +469,9 @@ pub(crate) fn execute(state: &mut AppState, action: Action) {
             });
         }
         Action::OpenCommandBar => {
-            state.palette = Some(crate::palette::PaletteState::new(
+            state.palette = Some(crate::palette::PaletteState::with_durables(
                 crate::palette::default_items(&ghostwave::theme::names()),
+                durable_targets(state),
             ));
         }
         Action::Ghostwave => new_content(state, ContentPane::visualizer()),
@@ -2196,7 +2210,7 @@ mod tests {
         execute(&mut s, Action::ConnectDurableSsh(TEST_HOST.to_string()));
 
         assert_eq!(s.current_session, format!("ssh-{TEST_HOST}"));
-        assert_eq!(s.current().name, format!("ssh {TEST_HOST}"));
+        assert_eq!(s.current().name, format!("ds {TEST_HOST}"));
         assert_eq!(
             s.remote_spec_of(0, 0),
             Some((
@@ -2216,8 +2230,28 @@ mod tests {
         execute(&mut s, Action::ConnectSsh(TEST_HOST.to_string()));
 
         assert_eq!(s.current_session, format!("ssh-{TEST_HOST}"));
+        assert_eq!(s.current().name, format!("ssh {TEST_HOST}"));
         assert_eq!(s.remote_spec_of(0, 0), None, "a plain ssh pane is not durable");
         assert_eq!(toast(&s), format!("connecting to {TEST_HOST}"));
+    }
+
+    #[test]
+    fn the_palette_lists_the_durable_sessions_it_was_given() {
+        let _guard = crate::ui_session::test_lock();
+        let mut s = state();
+
+        execute(&mut s, Action::ConnectDurableSsh(TEST_HOST.to_string()));
+        execute(&mut s, Action::OpenCommandBar);
+
+        let palette = s.palette.as_mut().expect("the palette is open");
+        palette.set_query("durable");
+        let out = palette.filtered_items();
+        assert!(
+            out.iter()
+                .any(|item| item.action == Action::ConnectDurableSsh(TEST_HOST.to_string())),
+            "the live durable pane is offered back, got {:?}",
+            out.iter().map(|item| item.title.as_str()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
