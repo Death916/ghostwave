@@ -17,7 +17,8 @@ Repo: ghostwave (iced front-end + core lib). Base commit: `1a08166`.
 This settles the one thing the plan had left open and narrows the job to discoverability:
 
 - `ds <host>` already produces a durable session — its behaviour is **not** changed by this plan (§3 D3 keeps the
-  `ds ` item byte-identical; §4.4 requires the existing `dynamic_ds_prefix` test to pass unmodified).
+  `ds ` item's *title and action* byte-identical; only its category becomes `Remote — durable`, and §4.4 requires
+  the existing `dynamic_ds_prefix` test to pass unmodified — it asserts titles only).
 - The failure was that nothing in the palette or the session list made the difference *visible*: `ssh orac` and
   `ds orac` looked the same, and a durable session was badged `ssh`. So the work is labels + the durable
   inventory, which is what §3 D3/D5/D6 do.
@@ -29,10 +30,10 @@ This settles the one thing the plan had left open and narrows the job to discove
 Two independent defects, one per numbered want.
 
 **(a) The palette cannot show that a durable session already exists, and cannot show that `ssh` is not durable.**
-`ssh <host>` (`src/app.rs:1055` `connect_ssh`) spawns a plain `ssh` pty with `remote: None`; the remote shell
+`ssh <host>` (`src/app.rs:1061` `connect_ssh`) spawns a plain `ssh` pty with `remote: None`; the remote shell
 dies with the connection. Durable is a *different* command, `ds <host>` (`src/app.rs:1087`
 `connect_durable_ssh`), which runs `ssh -t <host> … ghostd attach ghostwave-<host>` and binds the pane to a
-`RemoteSpec`. The palette (`src/palette.rs:86-121`) knows both prefixes, but:
+`RemoteSpec`. The palette (`src/palette.rs:80` `filtered_items`) knows both prefixes, but:
 
 - `ds <host>` only ever builds **one** item for the literal text typed — the already-known durable sessions are
   never listed, so there is nothing to "show when typing durable";
@@ -61,6 +62,10 @@ NOT done (each is a real gap, called out so review does not read silence as cove
 - no auto-connect on restore — `remote.rs`'s invariant ("a remote pane is never auto-connected on restore") holds;
 - no change to `PaneState` / `RemoteSpec` / session JSON: files stay readable by older builds;
 - no status-bar / tab-bar badge work beyond D6's tab title; no hover tooltips, no new modal;
+- no change to the pane label band: `src/pane_canvas.rs:124-140` (`remote_status`) renders
+  `ssh <host> — reconnecting (attempt N) — Esc to stop` and `ssh <host> — disconnected (Enter connect | k kill)`
+  for a durable pane, so a durable session is spelled `ssh` there too — the same misleading label D5/D6 fix in
+  the picker and the tab, in a second render site. Not fixed by this plan: out of the sanctioned file set;
 - the README "Not in this build" section is already stale (remote/SSH is ported) — left alone, not this card.
 
 ## 3. Binding design decisions
@@ -85,7 +90,7 @@ Let `q = self.query.trim()`, `lower = q.to_lowercase()`.
 
 | query | items returned |
 |---|---|
-| `ds <host>` (`lower.starts_with("ds ")`, non-empty host) | **unchanged**: one `Durable SSH (ghostd): <host>`, category `Remote — durable`, `ConnectDurableSsh(host)` |
+| `ds <host>` (`lower.starts_with("ds ")`, non-empty host) | title and action **unchanged** (`Durable SSH (ghostd): <host>`, `ConnectDurableSsh(host)`); category becomes `Remote — durable` (today `Remote`, `src/palette.rs:115`) |
 | `durable` bare (`lower == "durable"`) | one item per known target, **no create item** (a create needs a host): title `Durable session: <host> — <daemon session>`, category `Remote — durable`, `ConnectDurableSsh(host)`; if the inventory is **empty**, fall through to normal fuzzy filtering |
 | `durable <text>` (`lower.starts_with("durable ")`) | known targets whose host or daemon session contains `<text>` (case-insensitive), in host order; then, when `<text>` is non-empty, one extra `New durable SSH (ghostd): <text>` (`Remote — durable`, `ConnectDurableSsh(<text>)`) |
 | `ssh <host>` | `Connect SSH: <host>` with category `Remote — not durable` (title byte-identical, so the existing test holds), **plus** — only when a known target's host equals `<host>` — `Durable session: <host> — <session>` (`Remote — durable`, `ConnectDurableSsh(host)`) |
@@ -110,8 +115,8 @@ pub fn remote_kind(name: &str) -> Option<RemoteKind>
 plus `pub fn all_remote_specs() -> Vec<(String, String)>`. A durable pane wins over a plain one in a mixed
 session (`Durable` covers `PlainSsh`). Detection of a plain pane is exact, not heuristic: `connect_ssh` spawns
 program `"ssh"` with `remote: None`, and the saved `PaneState.program` is that same string.
-`has_remote(name)` stays, re-implemented as `remote_kind(name) == Some(RemoteKind::Durable)`, so `app.rs` and
-`ui_session.rs` keep working.
+`has_remote(name)` stays, re-implemented as `remote_kind(name) == Some(RemoteKind::Durable)`, so its only
+caller, `src/ui_session.rs:55` (`remote_names`'s filter), keeps working.
 
 **D5 — the picker carries kinds, not a set.** `SessionsOverlay.remotes: HashSet<String>` becomes
 `kinds: HashMap<String, RemoteKind>`; `SessionsOverlay::new(current, names, kinds)`; `is_remote` is replaced by
@@ -130,7 +135,9 @@ place the state is readable. The key-hint line gets no change.
 the existing session instead of stacking a duplicate (`src/remote.rs:70-79`), and it must not drift.
 
 **D7 — the palette's empty hint** becomes
-`No matching commands (try: open <path> | ssh <host> | ds <host> | durable)`.
+`No matching commands (try: open <path> | ssh <host> | ds <host> | durable | theme <name>)` — today's string
+(`src/palette.rs:472`) with the two durable forms inserted and `theme <name>` **kept**: dropping an existing
+affordance is not this card.
 
 ## 4. Ordered work items (stage 3 executes these in this order)
 
@@ -141,12 +148,24 @@ the existing session instead of stacking a duplicate (`src/remote.rs:70-79`), an
    see §6 Risks): `a_durable_pane_makes_the_session_durable`, `a_plain_ssh_pane_is_ssh_and_not_durable`,
    `neither_pane_kind_is_neither` (`remote_kind` → `None`), `all_remote_specs_lists_a_durable_binding`
    (assert `contains`, never list equality — the real dir may hold the owner's sessions).
-2. `src/ui_session.rs` — `remote_kinds()`, and the three call sites. Rename/retarget the test
-   `a_remote_pane_comes_back_disconnected_and_its_session_is_badged_ssh` → `…_is_badged_durable`, asserting
-   `remote_kinds().get(&name) == Some(&RemoteKind::Durable)`.
-3. `src/sessions_overlay.rs` — `kinds: HashMap`, `is_durable`, `kind`, badges, header, and update the three
-   tests that touch `remotes` (`the_current_session_is_listed_and_selected`,
-   `a_session_with_a_durable_remote_pane_is_badged_ssh` → `…_is_badged_ds`, `a_relist_keeps_the_selection_on_the_current_session`).
+2. `src/ui_session.rs` — `remote_kinds()`, and the three call sites (`open_picker` :62, `refresh_picker`
+   :249, the delete branch of `picker_message` :283). Rename/retarget the test
+   `a_remote_pane_comes_back_disconnected_and_its_session_is_badged_ssh` (:561) → `…_is_badged_durable`, and in
+   the same test retarget **both** `remote_names()` assertions — :586 `remote_names().contains(&name)` and :589
+   `names().contains(&name) || remote_names().contains(&name)` — onto `remote_kinds()`
+   (`remote_kinds().get(&name) == Some(&RemoteKind::Durable)`, and the :589 fallback likewise).
+3. `src/sessions_overlay.rs` — `kinds: HashMap<String, RemoteKind>`, `is_durable`, `kind`, badges, header.
+   The third argument of `new`/`relist` is passed in **five** places and every one of them changes (`remotes:
+   HashSet<String>` → `kinds: HashMap<String, RemoteKind>`), plus the four `is_remote` assertions:
+
+   | site | line | edit |
+   |---|---|---|
+   | `picker()` test helper | 331-338 | `HashSet::new()` → `HashMap::new()` (mechanical) |
+   | `the_current_session_is_listed_and_selected` | 346 | `!is_remote("default")` → `!is_durable("default")` |
+   | `a_session_with_a_durable_remote_pane_is_badged_ssh` → `…_is_badged_ds` | 351-357 | `HashSet::from(["ds-prod"])` → `HashMap::from([("ds-prod", Durable)])`; both `is_remote` → `is_durable` |
+   | `an_unknown_current_session_is_added_to_the_list` | 362 | `HashSet::new()` → `HashMap::new()` (mechanical) |
+   | `a_relist_keeps_the_selection_on_the_current_session` | 440-446 | `relist` third arg `HashSet::from(["a"])` → `HashMap::from([("a", Durable)])`; 446 `is_remote` → `is_durable` |
+
    Add `a_plain_ssh_session_is_badged_ssh_and_a_durable_one_ds` and `a_mixed_session_with_a_durable_pane_is_durable`.
 4. `src/palette.rs` — `durables` field, `with_durables`, the D3 grammar, the D3 category strings, the D7 hint.
    Keep `dynamic_ssh_prefix` and `dynamic_ds_prefix` passing **unmodified** (byte-identical titles/actions).
@@ -179,9 +198,21 @@ bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --a
   compile anyway. Exit 4 = low RAM → retry later.
 - expected: every `test result: ok`, zero `FAILED`, for the four targets the suite runs: `--lib` (core),
   the bin unittests (`src/main.rs` + modules), `tests/flood_throughput.rs`, `tests/term_core.rs`.
-  Baseline count at `1a08166`: 204 `#[test]` in `src/` + 7 in `tests/` (measured by `grep -c '#\[test\]'`);
-  after this plan the count is baseline + the new tests in §4 and minus none (no test is deleted — the four
-  renamed/retargeted ones are the only edits). Stage 3 must paste the real per-target counts.
+  Baseline count at `1a08166`: 204 `#[test]` in `src/` + 7 in `tests/` (measured by `grep -c '#\[test\]'`).
+- **The real edit set, so stage 3 knows what must move** (no test is deleted; every edit below is either a
+  signature ripple or an assertion retarget, and any *other* test that needs touching is a plan defect — report
+  it, do not silently widen the diff):
+  - `src/sessions_overlay.rs`: the third argument of `new`/`relist` is constructed at **five** sites
+    (`picker()` :331-338, `an_unknown_current_session_is_added_to_the_list` :362 — both mechanical
+    `HashSet::new()` → `HashMap::new()`; `…_is_badged_ds` :351-355, `a_relist_…` :440-443 — value changes), and
+    the four `is_remote` assertions (:346, :356, :357, :446) become `is_durable`;
+  - `src/ui_session.rs`: `a_remote_pane_comes_back_disconnected_and_its_session_is_badged_ssh` is renamed and
+    both of its `remote_names()` assertions (:586, :589) move to `remote_kinds()`;
+  - `src/input.rs`: `the_durable_ssh_action_opens_its_own_session_and_binds_the_pane` (:2199, tab `ds <host>`)
+    and the added assertion in `the_plain_ssh_action_opens_its_session_without_a_ghostd_binding` (§4.5).
+  - Count: 204 → **215** `#[test]` in `src/` (11 new: 4 in `session.rs`, 4 in `palette.rs`, 2 in
+    `sessions_overlay.rs`, 1 in `input.rs`); `tests/` stays 7. Stage 3 must paste the real per-target counts and
+    reconcile any difference.
 - a fresh `CARGO_TARGET_DIR` recompiles libghostty-vt with zig (`shell.nix` pins zig 0.15.2); `/var/build` had
   25 GB free at plan time, the last target dir cost 5.3 GB. Use `nix-shell ./shell.nix` — **not** a minimal
   shell (PROGRESS.md:643 records why).
