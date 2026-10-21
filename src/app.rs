@@ -1162,7 +1162,7 @@ impl AppState {
         self.ensure_remote_binary(host);
         match self.remote_pane(&argv, Some(spec)) {
             Ok(pane) => {
-                self.push_remote_tab(pane, &format!("ssh {host}"), fresh);
+                self.push_remote_tab(pane, &format!("ds {host}"), fresh);
                 self.toast(format!("durable ssh: {host}"));
             }
             Err(e) => self.toast(format!("ssh failed: {e}")),
@@ -1317,7 +1317,7 @@ impl AppState {
     }
 
     /// Every (host, daemon session) pair across live tabs.
-    fn live_remote_specs(tabs: &[Tab]) -> Vec<(String, String)> {
+    pub(crate) fn live_remote_specs(tabs: &[Tab]) -> Vec<(String, String)> {
         let mut specs = Vec::new();
         for tab in tabs {
             for entry in tab.panes.iter().flatten() {
