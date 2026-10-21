@@ -560,6 +560,15 @@ mod tests {
     fn normal_unbound_passes_to_terminal() {
         assert!(matches!(handle(Mode::Normal, &kp(Key::A, no_mod())), Dispatch::Pass));
         assert!(matches!(handle(Mode::Normal, &kp(Key::Enter, no_mod())), Dispatch::Pass));
+        // The page keys are deliberately NOT in normal_binds: whether they
+        // scroll ghostwave's scrollback depends on the pane's screen, which the
+        // bind table cannot see. The app's input path decides (src/input.rs).
+        assert!(matches!(handle(Mode::Normal, &kp(Key::PageUp, no_mod())), Dispatch::Pass));
+        assert!(matches!(handle(Mode::Normal, &kp(Key::PageDown, no_mod())), Dispatch::Pass));
+        assert!(matches!(
+            handle(Mode::Normal, &kp(Key::PageUp, Mods::SHIFT)),
+            Dispatch::Action(Action::PageUp)
+        ));
     }
 
     #[test]

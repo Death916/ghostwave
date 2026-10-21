@@ -5,11 +5,12 @@
 //! cell, painted at the bounds iced gives it, with iced owning the split drags,
 //! the pane drags and the focus placement that follow from them.
 //!
-//! Geometry: a [`SPACING`] px gutter between cells with the window background
-//! showing through it, each cell's terminal area inset by [`PANE_INSET`] px and
-//! sitting below a [`TITLE_H`] px label band, framed by a stroke in
-//! `theme.frame_active` (focused pane) or `theme.frame`. Frames off drops the
-//! gutter, the inset and the band, so panes touch.
+//! Geometry: neighbouring cells touch, and each paints a frame stroke on its own
+//! outermost pixels, so the frames of two neighbours meet on the edge they share
+//! and that edge carries one line instead of a band of window background
+//! between two frames. A cell's terminal area sits [`inset`] px inside its frame
+//! and below a [`TITLE_H`] px label band. Frames off drops the stroke, the inset
+//! and the band, so panes touch.
 //!
 //! Terminal content stays the canvas layer's: one [`PaneCanvas`] per pane paints
 //! that pane at its own bounds with the shared painter.
@@ -36,13 +37,16 @@ use iced::{
 
 use crate::Message;
 use crate::app::{AppState, GridPane, Tab};
-use crate::ui_fonts;
 use crate::keys;
 use crate::pane::{ContentPane, PaneEntry, PaneId, SharedPane};
 use crate::pane_canvas::{self, CanvasState};
+use crate::ui_fonts;
 
-/// Gutter between neighbouring cells, in px.
-pub const SPACING: f32 = 4.0;
+/// Background kept between the terminal areas of two neighbouring panes, in px.
+///
+/// Half of it is each pane's own side of the divider, so the terminal areas stay
+/// apart without the frames being separated: the cells themselves touch.
+pub const PANE_GAP: f32 = 4.0;
 
 /// Inset of a pane's terminal area inside its cell, in px.
 pub const PANE_INSET: f32 = 2.0;
@@ -83,14 +87,63 @@ pub fn click_to_pane_index(
     cell_active_pane_index(grid, cell, |id| tab.index_of(id))
 }
 
-/// Gutter width, in px, for a pane layer with or without frames.
-pub fn spacing(frames: bool) -> f32 {
-    if frames { SPACING } else { 0.0 }
-}
+/// Gutter the grid leaves between neighbouring cells, in px.
+///
+/// None, ever. A frame is drawn on a cell's own outermost pixels, so any gutter
+/// iced inserted would sit *between* the frames of two neighbours and show the
+/// window background on the edge they share — which reads as a missing frame
+/// line exactly where the panes meet. The space that keeps the terminal areas
+/// apart is [`inset`]'s, and a split is still grabbable through
+/// [`SPLIT_GRAB_W`].
+pub const SPACING: f32 = 0.0;
+
+/// Width of the band, in px, in which a split can be grabbed, with frames on.
+///
+/// The grid has no spacing of its own to grab, so this is handed to iced as the
+/// split's leeway; iced makes the hit area `spacing + leeway` wide, centred on
+/// the split, which keeps the 4px band the old gutter gave. It is handed over
+/// only when frames are on: without them there is nothing to grab between the
+/// panes, and a band there would swallow the click that should focus the pane.
+pub const SPLIT_GRAB_W: f32 = 4.0;
 
 /// Inset of a pane's terminal area inside its cell, in px.
+///
+/// [`PANE_GAP`] split over the two panes that share an edge, plus
+/// [`PANE_INSET`]; zero without frames, so panes touch.
 pub fn inset(frames: bool) -> f32 {
-    if frames { PANE_INSET } else { 0.0 }
+    if frames {
+        PANE_INSET + PANE_GAP / 2.0
+    } else {
+        0.0
+    }
+}
+
+/// A cell's frame stroke and the inset it puts its terminal area at, in px.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellMetrics {
+    /// Width of the frame stroke drawn on the cell's own edge.
+    pub frame: f32,
+    /// Inset of the terminal area inside the cell, the stroke included.
+    pub padding: f32,
+}
+
+/// The frame stroke and terminal inset of one cell.
+///
+/// The stroke is the focused or unfocused width, or nothing without frames; the
+/// terminal area is inset by the stroke plus [`inset`], which is what keeps a
+/// pane's content off its own frame and off its neighbour's.
+pub fn cell_metrics(frames: bool, focused: bool) -> CellMetrics {
+    let frame = if !frames {
+        0.0
+    } else if focused {
+        pane_canvas::FRAME_ACTIVE_W
+    } else {
+        pane_canvas::FRAME_INACTIVE_W
+    };
+    CellMetrics {
+        frame,
+        padding: inset(frames) + frame,
+    }
 }
 
 /// The grid axis a split direction splits along. `SplitDir::Horizontal` is
@@ -134,7 +187,6 @@ fn grid<'a>(state: &'a AppState, mouse_tracking: Vec<usize>) -> PaneGrid<'a, Mes
     let active = tab.active;
     let theme = state.theme;
     let (cell, font_px, padding) = (state.cell, state.config.font_size, state.config.padding);
-    let inset = inset(frames);
     let font = ui_fonts::primary();
     let replace_title = state.config.dynamic_title != crate::ui_config::DynamicTitleMode::Off;
 
@@ -142,13 +194,8 @@ fn grid<'a>(state: &'a AppState, mouse_tracking: Vec<usize>) -> PaneGrid<'a, Mes
         let index = payload.active_id().and_then(|id| tab.index_of(id));
         let entry = index.and_then(|index| tab.entry(index));
         let focused = index == Some(active);
-        let frame_w = if !frames {
-            0.0
-        } else if focused {
-            pane_canvas::FRAME_ACTIVE_W
-        } else {
-            pane_canvas::FRAME_INACTIVE_W
-        };
+        let metrics = cell_metrics(frames, focused);
+        let frame_w = metrics.frame;
         let frame_color = if focused {
             theme.frame_active
         } else {
@@ -170,9 +217,9 @@ fn grid<'a>(state: &'a AppState, mouse_tracking: Vec<usize>) -> PaneGrid<'a, Mes
                 .width(Fill)
                 .height(Fill),
             )
-            .padding(inset + frame_w)
+            .padding(metrics.padding)
             .into(),
-            Some(PaneEntry::Content(content)) => content_body(content, inset + frame_w, theme),
+            Some(PaneEntry::Content(content)) => content_body(content, metrics.padding, theme),
             None => text("").into(),
         };
         let mut content = Content::new(body);
@@ -190,7 +237,8 @@ fn grid<'a>(state: &'a AppState, mouse_tracking: Vec<usize>) -> PaneGrid<'a, Mes
                 Some(PaneEntry::Content(content)) => content.label(),
                 None => String::new(),
             };
-            content = content.title_bar(TitleBar::new(label_band(&label, frame_color, font, theme)));
+            content =
+                content.title_bar(TitleBar::new(label_band(&label, frame_color, font, theme)));
         }
         content.style(move |_theme| container::Style {
             background: Some(pane_canvas::rgb(theme.bg).into()),
@@ -202,15 +250,17 @@ fn grid<'a>(state: &'a AppState, mouse_tracking: Vec<usize>) -> PaneGrid<'a, Mes
             ..container::Style::default()
         })
     })
-    .spacing(spacing(frames))
+    .spacing(SPACING)
     .min_size(MIN_SIZE)
     .on_click(move |pane| {
         let index = click_to_pane_index(&tab.grid, tab, pane).unwrap_or(tab.active);
         Message::FocusPane(index)
     })
-    .on_resize(0.0, |event| Message::GridResize {
-        split: event.split,
-        ratio: event.ratio,
+    .on_resize(if frames { SPLIT_GRAB_W } else { 0.0 }, |event| {
+        Message::GridResize {
+            split: event.split,
+            ratio: event.ratio,
+        }
     })
     .on_drag(Message::GridDrag)
     .style(move |_theme| grid_style(&theme))
@@ -224,7 +274,11 @@ fn grid<'a>(state: &'a AppState, mouse_tracking: Vec<usize>) -> PaneGrid<'a, Mes
 /// The pane is not a terminal, so it brings its own widget instead of a
 /// [`PaneCanvas`]: the preview's line and image views, the AI chat's cards, or
 /// the visualizer's canvas program.
-fn content_body<'a>(content: &'a ContentPane, inset: f32, theme: GhostTheme) -> Element<'a, Message> {
+fn content_body<'a>(
+    content: &'a ContentPane,
+    inset: f32,
+    theme: GhostTheme,
+) -> Element<'a, Message> {
     let body: Element<'a, Message> = match content {
         ContentPane::Preview { pane, .. } => pane.view::<Message>(&theme),
         ContentPane::Ai { id, pane } => {
@@ -441,13 +495,11 @@ impl canvas::Program<Message> for PaneCanvas {
         let mut guard = self.handle.lock().unwrap();
 
         guard.last_bounds = Some(bounds);
-        let (cols, rows) = bounds_to_cols_rows(bounds.width, bounds.height, self.cell, self.padding);
+        let (cols, rows) =
+            bounds_to_cols_rows(bounds.width, bounds.height, self.cell, self.padding);
         guard.resize(cols, rows, self.cell);
 
-        let origin_offset = Point::new(
-            bounds.x.round() - bounds.x,
-            bounds.y.round() - bounds.y,
-        );
+        let origin_offset = Point::new(bounds.x.round() - bounds.x, bounds.y.round() - bounds.y);
         let pane_rect = Rectangle::new(origin_offset, bounds.size());
 
         pane_canvas::paint_pane(
@@ -578,10 +630,7 @@ mod tests {
         );
 
         assert_eq!(format_pane_label("", 1, "", None, true), "pane 1");
-        assert_eq!(
-            format_pane_label("term", 2, "fish", None, true),
-            "fish"
-        );
+        assert_eq!(format_pane_label("term", 2, "fish", None, true), "fish");
         assert_eq!(
             format_pane_label("pane", 1, "sh", Some((0, 2)), true),
             "sh [1/2]"
@@ -624,5 +673,250 @@ mod tests {
         let cell = grid.get_mut(root).expect("root exists");
         cell.active = 0;
         assert_eq!(cell_active_pane_index(&grid, root, index_map), Some(0));
+    }
+
+    /// Window size the framed-pane cases are laid out at: halves land on whole
+    /// pixels, so the arithmetic below is exact.
+    const W: f32 = 1200.0;
+    /// See [`W`].
+    const H: f32 = 800.0;
+
+    /// A side of a cell.
+    #[derive(Clone, Copy, Debug)]
+    enum Side {
+        Left,
+        Right,
+        Top,
+        Bottom,
+    }
+
+    /// The cell rects iced lays out for `grid` — the same call `PaneGrid::layout`
+    /// makes, so the numbers are the engine's, not this test's.
+    fn regions(
+        grid: &pane_grid::State<GridPane>,
+    ) -> std::collections::BTreeMap<pane_grid::Pane, Rectangle> {
+        grid.layout()
+            .pane_regions(SPACING, MIN_SIZE, iced::Size::new(W, H))
+    }
+
+    /// The band `width` px wide that a cell's frame stroke occupies on `side`.
+    fn frame_edge(cell: Rectangle, width: f32, side: Side) -> Rectangle {
+        match side {
+            Side::Left => Rectangle { width, ..cell },
+            Side::Right => Rectangle {
+                x: cell.x + cell.width - width,
+                width,
+                ..cell
+            },
+            Side::Top => Rectangle {
+                height: width,
+                ..cell
+            },
+            Side::Bottom => Rectangle {
+                y: cell.y + cell.height - width,
+                height: width,
+                ..cell
+            },
+        }
+    }
+
+    /// The cell's terminal area: below the label band, inside the frame and the
+    /// pane inset.
+    fn body(cell: Rectangle, padding: f32, frames: bool) -> Rectangle {
+        let title = if frames { TITLE_H } else { 0.0 };
+        Rectangle {
+            x: cell.x + padding,
+            y: cell.y + title + padding,
+            width: cell.width - 2.0 * padding,
+            height: cell.height - title - 2.0 * padding,
+        }
+    }
+
+    /// Asserts one pair of neighbouring cells carries its frame on the edge they
+    /// share: the two strokes meet on the boundary with no background band
+    /// between them, and neither cell's terminal area reaches under a stroke.
+    fn assert_framed_shared_edge(
+        frames: bool,
+        a: Rectangle,
+        focused_a: bool,
+        b: Rectangle,
+        focused_b: bool,
+    ) {
+        let m_a = cell_metrics(frames, focused_a);
+        let m_b = cell_metrics(frames, focused_b);
+        let (w_a, w_b) = (m_a.frame, m_b.frame);
+        let (pad_a, pad_b) = (m_a.padding, m_b.padding);
+        assert!(w_a > 0.0 && w_b > 0.0, "both cells draw a frame stroke");
+
+        // `b` is the neighbour to the right of, or below, `a`.
+        let (side_a, side_b, gap, body_a, body_b) = if b.x > a.x + 0.01 {
+            (
+                Side::Right,
+                Side::Left,
+                b.x - (a.x + a.width),
+                body(a, pad_a, frames),
+                body(b, pad_b, frames),
+            )
+        } else {
+            assert!(b.y > a.y + 0.01, "cells {a:?} and {b:?} are not neighbours");
+            (
+                Side::Bottom,
+                Side::Top,
+                b.y - (a.y + a.height),
+                body(a, pad_a, frames),
+                body(b, pad_b, frames),
+            )
+        };
+
+        assert!(
+            gap.abs() <= 0.01,
+            "the two frames must meet on the shared edge, but {gap}px of \
+             background sits between the cells ({a:?} | {b:?})",
+        );
+
+        let edge_a = frame_edge(a, w_a, side_a);
+        let edge_b = frame_edge(b, w_b, side_b);
+        let stroke_gap = match side_a {
+            Side::Right | Side::Left => edge_b.x - (edge_a.x + edge_a.width),
+            Side::Top | Side::Bottom => edge_b.y - (edge_a.y + edge_a.height),
+        };
+        assert!(
+            stroke_gap.abs() <= 0.01,
+            "the two frame strokes must touch across the shared edge, but they \
+             are {stroke_gap}px apart ({edge_a:?} | {edge_b:?})",
+        );
+
+        // No cell's terminal area may sit under its neighbour's stroke.
+        match side_a {
+            Side::Right | Side::Left => {
+                assert!(
+                    body_b.x >= edge_a.x + edge_a.width - 0.01,
+                    "the neighbour's terminal covers this cell's frame: \
+                     body {body_b:?} vs stroke {edge_a:?}",
+                );
+                assert!(
+                    body_a.x + body_a.width <= edge_b.x + 0.01,
+                    "this cell's terminal covers the neighbour's frame: \
+                     body {body_a:?} vs stroke {edge_b:?}",
+                );
+                assert!(
+                    body_a.x + body_a.width <= body_b.x,
+                    "the two terminal areas overlap: {body_a:?} | {body_b:?}",
+                );
+            }
+            Side::Top | Side::Bottom => {
+                assert!(
+                    body_b.y >= edge_a.y + edge_a.height - 0.01,
+                    "the neighbour's terminal covers this cell's frame: \
+                     body {body_b:?} vs stroke {edge_a:?}",
+                );
+                assert!(
+                    body_a.y + body_a.height <= edge_b.y + 0.01,
+                    "this cell's terminal covers the neighbour's frame: \
+                     body {body_a:?} vs stroke {edge_b:?}",
+                );
+                assert!(
+                    body_a.y + body_a.height <= body_b.y,
+                    "the two terminal areas overlap: {body_a:?} | {body_b:?}",
+                );
+            }
+        }
+    }
+
+    /// The frame is drawn on every edge of a cell, the ones it shares with a
+    /// neighbour included: with frames on, a cell's stroke and its neighbour's
+    /// meet on the boundary, so the shared edge shows a frame line instead of a
+    /// band of window background.
+    #[test]
+    fn framed_panes_carry_their_frame_on_shared_edges() {
+        // Two panes, side by side.
+        let (mut grid, root) = pane_grid::State::new(GridPane::single(PaneId(1)));
+        let (right, _split) = grid
+            .split(
+                axis(SplitDir::Horizontal),
+                root,
+                GridPane::single(PaneId(2)),
+            )
+            .expect("split succeeds");
+        let cells = regions(&grid);
+        assert_framed_shared_edge(true, cells[&root], true, cells[&right], false);
+
+        // Two panes, stacked.
+        let (mut grid, root) = pane_grid::State::new(GridPane::single(PaneId(1)));
+        let (bottom, _split) = grid
+            .split(axis(SplitDir::Vertical), root, GridPane::single(PaneId(2)))
+            .expect("split succeeds");
+        let cells = regions(&grid);
+        assert_framed_shared_edge(true, cells[&root], true, cells[&bottom], false);
+
+        // Four panes in a cross: every pane has a neighbour on each axis.
+        let (mut grid, root) = pane_grid::State::new(GridPane::single(PaneId(1)));
+        let (bottom, _split) = grid
+            .split(axis(SplitDir::Vertical), root, GridPane::single(PaneId(2)))
+            .expect("split succeeds");
+        let (top_right, _split) = grid
+            .split(
+                axis(SplitDir::Horizontal),
+                root,
+                GridPane::single(PaneId(3)),
+            )
+            .expect("split succeeds");
+        let (bottom_right, _split) = grid
+            .split(
+                axis(SplitDir::Horizontal),
+                bottom,
+                GridPane::single(PaneId(4)),
+            )
+            .expect("split succeeds");
+        let cells = regions(&grid);
+        assert_framed_shared_edge(true, cells[&root], true, cells[&top_right], false);
+        assert_framed_shared_edge(true, cells[&bottom], false, cells[&bottom_right], false);
+        assert_framed_shared_edge(true, cells[&root], true, cells[&bottom], false);
+        assert_framed_shared_edge(true, cells[&top_right], false, cells[&bottom_right], false);
+    }
+
+    /// Frames off is unchanged: no gutter, no inset, no stroke — the panes'
+    /// terminal areas touch.
+    #[test]
+    fn frameless_panes_touch_with_no_gutter() {
+        assert_eq!(SPACING, 0.0);
+        assert_eq!(inset(false), 0.0);
+        assert_eq!(
+            cell_metrics(false, true),
+            CellMetrics {
+                frame: 0.0,
+                padding: 0.0
+            }
+        );
+        assert_eq!(
+            cell_metrics(false, false),
+            CellMetrics {
+                frame: 0.0,
+                padding: 0.0
+            }
+        );
+
+        let (mut grid, root) = pane_grid::State::new(GridPane::single(PaneId(1)));
+        let (right, _split) = grid
+            .split(
+                axis(SplitDir::Horizontal),
+                root,
+                GridPane::single(PaneId(2)),
+            )
+            .expect("split succeeds");
+        let cells = regions(&grid);
+
+        let pad_a = cell_metrics(false, true).padding;
+        let pad_b = cell_metrics(false, false).padding;
+        let body_a = body(cells[&root], pad_a, false);
+        let body_b = body(cells[&right], pad_b, false);
+
+        assert_eq!(
+            body_a.x + body_a.width,
+            body_b.x,
+            "frames off: the two panes' terminal areas touch, with no gutter",
+        );
+        assert_eq!(body_a.y, body_b.y);
+        assert_eq!(body_a.height, body_b.height);
     }
 }

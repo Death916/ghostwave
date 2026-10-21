@@ -4,6 +4,7 @@
 
 use ghostwave::config::Config;
 use ghostwave::keymap::Action;
+use ghostwave::ui_fonts;
 use iced::{
     keyboard,
     widget::{pane_grid, Stack},
@@ -16,7 +17,6 @@ pub mod ai;
 mod autosave;
 pub mod chrome_widgets;
 mod ui_config;
-mod ui_fonts;
 #[allow(dead_code)]
 mod grid_session;
 mod input;

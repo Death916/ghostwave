@@ -18,6 +18,7 @@ use libghostty_vt::{
     kitty::graphics::{self},
     mouse,
     render::{CellIterator, RenderState, RowIterator},
+    screen::Screen,
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     terminal::{
         ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
@@ -58,13 +59,93 @@ pub struct CellDims {
     pub baseline: f32,
 }
 
+/// Session-name prefix of a remote ghostd session: `ghostwave-<host token>`.
+pub const REMOTE_SESSION_PREFIX: &str = "ghostwave-";
+
+/// Longest ssh destination accepted, so a session file cannot feed an unbounded
+/// token into a command line.
+pub const HOST_MAX_LEN: usize = 255;
+
+/// Whether `host` is a usable ssh destination.
+///
+/// The accepted characters are exactly what the supported forms need — an alias,
+/// `user@host`, `host:port`, `[v6]:port`, `user@[v6]:port` and
+/// `ssh://user@host:port` — so a destination can be handed to `ssh` as an argv
+/// element and would still be plain data if it ever reached a shell. Whitespace,
+/// control characters, quotes and shell metacharacters are all refused at this
+/// boundary; the port (`%` for a zone id) is the only punctuation beyond the URI
+/// set.
+pub fn host_is_valid(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= HOST_MAX_LEN
+        && host.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '-' | '_' | '@' | ':' | '/' | '[' | ']' | '%')
+        })
+}
+
+/// The host as a filesystem-safe token, for session names.
+pub fn sanitize_host(host: &str) -> String {
+    host.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect()
+}
+
+/// The ghostd session a durable pane binds to on `host`: `ghostwave-<host>`.
+///
+/// This is the only source of a session name — a name stored in a session file
+/// is rederived from its host ([`RemoteSpec::rederived`]) rather than trusted.
+pub fn remote_session(host: &str) -> String {
+    format!("{REMOTE_SESSION_PREFIX}{}", sanitize_host(host))
+}
+
 /// A durable remote session binding (ghostd). Saved with the session so
 /// restore can re-show the pane in a disconnected state.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+///
+/// `session` is derived data: it is serialized for readability and backwards
+/// compatibility, but deserialization rederives it from `host`, so a crafted
+/// session file cannot choose the name that later reaches a remote command line
+/// or a `pkill` pattern.
+#[derive(Serialize, Clone, Debug)]
 pub struct RemoteSpec {
     pub host: String,
-    /// Session name on the remote host.
+    /// Session name on the remote host; always [`remote_session`] of `host`.
     pub session: String,
+}
+
+impl RemoteSpec {
+    /// The binding for `host`, with the session name derived from it.
+    pub fn for_host(host: &str) -> Self {
+        Self {
+            host: host.to_string(),
+            session: remote_session(host),
+        }
+    }
+
+    /// This binding with the session name rederived from its host.
+    ///
+    /// Used wherever a binding comes from outside the process — a session file,
+    /// a hand-edited config — so nothing downstream has to trust a stored name.
+    pub fn rederived(&self) -> Self {
+        Self::for_host(&self.host)
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored {
+            host: String,
+            /// Accepted from the file format, then ignored: the name is derived.
+            #[serde(default)]
+            #[allow(dead_code)]
+            session: String,
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        Ok(RemoteSpec::for_host(&stored.host))
+    }
 }
 
 /// Reconnect state machine for remote (ssh/ghostd) panes.
@@ -89,6 +170,13 @@ pub struct TermPane {
     mouse_encoder: mouse::Encoder<'static>,
     mouse_event: mouse::Event<'static>,
     pub response: Vec<u8>,
+    /// Scanner for inbound font queries (`OSC 50`); its replies land in
+    /// `response` and leave with `flush_response`.
+    font_query: crate::font_query::Scanner,
+    /// The family a font query is answered with, captured at construction from
+    /// `ui_fonts::active_family()` so a pane answers what the app is actually
+    /// configured to use.
+    pub font_family: String,
     selection: SelectionState<'static>,
     /// None when the pane is in a disconnected state (no child process).
     pub pty: Option<Pty>,
@@ -286,6 +374,8 @@ impl TermPane {
             mouse_encoder,
             mouse_event,
             response: Vec::with_capacity(64),
+            font_query: crate::font_query::Scanner::new(),
+            font_family: crate::ui_fonts::active_family().to_string(),
             selection: SelectionState::new()?,
             pty,
             pty_rx,
@@ -424,7 +514,7 @@ impl TermPane {
             return false;
         }
 
-        let Some(rx) = self.pty_rx.as_ref() else {
+        let Some(rx) = self.pty_rx.take() else {
             return false;
         };
 
@@ -436,6 +526,7 @@ impl TermPane {
                         if let Some(log) = self.log.as_mut() {
                             log.write(&data);
                         }
+                        self.scan_queries(&data);
                         self.term.vt_write(&data);
                         had_activity = true;
                     }
@@ -452,6 +543,7 @@ impl TermPane {
                 }
             }
         }
+        self.pty_rx = Some(rx);
         had_activity
     }
 
@@ -512,6 +604,14 @@ impl TermPane {
         if let Some(log) = self.log.as_mut() {
             log.seed(data);
         }
+    }
+
+    /// Scans inbound pty bytes for a font query and queues the reply in
+    /// `response`, which `flush_response` writes back to the pty. The bytes
+    /// themselves are not consumed — the VT still receives them unchanged.
+    pub fn scan_queries(&mut self, data: &[u8]) {
+        let replies = self.font_query.feed(data, &self.font_family);
+        self.response.extend_from_slice(&replies);
     }
 
     pub fn flush_response(&mut self) {
@@ -696,6 +796,19 @@ impl TermPane {
         self.term.scroll_viewport(ScrollViewport::Bottom);
         self.scroll_active = false;
         self.force_repaint = true;
+    }
+
+    /// Whether the pane is showing the primary screen, the one the scrollback
+    /// belongs to.
+    ///
+    /// Full-screen programs (`less`, `vim`, `htop`) switch to the alternate
+    /// screen while they run; the alternate screen keeps no history, so this is
+    /// also the answer to "does the pane have scrollback to scroll right now".
+    /// A failed read reports `false`: callers that take a key away from the
+    /// program use this, and a program that owns the key is safer than one that
+    /// silently loses it.
+    pub fn on_primary_screen(&self) -> bool {
+        matches!(self.term.active_screen(), Ok(Screen::Primary))
     }
 
     pub fn clear_terminal(&mut self) -> Result<()> {
@@ -1191,6 +1304,106 @@ mod tests {
             title.contains("SLOW-PRIME"),
             "prime drain gave up before the child's first write (title={title:?})"
         );
+    }
+
+    /// A font query arriving on the pane's inbound path is answered with the
+    /// family the app is configured to use, in the terminator the query used.
+    /// Feeds the same `scan_queries` entry point both live hook points
+    /// (`TermPane::poll_pty`, `Pane::ingest`) call.
+    #[test]
+    fn pane_answers_the_font_query() {
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
+        let mut pane = TermPane::new(
+            80,
+            24,
+            cell,
+            None,
+            &[],
+            None,
+            1000,
+            1024 * 1024,
+            false,
+            None,
+        )
+        .expect("pane without a child");
+
+        let family = crate::ui_fonts::active_family().to_string();
+        pane.response.clear();
+        pane.scan_queries(b"\x1b]50;?\x1b\\");
+
+        let mut expected = b"\x1b]50;".to_vec();
+        expected.extend_from_slice(family.as_bytes());
+        expected.extend_from_slice(b"\x1b\\");
+        assert_eq!(
+            pane.response, expected,
+            "font query should be answered with the configured family"
+        );
+        assert_eq!(pane.font_family, family, "pane captured the active family");
+    }
+
+    #[test]
+    fn page_keys_encode_to_the_bytes_a_program_reads() {
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
+        let mut pane = TermPane::new(
+            80,
+            24,
+            cell,
+            None,
+            &[],
+            None,
+            1000,
+            1024 * 1024,
+            false,
+            None,
+        )
+        .unwrap();
+
+        pane.handle_key(
+            Key::PageUp,
+            Mods::empty(),
+            Mods::empty(),
+            '\0',
+            None,
+            key::Action::Press,
+        )
+        .unwrap();
+        assert_eq!(pane.response, b"\x1b[5~", "PageUp reaches the program as CSI 5 ~");
+
+        pane.response.clear();
+        pane.handle_key(
+            Key::PageDown,
+            Mods::empty(),
+            Mods::empty(),
+            '\0',
+            None,
+            key::Action::Press,
+        )
+        .unwrap();
+        assert_eq!(pane.response, b"\x1b[6~", "PageDown reaches the program as CSI 6 ~");
+    }
+
+    #[test]
+    fn on_primary_screen_follows_the_alternate_screen_flag() {
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
+        let mut pane = TermPane::new(
+            80,
+            24,
+            cell,
+            None,
+            &[],
+            None,
+            1000,
+            1024 * 1024,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(pane.on_primary_screen(), "a fresh terminal is on its primary screen");
+        pane.term.vt_write(b"\x1b[?1049h");
+        assert!(!pane.on_primary_screen(), "1049h switches a program to the alternate screen");
+        pane.term.vt_write(b"\x1b[?1049l");
+        assert!(pane.on_primary_screen(), "1049l returns it to the primary screen");
     }
 
     #[test]

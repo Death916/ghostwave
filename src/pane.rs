@@ -329,7 +329,9 @@ impl Pane {
         self.dirty = true;
     }
 
-    /// Writes pty output to the pane log first, then to the VT.
+    /// Writes pty output to the pane log first, then to the VT. Answers a font
+    /// query in the same bytes on the way through — the iced path has no other
+    /// response flush, so the reply is written back here.
     pub fn ingest(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -337,7 +339,9 @@ impl Pane {
         if let Some(log) = self.term.log.as_mut() {
             log.write(data);
         }
+        self.term.scan_queries(data);
         self.term.term.vt_write(data);
+        self.term.flush_response();
         self.term.force_repaint = true;
         self.dirty = true;
     }

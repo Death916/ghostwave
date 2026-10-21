@@ -396,6 +396,11 @@ pub struct AppState {
     remote_upload_tx: std::sync::mpsc::Sender<crate::remote::UploadResult>,
     /// Uploads still in flight; the front-end keeps ticking while any is.
     uploads_in_flight: usize,
+    /// Hosts with an upload already in flight, so a second request for the same
+    /// host joins the first instead of racing it on the remote filesystem.
+    uploads_pending: std::collections::HashSet<String>,
+    /// The ssh seam: `ssh` in a real run, a recorder in tests.
+    pub ssh: std::sync::Arc<dyn crate::remote::SshRunner>,
     last_tick: std::time::Instant,
     window: Size,
 }
@@ -410,6 +415,45 @@ pub enum TickRate {
     Slow,
     /// Nothing is animating; effectively no ticks (the period is an hour).
     Off,
+}
+
+/// Reports one upload's outcome to the front-end exactly once.
+///
+/// The upload runs on a detached thread, so the result has to arrive even when
+/// the upload itself panics: a count that never comes back would pin the
+/// front-end at the slow tick forever. The send happens once, from [`Self::report`]
+/// or, failing that, from `Drop`.
+struct UploadReport {
+    host: String,
+    tx: std::sync::mpsc::Sender<crate::remote::UploadResult>,
+    reported: bool,
+}
+
+impl UploadReport {
+    fn new(host: String, tx: std::sync::mpsc::Sender<crate::remote::UploadResult>) -> Self {
+        Self {
+            host,
+            tx,
+            reported: false,
+        }
+    }
+
+    fn host(&self) -> &str {
+        &self.host
+    }
+
+    fn report(&mut self, ok: bool) {
+        self.reported = true;
+        let _ = self.tx.send((self.host.clone(), ok));
+    }
+}
+
+impl Drop for UploadReport {
+    fn drop(&mut self) {
+        if !self.reported {
+            self.report(false);
+        }
+    }
 }
 
 impl AppState {
@@ -441,6 +485,8 @@ impl AppState {
             remote_uploads,
             remote_upload_tx,
             uploads_in_flight: 0,
+            uploads_pending: Default::default(),
+            ssh: std::sync::Arc::new(crate::remote::SystemSsh),
             last_tick: std::time::Instant::now(),
             window,
         };
@@ -1059,14 +1105,17 @@ impl AppState {
     /// Re-running the command resumes it by re-opening the connection, which is
     /// what living in its own named session is for.
     pub fn connect_ssh(&mut self, host: &str) {
+        if !remote::host_is_valid(host) {
+            self.toast(format!("not an ssh destination: {host}"));
+            return;
+        }
         let target = remote::ssh_session(host);
         let fresh = if self.current_session != target {
             self.open_remote_session(&target)
         } else {
             false
         };
-        let args = [host];
-        match self.remote_pane(Some("ssh"), &args, None) {
+        match self.remote_pane(&remote::ssh_argv(host), None) {
             Ok(pane) => {
                 self.push_remote_tab(pane, &format!("ssh {host}"), fresh);
                 self.toast(format!("connecting to {host}"));
@@ -1085,6 +1134,10 @@ impl AppState {
     /// attach pane (one daemon serves one client at a time) instead of stacking a
     /// duplicate.
     pub fn connect_durable_ssh(&mut self, host: &str) {
+        if !remote::host_is_valid(host) {
+            self.toast(format!("not an ssh destination: {host}"));
+            return;
+        }
         let target = remote::ssh_session(host);
         let fresh = if self.current_session != target {
             self.open_remote_session(&target)
@@ -1102,15 +1155,12 @@ impl AppState {
             }
             return;
         }
-        let session = remote::remote_session(host);
-        let argv = remote::attach_argv(host, &session);
-        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        // The binding is derived here and nowhere else: the session name a pane
+        // is bound to is always the one its host owns.
+        let spec = RemoteSpec::for_host(host);
+        let argv = remote::attach_argv(host, &spec.session);
         self.ensure_remote_binary(host);
-        let spec = RemoteSpec {
-            host: host.to_string(),
-            session,
-        };
-        match self.remote_pane(Some("ssh"), &args, Some(spec)) {
+        match self.remote_pane(&argv, Some(spec)) {
             Ok(pane) => {
                 self.push_remote_tab(pane, &format!("ds {host}"), fresh);
                 self.toast(format!("durable ssh: {host}"));
@@ -1155,12 +1205,20 @@ impl AppState {
     /// Kills the remote session the pane at `(tab, pane)` is bound to, over a
     /// fresh ssh connection. The local pane stays as it is — it is left
     /// disconnected, and the kill is the daemon's own to report.
-    pub fn kill_remote_pane(&mut self, tab: usize, pane: usize) {
+    ///
+    /// A binding that did not come out of [`remote::remote_session`] is refused
+    /// rather than sent: the session name reaches a remote command line, so it is
+    /// never taken from a pane or a session file as given.
+    pub fn kill_remote_pane(&mut self, tab: usize, pane: usize) -> bool {
         let Some((host, session)) = self.remote_spec_of(tab, pane) else {
-            return;
+            return false;
         };
+        if !remote::binding_is_valid(&host, &session) {
+            self.toast(format!("refusing to kill {session} on {host}"));
+            return false;
+        }
         self.toast(format!("killing remote session {session} on {host}"));
-        remote::spawn_kill(&host, &session);
+        remote::spawn_kill(Arc::clone(&self.ssh), &host, &session)
     }
 
     /// Palette "Kill Remote Session": kills the remote session of the focused
@@ -1173,9 +1231,10 @@ impl AppState {
             self.toast("no remote session in active pane");
             return;
         };
-        self.kill_remote_pane(tab, pane);
-        self.close_active();
-        self.toast(format!("killed remote session {session} on {host}"));
+        if self.kill_remote_pane(tab, pane) {
+            self.close_active();
+            self.toast(format!("killed remote session {session} on {host}"));
+        }
     }
 
     /// Session manager `k`: kills every remote daemon the named session owns,
@@ -1183,7 +1242,9 @@ impl AppState {
     ///
     /// The daemons are killed over fresh ssh connections, so this works when the
     /// panes are dead or the daemons are wedged; a session whose panes are ALL
-    /// remote is removed, while a mixed one keeps its local tabs.
+    /// remote is removed, while a mixed one keeps its local tabs. The bindings
+    /// come out of a session file here, so they are rederived from their host
+    /// first and anything that does not check out is skipped.
     pub fn kill_session_remotes(&mut self, name: &str) {
         let (specs, pure) = if name == self.current_session {
             (
@@ -1201,25 +1262,35 @@ impl AppState {
             return;
         }
         let hosts = remote::dedupe_hosts(specs);
-        for (host, session) in &hosts {
-            remote::spawn_kill(host, session);
+        let (valid, refused): (Vec<(String, String)>, Vec<(String, String)>) = hosts
+            .into_iter()
+            .partition(|(host, session)| remote::binding_is_valid(host, session));
+        if valid.is_empty() {
+            self.toast(format!(
+                "no killable remote sessions in {name}: {} refused",
+                refused.len()
+            ));
+            return;
         }
-        let on = hosts
+        for (host, session) in &valid {
+            remote::spawn_kill(Arc::clone(&self.ssh), host, session);
+        }
+        let on = valid
             .iter()
             .map(|(host, _)| host.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        if name != self.current_session && pure {
+        if name != self.current_session && pure && refused.is_empty() {
             ghostwave::session::delete(name);
             crate::ui_session::refresh_picker(self);
             self.toast(format!(
                 "killed {} remote session(s) on {on}, removed {name}",
-                hosts.len()
+                valid.len()
             ));
         } else {
             self.toast(format!(
                 "killed {} remote session(s) on {on}",
-                hosts.len()
+                valid.len()
             ));
         }
     }
@@ -1328,22 +1399,22 @@ impl AppState {
         }
     }
 
-    /// Forks a pane running `program`/`args`, optionally bound to a durable
-    /// remote session.
-    fn remote_pane(
-        &self,
-        program: Option<&str>,
-        args: &[&str],
-        remote: Option<RemoteSpec>,
-    ) -> Result<SharedPane> {
+    /// Forks a pane running the ssh `argv`, optionally bound to a durable remote
+    /// session.
+    ///
+    /// Which program that is comes from the ssh seam, so a test can substitute a
+    /// stand-in for `ssh` and no unit test dials a host.
+    fn remote_pane(&self, argv: &[String], remote: Option<RemoteSpec>) -> Result<SharedPane> {
+        let (program, args) = self.ssh.pane_command(argv);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let pane = Pane::spawn_program(
             REMOTE_COLS,
             REMOTE_ROWS,
             self.cell,
             self.config.scrollback,
             self.config.max_log_mb * 1024 * 1024,
-            program,
-            args,
+            Some(program.as_str()),
+            &args,
             None,
             remote,
         )?;
@@ -1373,20 +1444,28 @@ impl AppState {
     }
 
     /// Starts the background upload of `host`'s ghostd binary, unless it is
-    /// already known good.
+    /// already known good or an upload for that host is already in flight.
     ///
     /// The result arrives on the upload channel and is drained by the tick, which
-    /// is what keeps running while an upload is in flight.
+    /// is what keeps running while an upload is in flight. One upload per host at
+    /// a time is what keeps two panes — or a manual reconnect racing the first
+    /// connect — from writing the same remote binary concurrently.
     fn ensure_remote_binary(&mut self, host: &str) {
-        if self.binary_ready.contains(host) {
+        if !remote::host_is_valid(host) {
+            remote::dbg(format!("upload {host}: not an ssh destination, not starting one"));
+            return;
+        }
+        if self.binary_ready.contains(host) || !self.uploads_pending.insert(host.to_string()) {
             return;
         }
         let tx = self.remote_upload_tx.clone();
+        let ssh = Arc::clone(&self.ssh);
         let host = host.to_string();
         self.uploads_in_flight += 1;
         std::thread::spawn(move || {
-            let ok = remote::upload_ghostd(&host);
-            let _ = tx.send((host, ok));
+            let mut report = UploadReport::new(host, tx);
+            let ok = remote::upload_ghostd(ssh.as_ref(), report.host());
+            report.report(ok);
         });
     }
 
@@ -1394,6 +1473,7 @@ impl AppState {
     /// lets its waiting panes connect, a host that failed leaves them manual.
     fn drain_remote_uploads(&mut self) {
         while let Ok((host, ok)) = self.remote_uploads.try_recv() {
+            self.uploads_pending.remove(&host);
             self.uploads_in_flight = self.uploads_in_flight.saturating_sub(1);
             if ok {
                 self.binary_ready.insert(host.clone());
@@ -1550,6 +1630,72 @@ mod tests {
 
     fn ready(hosts: &[&str]) -> HashSet<String> {
         hosts.iter().map(|host| host.to_string()).collect()
+    }
+
+    /// A workspace whose ssh seam is a recorder, so the upload and kill paths can
+    /// be asserted on without dialing anything.
+    fn recorded_workspace() -> (AppState, Arc<crate::remote::testing::FakeSsh>) {
+        let mut state = workspace();
+        let ssh = Arc::new(crate::remote::testing::FakeSsh::default());
+        state.ssh = ssh.clone();
+        (state, ssh)
+    }
+
+    #[test]
+    fn a_host_uploads_its_binary_once_while_the_first_upload_is_in_flight() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, ssh) = recorded_workspace();
+
+        state.ensure_remote_binary("prod");
+        state.ensure_remote_binary("prod");
+
+        let calls = ssh.wait_calls(1, std::time::Duration::from_secs(5));
+        assert_eq!(calls.len(), 1, "the second request joined the first: {calls:?}");
+        assert!(
+            state.remote_activity(),
+            "an upload in flight is what keeps the front-end ticking"
+        );
+    }
+
+    #[test]
+    fn a_host_can_upload_again_after_its_upload_failed() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, ssh) = recorded_workspace();
+        ssh.scripted.lock().unwrap().push_back(crate::remote::SshOutcome {
+            status: Some(255),
+            timed_out: false,
+            stdout: Vec::new(),
+        });
+
+        state.ensure_remote_binary("prod");
+        ssh.wait_calls(1, std::time::Duration::from_secs(5));
+        // The report is sent by the upload thread after its last call returns, so
+        // give the channel a bounded chance to deliver it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state.uploads_pending.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            state.drain_remote_uploads();
+        }
+
+        assert!(state.uploads_pending.is_empty(), "the upload reported back");
+        assert!(!state.binary_ready.contains("prod"), "the failed host is not ready");
+        assert!(!state.remote_activity(), "and nothing is left in flight");
+
+        state.ensure_remote_binary("prod");
+
+        let calls = ssh.wait_calls(2, std::time::Duration::from_secs(5));
+        assert_eq!(calls.len(), 2, "the host is not stuck in flight: {calls:?}");
+    }
+
+    #[test]
+    fn a_host_that_is_not_an_ssh_destination_is_never_uploaded_to() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, ssh) = recorded_workspace();
+
+        state.ensure_remote_binary("prod'; rm -rf ~; '");
+
+        assert!(ssh.calls().is_empty(), "no ssh was opened: {:?}", ssh.calls());
+        assert!(!state.remote_activity(), "nothing is in flight either");
     }
 
     /// A tab holding one DISCONNECTED remote pane for `host`, built without a

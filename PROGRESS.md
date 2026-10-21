@@ -1283,3 +1283,115 @@ merge-base. Not merged and not pushed — the merge is the owner's call.
   `folio_wait_bit_common` and the loopback `juicefs` daemon was the only busy process on the box.
   Root was at 96 % the whole time and the mount runs `--free-space-ratio 0.15`, so the write-back
   cache was throttled throughout — expect the same wall-clock for any future full-suite run here.
+
+### Remote/SSH hardening after the security gate (branch `wt/remote-ssh-secfix`)
+
+Stage 5 (audit card `t_f1f2aac0`) tripped on the ported remote subsystem and filed six findings;
+this branch answers them. Parity behaviour is unchanged: the same `sh -c '…'` wrapper, the same
+attach-with-`|| new` fallback, the same bounded reconnect pass, `k` still kills the daemon of the
+pane it is pressed in.
+
+Two of the six were injection paths into the remote login shell, so the fix is structural rather
+than escaping-at-the-last-minute:
+
+- **No host text in a remote command.** `attach_cmd`/`kill_cmd` used to interpolate `host` into the
+  `sh -c` payload (a host with a `'` closed the wrapper). The host is now an argv element of the
+  local `ssh` and nothing else, and it must pass `ghostwave::term::host_is_valid` — the documented
+  destination forms (alias, `user@host`, `host:port`, `[v6]:port`, `ssh://user@host:port`) are
+  accepted, whitespace and shell metacharacters are not. `connect_ssh`/`connect_durable_ssh` toast
+  and open nothing for a host that fails it.
+- **The stored session name is derived data.** `RemoteSpec` no longer deserializes `session`
+  verbatim: a hand-written `Deserialize` rederives it from `host` (`ghostwave::term::remote_session`),
+  so a session file can not name what a later command line or `pkill` pattern contains.
+  `remote::binding_is_valid(host, session)` gates every binding that did not come out of this
+  process — the pane kill and the session-manager `k` both refuse instead of sending. The name is
+  also quoted as data (`dquoted`) in both commands.
+- **The orphan sweep is anchored and literal.** `pkill -9 -f "ghostd-$(uname -m) new <name>"`
+  matched a regex against any command line, so the `.` in a generated name also matched `-`
+  (`ghostwave-prod.example` vs `ghostwave-prod-example` = a different session's daemon, SIGKILLed).
+  The pattern is now `(^|/)ghostd-[^ ]* new <escaped name>($| )`: the name is escaped to a literal
+  and the match is pinned to a `ghostd …` invocation whose `new <name>` argument ends or is followed
+  by the next argument. The pidfile kill (`ghostd kill <name>`, TERM then KILL on daemon + child
+  group) remains the primary path.
+- **Unit tests do not dial.** `remote::SshRunner` is the seam: `SystemSsh` execs ssh, tests inject
+  `remote::testing::FakeSsh`, which records (host, command, stdin length) and answers from a script.
+  The pane's own program comes from the same seam (`pane_command`), so `ds`/`ssh` tests fork a local
+  stand-in rather than a real `ssh` to 127.0.0.1, and the `k` test no longer runs the remote sweep on
+  the test machine. The command lines themselves are exercised through a real POSIX shell
+  (`sh -c` exactly as a remote login shell parses them) against a stub `ghostd` in a throwaway
+  `$HOME`.
+- **Uploads are per-host and verified.** `AppState::ensure_remote_binary` keeps an in-flight set, so
+  a second request for a host joins the first instead of starting a second upload; each upload
+  writes a unique remote temp (`ghostd-<arch>.new.<pid>.<n>`) and publishes it with one `mv -f`, so
+  the old binary survives a dropped connection, and the install only counts once the remote reports
+  the version just sent. `UploadReport` (Drop-guarded) guarantees the front-end hears back even if
+  the upload thread panics — the old code could leave `uploads_in_flight > 0` forever and pin
+  `tick_rate` at Slow.
+- **Every ssh child has a deadline and a cap.** `ConnectTimeout` bounds only the connection, so
+  `run_bounded` gives each command an overall deadline (15 s; 120 s for an upload), signals it on
+  expiry and reaps it before returning; a process-wide `SlotPool` holds at most 4 ssh children, so
+  repeated kills against a hung host queue instead of accumulating.
+
+### Font query answered: xterm's `OSC 50` (branch `wt/t_c989ef4e`)
+
+The card asked for "the font query (**OSC 12**)" so that `fastfetch` would show ghostwave's real
+font. Both halves are wrong, and the premise was corrected before any code was written
+(`PLAN.md` §0, reviewed and approved at stage 2):
+
+- **OSC 12 is the cursor colour**, not a font (ghostty.org docs map `n=12` to *Cursor color*). The
+  pinned VT answers it itself through `on_pty_write` — `term.rs`'s own
+  `terminal_responds_to_probes` test relies on that — so a second reply would break colour
+  queries for every program.
+- **`fastfetch` never sends an OSC font query on Linux.** Its only escape-sequence font path is
+  `XTGETTCAP` inside `detectKitty()`, gated on the terminal's process name being `kitty`; a
+  ghostwave pane falls through to `Unknown terminal: ghostwave` in the `terminalfont` module, and
+  the "Noto Sans" comes from the separate `font` module's fontconfig path. No escape sequence a
+  terminal emits can change either: making `fastfetch -c examples/N.jsonc` print the real font
+  needs an upstream `ghostwave` matcher entry, which is hermz's call and out of scope here.
+
+What was actually missing, and is now built, is the real xterm font *query*. A program writes
+`ESC ] 50 ; ? ST` (or `BEL` for `ST`) and gets `ESC ] 50 ; <family> <same terminator>` back.
+
+- **Traced inbound path** (unchanged by this work): pty reader thread →
+  `PtyMsg::Data` → live iced path `main.rs` `Message::Output` → `Pane::ingest`
+  (`src/pane.rs`) → `vt_write`; and the prime/restore path `TermPane::poll_pty`
+  (`src/term.rs`) → `vt_write`, drained by `prime_pty`. Both hooks now run the scanner
+  first: `self.term.scan_queries(data)` before `vt_write`, and `ingest` additionally calls
+  `flush_response()` — the iced path had no response flush of its own, and a font reply is
+  useless sitting in a buffer.
+- **`src/font_query.rs`** (new, std only, house pattern of `program_status.rs`): `Scanner::feed`
+  keeps state across chunks so a query split by the reader is answered once; retains at most 64
+  body bytes, so an OSC 8 hyperlink or a clipboard payload is abandoned rather than buffered; and
+  answers **only** the exact body `50;?` — `50;<font>` (xterm's *set* command) and every other OSC
+  are ignored. The VT parses no OSC 50 at all, so nothing double-replies.
+- **The family is never hardcoded**: `TermPane` captures `ui_fonts::active_family()` once at
+  construction (`Config.font_family` → `ui_fonts::init` → `ACTIVE_FAMILY`, fallback "JetBrains
+  Mono"), so a pane answers what the app is actually configured to use.
+- **`ui_fonts` moved into the library crate** (`src/lib.rs`), because `TermPane` lives there and
+  the binary-crate module was unreachable from it — the compile-blocking gap stage 2 found and
+  carried as amendment A1. `main.rs` now does `use ghostwave::ui_fonts;`, and the `crate::ui_fonts`
+  paths in the bin modules resolve to that alias.
+- **Not touched, deliberately**: `session::replay_pane_log` writes straight into the VT, so
+  replayed history never reaches the scanner (answering a recorded query would inject replies into
+  a fresh shell); `src/input.rs`, `libghostty-vt`, and every other dependency are untouched.
+- **Suite**: green through the build gate — 218 tests (baseline on this base was **211**, not the
+  216 the plan assumed: lib 50 + bin 154 + 1 + 6; the 3 `ui_fonts` tests moved with the module
+  from the bin target to the lib target). Seven new tests: six in `font_query::tests` and
+  `term::tests::pane_answers_the_font_query`.
+- **Not exercised by hand**: the end-to-end check needs the GUI — in a ghostwave pane,
+  `printf '\033]50;?\033\\'; timeout 1 cat -v` should print `^[]50;JetBrains Mono^[\` (or the
+  configured family). That is `NEEDS-VULCAN:`, not a stage-3 acceptance.
+
+### Branch hygiene: bring a branch forward onto `master` *before* review is requested (card `t_750774cc`)
+
+The two PRs that produced this rule are PR #16 (`wt/t_2a5f5dab`, frames on shared pane edges) and
+PR #17 (`wt/t_c989ef4e`, the OSC 50 font-family sanitise above): #16 was merged as `46c1ce1`, then
+PR #15 as `c8b7404`, and by then PR #17 no longer merged — it was closed without merge at
+2026-10-20 23:57 with `mergeable: false`, its whole fix stranded off `master`. The conflicts were
+mechanical (`PLAN.md` add/add, `PROGRESS.md` both-sides-added; `src/term.rs` auto-merged), i.e. they
+were purely drift, and drift is fixable at any time — *before* a human spends a review, not instead of
+one. So, from card `t_750774cc` on: **a branch is brought forward onto the current `origin/master`
+and its `mergeable` flag is checked (`GET /api/v1/repos/death916/ghostwave/pulls/<n>`) before a
+review is requested**; if `master` moves while a PR is open, the branch comes forward again before
+the next card touches it. Rebase or merge is the author's choice — the rule is only that it happens
+and that the resulting tree was verified, never that the reviewer should discover the conflict.
