@@ -10,6 +10,20 @@ Repo: ghostwave (iced front-end + core lib). Base commit: `1a08166`.
 > the command pane when typing durable. and 2 it should show in the session list if its durable or not by a
 > label or highlight or something else
 
+### 0.1 Owner follow-up (2026-10-21, after the first plan revision)
+
+> sorry the ds command does work jsut needs to be more obvious
+
+This settles the one thing the plan had left open and narrows the job to discoverability:
+
+- `ds <host>` already produces a durable session — its behaviour is **not** changed by this plan (§3 D3 keeps the
+  `ds ` item byte-identical; §4.4 requires the existing `dynamic_ds_prefix` test to pass unmodified).
+- The failure was that nothing in the palette or the session list made the difference *visible*: `ssh orac` and
+  `ds orac` looked the same, and a durable session was badged `ssh`. So the work is labels + the durable
+  inventory, which is what §3 D3/D5/D6 do.
+- Consequence for §7: the owner has now said the two commands stay; this plan must not re-litigate that. §7 is
+  closed as "keep both, make durable obvious".
+
 ## 1. Root cause (verified by reading the code, not assumed)
 
 Two independent defects, one per numbered want.
@@ -41,6 +55,8 @@ In scope: `src/session.rs`, `src/sessions_overlay.rs`, `src/ui_session.rs`, `src
 NOT done (each is a real gap, called out so review does not read silence as coverage):
 
 - no ghostd change, no daemon protocol change;
+- no change to what any existing command *does*: `ds <host>` and `ssh <host>` keep their exact behaviour and
+  their existing palette titles (owner, §0.1) — this card is labels + inventory only;
 - no new on-disk file/format: no "known hosts" history (see D1 for why);
 - no auto-connect on restore — `remote.rs`'s invariant ("a remote pane is never auto-connected on restore") holds;
 - no change to `PaneState` / `RemoteSpec` / session JSON: files stay readable by older builds;
@@ -119,6 +135,8 @@ the existing session instead of stacking a duplicate (`src/remote.rs:70-79`), an
 ## 4. Ordered work items (stage 3 executes these in this order)
 
 1. `src/session.rs` — add `RemoteKind`, `remote_kind`, `all_remote_specs`, `has_remote` on top of `remote_kind`.
+   `all_remote_specs` is a thin fan-out over the **existing** `session::remote_specs(name)` (`src/session.rs:157`,
+   today per-session, used by the manager's kill path) over `list()` — reuse it rather than re-walking the JSON.
    Tests (in the existing `mod tests`, which runs against the real data dir with unique names + cleanup —
    see §6 Risks): `a_durable_pane_makes_the_session_durable`, `a_plain_ssh_pane_is_ssh_and_not_durable`,
    `neither_pane_kind_is_neither` (`remote_kind` → `None`), `all_remote_specs_lists_a_durable_binding`
@@ -194,8 +212,9 @@ bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --a
 - Badge colour choice reuses existing theme roles (`search_match`, `tab_inactive_text`), so no theme file,
   `Config` or `Theme` change is needed and themes without the role cannot regress.
 
-## 7. Open question for the owner (not blocking this card)
+## 7. The `ssh` question — closed by the owner (§0.1)
 
-Should plain `ssh <host>` stay available at all, or should the palette's `ssh` item become "durable by default"
-with the plain one demoted to `ssh-plain <host>`? This plan keeps both commands (it only labels them), because
-changing the default of an existing command is the owner's call, not a worker's.
+Both commands stay: `ssh <host>` keeps spawning a plain ssh pty, `ds <host>` keeps spawning the durable one.
+The plan only *labels* them and offers the durable twin next to a plain `ssh <host>` when a durable session for
+that host is already known (§3 D3). No command is renamed, removed, or made durable by default, and no
+`ssh-plain` alias is introduced — the owner has explicitly said `ds` works and the gap is discoverability.
