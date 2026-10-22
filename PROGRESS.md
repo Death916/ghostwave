@@ -1443,3 +1443,75 @@ nothing.
   at `font_size 12` / `padding 6` the only intended visible change is the search marker moving
   1.2 px right (canvas-local `−1.2 → 0`); at `font_size ≥ 17` its orange gutter marker must stop at
   the pane's edge instead of sitting on the stroke.
+
+---
+
+## Durable sessions: a killed session stays dead (`t_6abf6154`)
+
+A durable pane could not let go of a session. The daemon replayed a dead session's log into a
+brand-new one; `new` over a wedged daemon left the old daemon alive, because the pidfile has been two
+lines since the child pid was added and `recover_session`'s single-line parse always failed; every
+daemon deleted any other's `<name>.sock`/`.pid` unconditionally; a stale socket made a name
+uncreatable in silence; and the pane's script could not tell "no session" from "the session ended",
+so it recreated a killed session. All seven findings with their code anchors and measured
+reproductions are in `PLAN.md` §0, the change set in §2 C1–C6, and the ordered work in §9.
+
+**Measured after the change** — native `ghostd/debug/ghostd`, every session in a throwaway
+`GHOSTWAVE_STATE_DIR` (the owner's two live sessions on this host, `ghostwave-orac` and
+`ghostwave-death916orac`, were never touched; no `kill-all` ran outside a scratch dir):
+
+- **App suite 273 → 274 passed / 0 failed / 0 ignored** (76 lib + 191 bin + 1 + 6); the base was
+  measured on `a91a1a8` through the build gate. The new test is
+  `remote::tests::a_pane_creates_the_session_only_when_attach_says_it_is_missing`: it drives the real
+  script against a stub `ghostd` for rc 0/1/3/4 — 1 and 3 create and re-attach, 0 and 4 create
+  nothing, and a session that ended (4) is a **clean** exit — plus the busy shape
+  (`attach_rc = 1`, `new_rc = 1`, exactly what `new` does when its probe answers `Healthy`), which
+  must leave the script's status **1** so the pane's auto-reconnect retries.
+- **`ghostd` suite 0 → 7 passed / 0 failed** — 2 lib tests (`read_pidfile` on a two-line, one-line
+  and garbage file; removal only by the owner) plus 5 in the new `ghostd/tests/lifecycle.rs`: no
+  replay of a killed session's log, `new` recovers a `SIGSTOP`ped daemon and leaves exactly one
+  daemon with a client able to attach, an ended session reports **4** while a name with no session
+  still reports **1**, a kill leaves no `.sock`/`.pid`/`.log`, and the busy pin
+  (`a_busy_attach_is_not_reported_as_ended`) holds busy at **1** with the pidfile and log
+  byte-identical and the first client still relaying — green before the change by design, a pin.
+- **`cargo clippy --all-targets` rc 0 in both crates**, no new warning in either touched file (the
+  six `ghostd` ones and the two `src/remote.rs` ones are pre-existing).
+- **The seven §5 end-to-end checks** against the native debug daemon: kill → `new` shows the new
+  client **nothing** of the dead session and the log is gone with its daemon; `SIGSTOP` → `new` kills
+  the wedged daemon, leaves one daemon and a client attaches; a session killed under the pane's own
+  script makes the script **exit 0** with no session recreated; a typed `exit` leaves no daemon and no
+  state; `kill -9` → `new` binds fresh over the stale socket; and busy keeps the second attach at
+  **1** with the pidfile and log unchanged, the first client still relaying, and the pane script
+  exiting **1** without creating anything.
+
+Two things measured during implementation that the plan's wording did not anticipate, both handled:
+
+- **The busy refusal is sometimes delivered as `ECONNRESET`, not a clean EOF.** The daemon writes the
+  refusal and closes while the client's `SIZE` line is still unread, so the client's relay read
+  returns `ECONNRESET`. Treating that the way the old code did (a clean exit) would hand a *live*
+  session the ended fate and zero retries, so a reset now takes the same decision as an EOF: **1**
+  without the `OK\n` ack (busy → retried), **4** with it.
+- **The log goes when its daemon goes**, not only on `ghostd kill`: a session that ends by itself
+  (its program exits) leaves nothing behind either. Only state the daemon still owns is removed, so a
+  successor that took the name keeps its own files and its own log. **An `attach` to a live session
+  still replays everything** — truncation happens only in `new`, after the probe has refused a healthy
+  session, and that is the one behaviour change worth naming: history is replayable only while its
+  daemon lives.
+
+**No host behaves differently until the assets are rebuilt.** The daemon that runs on a host is the
+embedded `assets/ghostd-*` binary (`include_bytes!` in `src/remote.rs`), and the app re-uploads it only
+when `$BIN --version` differs from its own — so this source change is inert everywhere until both
+manifests move to **0.1.4** in the same commit as rebuilt `assets/ghostd-x86_64` and
+`assets/ghostd-aarch64` (`scripts/build-ghostd.sh both`, which needs an x86_64 host with the hosted
+1.86.0 toolchain the script fetches itself). That rebuild is the `NEEDS-VULCAN:` follow-up card.
+Bumping the version with a stale asset would brick every durable pane with "ghostd missing/stale —
+reconnect to upload", which is why neither the version nor `assets/` is touched here.
+
+`NEEDS-OWNER-VERIFY` (the ssh hop): `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+localhost true` → `death916@localhost: Permission denied (publickey).`, rc 255. sshd **does** listen
+(`ss -tln` → `LISTEN 0.0.0.0:22` and `[::]:22`, `openssh-10.5p1 [listener]`), it is publickey-only,
+and `~/.ssh/authorized_keys` does not exist (`~/.ssh` holds `hermes_ed25519`, `hermes_ed25519.pub`,
+`known_hosts`, `agent/`). Every check above therefore ran on this host directly, not over ssh; the
+assumption that `ssh -t … sh -c` returns the remote status as the pane's exit code is unchanged code
+(`remote.rs`'s `last_exit_code`) and unverified here. To make the hop verifiable on orac: append
+`~/.ssh/hermes_ed25519.pub` to `~/.ssh/authorized_keys`.

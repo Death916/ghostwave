@@ -1196,3 +1196,453 @@ The honest statement stays, and is repeated in §5's `NEEDS-OWNER-VERIFY` and in
    canvas-local (`−1.2 → 0`)?
 5. **Standing:** §1.1's four rows, §1.2's table, §3's two changes, §4's RED/GREEN expectations, the
    scope in §7, and the no-clip finding that decides against `with_clip`.
+
+---
+
+# PLAN — a killed durable session must not come back (`t_6abf6154`)
+
+Card: `t_6abf6154` · repo `/home/death916/code/ghostwave` · branch `wt/t_6abf6154` off `master` `a91a1a8`.
+Base suite, measured on this tree: **273** test functions (`grep -rh '^\s*#\[test\]' src/ | wc -l` = 266,
+`tests/` = 7, `#[ignore]` = 0). The `ghostd` crate has **0** tests.
+This is a stage-1 card: the only file it changes is `PLAN.md`.
+
+## 0. The report, and how it was reproduced
+
+> "starting a new durable session to a host that had a previously killed one still tries to re attacth
+> and replay old session. kill remote session doesnt work properly and spawning a new one jsut goes to
+> the old stuck one"
+
+All three sentences reproduce **locally, with no ssh and no remote host**: the shipped static daemon
+(`assets/ghostd-aarch64`, `ghostd 0.1.3`) driven directly, with `GHOSTWAVE_STATE_DIR` pointed at a
+throwaway directory. The scripts are `repro2.sh`, `repro3.sh`, `repro5.sh`, `repro6.sh`, `repro8.sh` in
+`~/.hermes/profiles/dev/cache/scratch/ghostd-repro/` — evidence for this plan, not part of the diff.
+
+The shipped asset **is** built from this tree (`grep -c -a "wedged daemon" assets/ghostd-aarch64` = 1,
+same for `busy: another client is attached`), so what is measured here is the code in `ghostd/src`.
+
+Seven findings. Each is a mechanism read out of the code *and* an output block from a run.
+
+### F1 — a new session replays the dead session's output
+
+`main.rs:52` opens the log `create(true).append(true)`; `main.rs:205-219` replays the whole file to every
+new client; nothing truncates it on `new`, and `cmd_kill` (`main.rs:525-564`) never removes it.
+
+```
+=== 1. fresh session s1, one command, then detach
+--- log size: 370        --- marker in the log? 2
+=== 2. ghostd kill s1  → ghostd: killed 's1'
+--- state dir: s1.log                     ← the log outlives the daemon
+=== 3. ghostd new s1 (a NEW session) then attach
+--- bytes the brand-new session showed its first client: 528
+--- does it contain the killed session's marker? 2
+```
+
+### F2 — `recover_session` never kills the wedged daemon
+
+`lib.rs:112-127`: `read_to_string(pid_file)` then `pid_str.trim().parse::<i32>()`. The pidfile has been
+**two lines** since the child pid was added (`main.rs:48-51`), so `trim()` yields `"2182633\n2182635"`,
+the parse always fails, and the whole body is skipped — no SIGTERM, no SIGKILL. All it does is unlink the
+socket and pidfile, i.e. it forgets a live daemon instead of killing it.
+
+```
+=== D3.2 new s2 over the wedged daemon
+[ghostd:probe] s2: no response in 2s -> Unresponsive
+[ghostd:new] s2: wedged daemon — recovering
+--- old daemon after the recovery: alive          ← it was never signalled
+--- new pidfile daemon=2182774                    ← a second daemon now owns the name
+--- after killing s2, is the old daemon STILL alive? alive
+```
+
+### F3 — state files are removed by *name*, not by owner
+
+`main.rs:133-134` (accept-loop cleanup), `main.rs:561-562` (`cmd_kill`) and `lib.rs:128-129`
+(`recover_session`) all `remove_file(socket_path(name))` / `pid_path(name)` unconditionally — any of them
+deletes whichever daemon currently owns that name, not the one that wrote the files.
+
+```
+=== attach exited rc=1
+=== new exited rc=0            ← the pane re-created the session (F4)
+=== state dir: s7.log          ← the dying old daemon unlinked its successor's sock+pid
+--- orphan daemon 2185083: alive
+--- ghostd kill s7 → ghostd: no session 's7'   exit=1
+--- orphan daemon after ghostd kill: alive     ← unreachable and unkillable by the CLI
+```
+
+### F4 — the pane's script cannot tell "no session" from "session ended"
+
+`remote.rs:191-194` builds `"$BIN" attach {s} 2>/dev/null || { "$BIN" new {s} >/dev/null 2>&1 && exec
+"$BIN" attach {s}; }`, and `cmd_attach` exits **1** for every failure (`main.rs:375`, `:426`, `:433`,
+`:481`). So a session that just *ended* — killed, or its shell exited — is re-created by the pane itself.
+Measured twice: on `ghostd kill` (above) and by typing `exit`:
+
+```
+=== F4b.1 daemon=2187979; log before: 186 bytes   (typed: echo MARKER-BEFORE-EXIT, then exit)
+=== F4b.2 s8 is BACK: old daemon 2187979 (dead), new daemon 2188104 (alive)
+          log now: 633 bytes, MARKER-BEFORE-EXIT x2
+```
+
+A durable remote shell cannot be exited, and a killed session is immediately re-created.
+
+### F5 — a liveness probe counts as an attach (found, not a symptom of this card)
+
+`main.rs:77-84` sets `ever_attached = true` on `accept()`, before the SIZE handshake, so any probe
+defeats the first-attach safeguard: `new s5 --first-attach-secs 3`, one probe, `sleep 5` →
+`--- s5 daemon after the deadline (must be dead): alive`. Fixing it needs a protocol verb; see §9.
+
+### F6 — a stale socket file makes the name permanently uncreatable, silently
+
+`main.rs:358-364` calls `daemonize()` and then `UnixListener::bind(&sock)` — never
+`ghostd::bind_listener` (`lib.rs:416-432`), the function that exists to clear a socket which refuses
+connections. `bind_listener` is called from nowhere (`grep -rn bind_listener` → its definition only). And
+because the parent has already exited 0, the child's bind failure is printed to `/dev/null` and lost.
+
+```
+=== SIGKILL the daemon; state left: s10.log s10.pid s10.sock
+--- new s10 exit=0  (no output)
+--- daemons named s10: 0 process(es)      ← new said "ok", no daemon exists
+--- a client attaching: exit=1  ghostd: no session 's10'
+```
+
+### F7 — `kill` reports success it never verified
+
+`main.rs:545-563` SIGKILLs and removes the state files without re-checking that the daemon died; the
+shell side (`remote.rs:236-241`) ends with `|| true; true`, so the ssh child exits 0 even when nothing
+was killed; `spawn_kill` (`remote.rs:418-437`) discards the outcome and the toast is unconditional
+(`app.rs:1220`, `:1236`). The mechanism is fixed below (F2/F3 make a surviving daemon detectable); the
+truthful toast is §9.
+
+## 1. One root cause
+
+A durable session's identity is a **name**, and its state (`<name>.sock`, `<name>.pid`, `<name>.log`) is
+treated as belonging to the name rather than to the daemon instance that owns it. Nothing records "which
+daemon wrote this", so (a) a new daemon inherits a dead one's log, (b) a wedged daemon cannot be killed
+because the function that should kill it cannot parse the file that names it, (c) any daemon can delete
+any other's state files, (d) a stale socket blocks the name forever, and (e) the pane cannot distinguish
+"create the session" from "the session ended". Fix them as one idea — *state belongs to the daemon that
+wrote it, and the daemon says why a connection failed* — not as seven patches.
+
+## 2. The change set (stage 3 executes these; order = commit order)
+
+### C1 — the log belongs to its daemon (`ghostd`, F1)
+* `cmd_new`: **after** the probe (so a healthy session is never touched) and **before** binding, truncate
+  the log: `let _ = fs::write(log_path(name), b"");` — with one `eprintln!` line when it discarded a
+  non-empty log. A `new` session starts with no history.
+* `cmd_kill`: after the daemon is confirmed dead, `let _ = fs::remove_file(log_path(name));`.
+* Doc on both: replay is only ever the history of the daemon that is attached to; a session no daemon
+  holds has nothing to replay.
+
+### C2 — `recover_session` parses, kills and verifies (`ghostd`, F2)
+Replace `lib.rs:110-130` with a `-> bool` ("the old daemon is gone"):
+* read the pidfile through the new `read_pidfile` (below); no pidfile → `false` (nothing that names a
+  victim — the caller reports it, it does not guess);
+* `SIGTERM`, 1 s poll, `SIGKILL`, then `!pid_alive(daemon)` as the verdict;
+* kill the recorded child's process group (`kill_child_group`, 2 s) — a killed daemon must not orphan the
+  session's program (this is what `cmd_kill` already does at `main.rs:558-560`);
+* remove the state only if the daemon is confirmed dead **and** the pidfile still names it (C3).
+* `cmd_new` calls it and **dies** when it returns `false`:
+  `die("'{name}' is held by a wedged daemon that will not die — kill it by hand")`. Never bind a second
+  daemon over a live one.
+
+### C3 — state files are removed only by their owner (`ghostd`, F3)
+New in `lib.rs`, all `pub` and doc'd:
+* `read_pidfile(name) -> Option<(Pid, Option<Pid>)>` — first line is the daemon, second (optional) the
+  child; a file that does not parse is `None`.
+* `pidfile_names(name, daemon) -> bool` — the ownership test.
+* `remove_state_if_owned(name, daemon)` — removes `<name>.sock`/`<name>.pid` **only** when
+  `pidfile_names` is true.
+* `write_pidfile(name, daemon, child)` — write `<name>.pid.tmp`, then `rename` (a reader must never see a
+  half file; today `main.rs:48-51` writes 15 bytes non-atomically).
+* Call sites: accept-loop cleanup (`main.rs:133-134`) → `remove_state_if_owned(name, getpid())`;
+  `cmd_kill` and `recover_session` → remove only after a confirmed death, only if the file still names
+  that pid.
+* `cmd_kill` with no pidfile must **not** delete a socket that still accepts a connection (that daemon is
+  alive, it is just not named): try `UnixStream::connect`; connects → `eprintln!("'{name}' has no pidfile
+  but its daemon answers — kill it by hand")` + exit 1; refused → the socket is stale, remove it.
+
+### C4 — `new` binds before it daemonizes, through `bind_listener` (`ghostd`, F6)
+`main.rs:358-364` becomes: `let listener = bind_listener(name).unwrap_or_else(|e| die(&format!(...)));`
+**before** `daemonize()`, and the daemon then runs `accept_loop(listener, ...)` on the inherited fd
+(`daemonize` only forks — no exec — so the fd survives; the socket is `CLOEXEC` but nothing execs).
+Effects: a stale socket is cleared (that is what `bind_listener` is for), a live one is refused, and a
+bind failure reaches the caller with a real exit status instead of vanishing into `/dev/null`.
+
+### C5 — the daemon says *why* a connection failed (`ghostd`, F4)
+New constants in `lib.rs`, doc'd as the contract with `src/remote.rs`:
+
+| code | meaning | who returns it |
+|---|---|---|
+| `1` | there is no session (unchanged meaning — old app keeps working), **and, unchanged, a live session that is attached elsewhere (busy)** | `cmd_attach`: connect failed; busy: the refusal text as the handshake's first chunk (`main.rs:81`, `:441`) with **no `OK\n` seen**, so the relay's `Ok(0)` (`main.rs:481`) exits 1 |
+| `3` | the daemon holds the session but never answered (wedged) | `cmd_attach`, the 8 s handshake deadline (`main.rs:423`, exit at `:426-427`) |
+| `4` | the session exists but ended | `cmd_attach`: `Ok(0)` at the handshake (`main.rs:432-434`, the daemon accepted and closed before acking), and `Ok(0)` in the relay (`main.rs:481`) **after `OK\n` was seen** |
+
+**Busy stays on exit 1 — decided here, not later** (stage-2 D1; the codes are asset-locked, §6).
+Measured on this tree: the accept loop writes `busy: another client is attached\n` and returns, dropping
+the stream (`main.rs:78-82`, the write at `:81`); `cmd_attach`'s handshake takes that text as its first
+chunk and puts it in `out_buf` (`main.rs:438-441`, no `OK\n`), so the relay's first read is `Ok(0)` →
+`exit(1)` (`main.rs:481`) before any flush — the text reaches nobody. The pane's script then falls into its
+`|| { new … }`, which probes: `Probe::Healthy` → `die("…already exists")` (`main.rs:351`) → script exits 1 →
+`remote.rs:601` (`auto_reconnect && code != 0`) retries, bounded by `reconnect_attempts = 5`
+(`config.rs:84`, reset on success at `app.rs:1189`). So a transient overlap — a second app instance, or a
+manual `ghostd attach` held during a reconnect — self-heals, and busy **cannot** create a session or
+truncate the log, because C1's truncation sits *after* the probe. Mapping busy to 4 instead would hand a
+*live* session the fate of a dead one (clean exit → `Manual`, zero retries); 4 must mean "it ended, stop
+reconnecting" and nothing else. No new `eprintln!` for busy either: the pane discards the attach's stderr
+(`2>/dev/null`), and detecting the string in Rust would couple the client to the daemon's English text
+(§7.2).
+
+The discriminator for 4 is the handshake, and busy cannot fake it: on success the daemon sends `OK\n`
+(`main.rs:201`); on busy it *writes the refusal before dropping the stream* (`main.rs:81-82`), so a busy
+client's first handshake read yields that text, never `Ok(0)`. Implementation: record whether `OK\n` was
+seen. The relay's `Ok(0)` (`main.rs:481`) exits **4** only when it was (the session ended while we were
+attached — the reported symptom) and **1** when it was not (busy: retry, never create). The handshake's own
+`Ok(0)` (`main.rs:432-434`) stays **4** as planned: there the daemon accepted and closed before any ack, so
+the connection carried a session that is over; it is not the busy shape, which always delivers bytes first.
+
+### C6 — the pane creates only when the session is *missing* (`app`, F4)
+`remote.rs:188-198` becomes (same `sq`/`dquoted` shape, same version check first):
+
+```
+"$BIN" attach {session} 2>/dev/null; rc=$?; \
+if [ $rc -eq 1 ] || [ $rc -eq 3 ]; then \
+  if "$BIN" new {session} >/dev/null 2>&1; then "$BIN" attach {session} 2>/dev/null; rc=$?; fi; fi; \
+if [ $rc -eq 4 ]; then exit 0; fi; \
+exit $rc
+```
+
+* `exec` is dropped so the *second* attach gets the same translation — otherwise a session that ends
+  right after being created still reports 4 and the pane loops.
+* **4 → exit 0 is the app-side signal**: `remote.rs:601` reads `auto = auto_reconnect && code != 0`, so a
+  pane whose session ended is left disconnected (`Enter` reconnects). That is the whole reason a killed
+  session stays killed — no `app.rs` change is needed, and none is made.
+* **busy never enters this script as 4** (C5): it arrives as 1, the create branch runs, `new`'s probe
+  answers `Healthy` and `new` dies without binding or truncating, so the script's status stays 1 and the
+  pane's existing auto-reconnect retries it — the one path this card deliberately leaves as it is.
+* A dropped ssh still exits 255 → auto-reconnect is untouched.
+
+Doc comment on `attach_cmd` must state the contract: 1/3 create, 4 is an ending, nothing else creates,
+busy is 1 on purpose (probe-guarded, retried), and no `exec`.
+
+### C7 — journal
+`PROGRESS.md`: one entry, the seven findings in two or three sentences, the measured numbers, and the
+explicit "the daemon fixes reach no host until the assets are rebuilt" from §6.
+
+## 3. Wire compatibility (what this does to the owner's hosts *today*)
+
+| app | daemon | result |
+|---|---|---|
+| old (0.1.3) | old (0.1.3) | today's behaviour — the baseline the other rows are compared to |
+| new | new (0.1.4, §6) | the fix |
+| new | old (0.1.3, cached on every host) | **exactly today's behaviour** (no session → 1 → create; ended → 1 → create) |
+| old | new | the old app **downgrades the asset back to 0.1.3** before its first pane, so it lands in the "new app / old daemon" row above — today's behaviour |
+
+**How the `old | new` cell actually executes** (stage-2 D3). Not "the old script treats 4 as failure and
+creates" — that path cannot run. The old app's `ensure_remote_binary` (`app.rs:1453-1470`, skipped once
+`binary_ready` holds the host, `:1458`) calls `upload_ghostd` (`remote.rs:478-521`), whose `version_check`
+(`remote.rs:450-455`) fails against a 0.1.4 binary, so it re-uploads its **own embedded 0.1.3 asset** over
+it — a downgrade — and verifies it. From then on the old tab is talking to a 0.1.3 daemon and behaves like
+`old | old`. Where that upload does not happen (it failed, or the host was already marked ready), the old
+script's first act is still the version gate (`remote.rs:191-194`): `$($BIN --version)` ≠ the *app's*
+version → prints "ghostd missing/stale —
+reconnect to upload", **exit 1 before any attach** — which the pane reads as a failure and retries, never
+as a 4. So the cell's outcome ("today's behaviour") stands; the mechanism is the asset version, not the
+exit code. Two app versions alternating on one host therefore flip the cached binary's version back and
+forth under the running panes — pre-existing (both sides key on the same string, by design), not
+introduced here, and the reason the version must move in lockstep with the assets (§6).
+
+The version check at the top of `attach_cmd` (`$BIN --version` vs `ghostd {CARGO_PKG_VERSION}`) is what
+keeps the two sides in lockstep, and it is why **the version must not be bumped before the assets are
+rebuilt** — a bump with a stale asset would make every durable pane refuse to attach
+("ghostd missing/stale — reconnect to upload" forever).
+
+## 4. Tests
+
+`ghostd/tests/lifecycle.rs` (new file, 5 tests). Each test takes its own `GHOSTWAVE_STATE_DIR` under
+`std::env::temp_dir()` and holds a **process-wide `Mutex`** while it does — the env var is global and
+`set_var` is `unsafe` in edition 2024, so the safety comment goes on the lock. A `Drop` guard SIGKILLs
+the pids it recorded and removes its directory. Binaries come from `env!("CARGO_BIN_EXE_ghostd")`.
+
+| test | RED on `a91a1a8` | GREEN after |
+|---|---|---|
+| `a_new_session_does_not_replay_a_killed_ones_output` — new, attach-driver writes `echo MARKER`, kill, new, read `<state>/s.log` and one attaching client | log keeps the marker, client sees it (F1 measurement above) | log empty, client output has no marker |
+| `new_recovers_a_wedged_daemon_and_leaves_one_daemon` — new, `SIGSTOP` the daemon, `new` again | old pid alive, second daemon binding | `new` exit 0, old pid dead, pidfile line 1 is the new pid |
+| `a_session_that_ended_is_not_reported_as_missing` — attach a client, `ghostd kill` while attached | attach exits 1 | attach exits 4; `attach <no such name>` still exits 1 |
+| `a_kill_leaves_no_state_behind` — new, kill | `<name>.log` survives | no `.sock`/`.pid`/`.log`; a later `new` works with an empty log |
+| `a_busy_attach_is_not_reported_as_ended` — new; client A is a child `attach` whose stdin stays open (that is what makes the `client_tx` test at `main.rs:78` true), client B attaches | passes today (B exits 1) — a **pin, not a RED**: it exists so the exit-code refactor cannot quietly move busy onto 4 | B exits **1**, never 4; `<name>.pid` and `<name>.log` are byte-identical before and after, and A is still relaying (write a line to A's stdin, read it from its stdout) |
+
+`ghostd/src/lib.rs` unit tests (2): `pidfile_names_reads_the_two_line_file` (two lines, one line,
+garbage) and `state_files_are_removed_only_by_their_owner` (pidfile names 100; removal as 200 leaves both
+files, as 100 removes both).
+
+`src/remote.rs`: `StubRemote` (`remote.rs:1069-1105`) gains `attach_rc` and `new_rc` (its `attach`/`new`
+arms currently `exit 0` unconditionally), and one new test
+`a_pane_creates_the_session_only_when_attach_says_it_is_missing` asserts, for rc ∈ {1, 3} with `new`
+succeeding: `record.new` exists and the final status is the second attach's; for rc ∈ {0, 4}: no create,
+and the script's own status is 0 for 4. Its **busy-shape case** is the pin D1 asks for: `attach_rc = 1`
+with `new_rc = 1` (exactly what `new` does when its probe answers `Healthy` — `main.rs:351`) must leave the
+script's status **1**, so `remote.rs:601` auto-reconnects, and must not produce a status of 0. Two existing
+textual assertions change: `remote.rs:880-883` (`exec` is gone; the create is now conditional on rc) and the
+hostile-name test at `:1107-1126` (the stub's attach must exit 0 there, unchanged, and `injected` must
+still not exist).
+
+## 5. Verification (stage 3 runs these and pastes the real output)
+
+```bash
+export CARGO_TARGET_DIR=/var/build/ghostwave-t_6abf6154      # per card, never shared
+# 1. baseline, measured on a91a1a8 BEFORE the diff, and pasted with the after-run:
+grep -rh '^\s*#\[test\]' src/ | wc -l        # 266
+grep -rh '^\s*#\[test\]' tests/ | wc -l      # 7   → 273 test functions
+grep -rh '^\s*#\[test\]' ghostd/ | wc -l     # 0
+# 2. app suite — expect base + 1 passed / 0 failed / 0 ignored (273 + the one new test);
+#    the base number itself is taken from the run on a91a1a8 and pasted beside it
+bash ~/.hermes/scripts/build_gate.sh nix-shell --run 'cargo test 2>&1 | tail -20'
+# 3. daemon suite — expect 7 passed / 0 failed (5 lifecycle + 2 lib), 0 before
+bash ~/.hermes/scripts/build_gate.sh nix-shell --run 'cd ghostd && cargo test 2>&1 | tail -20'
+# 4. no new warnings
+bash ~/.hermes/scripts/build_gate.sh nix-shell --run 'cargo clippy --all-targets 2>&1 | tail -20'
+#    and, for the daemon:  cd ghostd && cargo clippy --all-targets
+```
+
+End-to-end, against a **native** build (`cd ghostd && cargo build` → `ghostd/target/debug/ghostd`), with
+`GHOSTWAVE_STATE_DIR` in the scratch dir. Every assertion below is one of the measured blocks in §0,
+re-run against the fixed binary; paste the raw output of each:
+
+1. kill → `new` → an attaching client sees **nothing** of the dead session (F1).
+2. wedged (`SIGSTOP`) → `new` → old daemon dead, exactly one daemon, a client can attach (F2/F3).
+3. attached → `ghostd kill` → the attach process exits **4**, and the pane script (driven with a stub
+   HOME holding the built binary) exits **0** without creating a session (F4/F7).
+4. `exit` typed in the durable shell → no new daemon appears (F4b).
+5. `kill -9` the daemon → `new` binds a fresh daemon and a client attaches (F6).
+6. after 3–5: `ls $GHOSTWAVE_STATE_DIR` — no `.log`, no `.pid`, no `.sock` left behind.
+7. busy: `new`, an attach held open, a second `attach` → the second exits **1** (not 4), the first still
+   relays, and `<name>.pid`/`<name>.log` are unchanged; the C6 script run against that state exits **1**
+   (the `new` it falls into dies with "already exists") so the pane retries, and **no** daemon or session was
+   created.
+
+**Never run any of this without `GHOSTWAVE_STATE_DIR` set.** Two of the owner's live sessions are running
+on this host (`ghostwave-orac`, `ghostwave-death916orac` — visible in `ps`); a bare `ghostd kill-all`
+would destroy them.
+
+## 6. Delivery — what stage 3 does NOT deliver (and why that is a separate card)
+
+The daemon that runs on a host is the **embedded static asset** (`include_bytes!("../assets/ghostd-…")`,
+`remote.rs:46-49`), and the app only re-uploads when `$BIN --version` differs from its own
+(`remote.rs:191-194`, `:450-455`). So every fix in `ghostd/src` is **inert on every host** until:
+
+* both manifests go to `0.1.4` (`Cargo.toml:3`, `ghostd/Cargo.toml:3`), **in the same commit** as
+* `assets/ghostd-x86_64` and `assets/ghostd-aarch64` rebuilt by `scripts/build-ghostd.sh both`
+  (`scripts/build-ghostd.sh:1-30`), and the app rebuilt to embed them.
+
+That cannot be done on orac, and the closest-looking workaround is a trap worth naming (stage-2 D4). The
+script's NixOS path is a **hosted x86_64 1.86.0 toolchain**: `RUST_VERSION="1.86.0"`
+(`scripts/build-ghostd.sh:21`), `nixos_setup` fetches and patchelf's `rustc`/`cargo` for
+`x86_64-unknown-linux-gnu` (`:71-77`), and `nixos_build` copies `rust-std-1.86.0-<target>` into **that
+toolchain's own sysroot** — `SYSROOT="$tc/rustc-1.86.0-x86_64-unknown-linux-gnu/rustc"` (`:61`), the copy at
+`:98-101` — then links with `$SYSROOT/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld` (`:110`). None of
+it can execute on `uname -m` = `aarch64`. The nix `rustc` here is **1.95.0**, measured in this repo:
+`nix-shell --run 'rustc --version'` → `rustc 1.95.0 (59807616e 2026-04-14)`, sysroot
+`/nix/store/8865lxjk610n0n0sjsgf11599gq37i3g-rustc-1.95.0`, whose `lib/rustlib` holds only
+`aarch64-unknown-linux-gnu` and the wasm targets — **no** musl std. A `rust-std` is loadable only by the
+`rustc` of the *same version*, so 1.86.0's tarballs are valid only inside the 1.86.0 toolchain the script
+fetches itself; dropping them into the 1.95.0 nix sysroot cannot link. So stage 3 does **not** bump any
+version and does **not** touch `assets/`: a bump with a stale asset bricks every durable pane (§3).
+
+Stage 3 creates the follow-up card, `NEEDS-VULCAN:` rebuild the assets at 0.1.4 — one command on any
+x86_64 host with rustup. It also records two **unverified** alternatives (do not trust them until measured;
+each pairs a std with the rustc that loads it): for the **aarch64** asset on orac,
+`nix-shell -p pkgsMusl.rustc pkgsMusl.cargo --run 'cd ghostd && cargo build --release'`; for the **x86_64**
+asset, a `rust-std` matching the rustc it will load (as measured here that means
+`rust-std-1.95.0-x86_64-unknown-linux-musl` with a 1.95.0 x86_64 rustc — never the script's 1.86.0 std into a
+1.95.0 sysroot) plus `pkgsCross.musl64.stdenv.cc` as the linker.
+
+**Stage 3's summary must say this plainly**: source fixed and verified; no host behaves differently until
+that card lands.
+
+## 7. Risks / traps
+
+1. **Destroying the owner's live sessions.** `GHOSTWAVE_STATE_DIR` or nothing; `kill-all` only ever
+   inside a scratch state dir. (§5.)
+2. **Old daemon, new app** = today's behaviour, on purpose (§3). Do not "fix" that by message-grepping
+   `attach`'s stderr: it couples the script to an English string.
+3. **`bind` before `daemonize`** moves where the socket is created. It works because `daemonize` forks
+   only (no exec, so `CLOEXEC` never fires) — but the first lifecycle test must prove a client can attach
+   through it, not assume it.
+4. **Truncating the log on `new`** is a real behaviour change: history is now only replayable while its
+   daemon lives. That is the point of the card, but say it in PROGRESS.md — an `attach` to a *live*
+   session still replays everything.
+5. **The ssh hop is not verifiable here — for want of a key, not of a daemon** (stage-2 D2, re-measured by
+   this seat). The assumption: `ssh -t … sh -c` returns the remote command's status as the pane's exit code,
+   and `last_exit_code != 0` drives the reconnect pass (`remote.rs:600-601`). Measured on orac: sshd **does**
+   listen — `ss -tln` → `LISTEN 0.0.0.0:22` and `[::]:22`; `ps` → `sshd: …openssh-10.5p1… [listener]`
+   (root); `journalctl --follow -n 0 _SYSTEMD_UNIT=sshd.service` running. The blocker is authentication:
+   `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new localhost true` →
+   `death916@localhost: Permission denied (publickey).`, rc 255 — publickey only — and
+   `~/.ssh/authorized_keys` does not exist (`~/.ssh` holds only `hermes_ed25519`, `hermes_ed25519.pub`,
+   `known_hosts`, `agent/`). **Stage 3 runs that probe first.** If it still fails, stage 3 states the
+   assumption and marks the end-to-end claim `NEEDS-OWNER-VERIFY` with exactly this reason ("no authorized
+   key for localhost; sshd listens on :22, publickey-only"), plus the one-line owner action that would make
+   it verifiable here: append `~/.ssh/hermes_ed25519.pub` to `~/.ssh/authorized_keys`. The sentence "no sshd
+   listens on orac" is false and must not reach C7's journal or `PROGRESS.md`.
+6. **Parallel tests and the env var**: one `GHOSTWAVE_STATE_DIR` per test, a process-wide mutex around
+   it, `unsafe { env::set_var }` with a safety comment (edition 2024).
+7. **Two-line pidfile readers**: `read_pidfile` is the only reader; do not leave `cmd_kill`'s inline parse
+   (`main.rs:535-540`) duplicated after the refactor.
+8. **`busy` is exit 1 on purpose** (D1; the reasoning is in C5). Giving it 4 would hand a *live* session the
+   fate of an ended one — script exit 0 → `Manual`, zero retries — where today the pane probe-guards its way
+   into the existing retry loop (bounded by `reconnect_attempts` = 5). If "attached elsewhere" should ever be
+   visible, it needs a distinct code **and** a script branch that retries without creating: its own card, not
+   a quiet change here. Wire codes are asset-locked (§6), so this decision cannot be revisited cheaply after
+   the 0.1.4 rebuild. Held by the `a_busy_attach_is_not_reported_as_ended` lifecycle test and the busy-shape
+   case of the app test (§4).
+
+## 8. NOT doing (explicit)
+
+* **No version bump, no asset rebuild** on this card (§6) — the follow-up card owns them.
+* **F5** (a probe counts as an attach): needs a new protocol verb plus a version handshake to be
+  version-safe; a safeguard erosion, not one of the reported symptoms. Own card.
+* **The kill toast / exit status**: making "Killed remote session" truthful needs the ssh child's outcome
+  carried into the tick loop (`spawn_kill` is fire-and-forget, `kill_cmd` ends with `true`,
+  `remote.rs:236-241`). Own card.
+* **Naming sessions** (so two durable sessions can exist on one host). The name is derived from the host
+  on purpose (`term::remote_session`); this card makes *the* session on a host recoverable, it does not
+  add a second one.
+* **`pkill` sweeping a daemon that has no pidfile at all** from the CLI. After C3 a live daemon always
+  owns its pidfile, so this is only reachable for daemons started by the *old* binary; the app's kill path
+  already sweeps them (`kill_pattern`).
+* **A distinct "attached elsewhere" exit code for `busy`** (§2 C5, §7.8): busy keeps exit 1 and the pane's
+  existing retry, and no message is added for it. Making the overlap visible, or retrying explicitly on a
+  distinct code, is its own card.
+* No touch to the pty/term/search subsystems, no keymap or palette changes, no UI.
+
+## 9. Ordered work items for stage 3
+
+1. `ghostd/src/lib.rs`: `read_pidfile` / `pidfile_names` / `remove_state_if_owned` / `write_pidfile`, the
+   three exit-code constants, and the rewritten `recover_session` (C2, C3, C5) + the two unit tests.
+2. `ghostd/src/main.rs`: `cmd_new` (probe → recover-or-die → truncate log → `bind_listener` → daemonize),
+   accept-loop cleanup and pidfile write through the new helpers, `cmd_attach`'s exit codes (1/3/4 — the
+   relay distinguishes them by whether `OK\n` was seen, and busy stays **1** with no new message), `cmd_kill`
+   (verify death, owned removal, log removal, no-pidfile rule) (C1–C5).
+3. `ghostd/tests/lifecycle.rs` — the five tests (C2–C5 plus the busy pin); run `cd ghostd && cargo test`
+   through the gate.
+4. `src/remote.rs`: the new `attach_cmd` script + doc comment, `StubRemote`'s `attach_rc`/`new_rc`, the new
+   test (including its busy-shape case), and the two existing assertions (C6).
+5. `cargo test` + `cargo clippy --all-targets` for both crates through the build gate; paste the counts.
+6. The seven end-to-end checks of §5 against `ghostd/target/debug/ghostd`; paste the raw output.
+7. `PROGRESS.md` entry (C7), then commit, push the branch with `fleet_push.sh`, open the PR, create the
+   `NEEDS-VULCAN:` asset follow-up card, and hand stage 4 to `review`.
+
+## 10. What stage 2 has to judge
+
+1. **Is the root cause right?** F1/F2/F3/F4/F6 are reproduced in §0 with the code anchor beside each one.
+   The load-bearing claim is F3: *any* daemon deletes *any* daemon's state files, which is what leaves a
+   live daemon with no `.pid`/`.sock` (measured). Challenge it if C3 does not actually close it.
+2. **Is C4 safe?** binding before `daemonize` is the one structural change; the plan gives its reason
+   (F6's silent bind failure) and its only evidence requirement (a lifecycle test that attaches).
+3. **Is C5/C6's contract right** — 1 keeps its old meaning so an old daemon is not broken *and* stays the
+   code for `busy`, 4 maps to exit 0 in the script because `remote.rs:601` treats a clean exit as "do not
+   reconnect", and no `app.rs` change is needed? Is any path left where a killed session still gets
+   re-created, and is any path left where a *live* session stops retrying?
+4. **Is the scope split honest** — source now, assets by a `NEEDS-VULCAN:` card, and a summary that says
+   no host changes behaviour until then?
+5. **Are the numbers right** — 273 → 274 in the app, 0 → 7 in `ghostd` (5 lifecycle + 2 lib), and are the
+   RED expectations for all seven new tests actually red on `a91a1a8` (the busy pin is the one exception: it
+   guards a status that must *stay* 1, so it passes on `a91a1a8` too and is labelled as a pin)?
