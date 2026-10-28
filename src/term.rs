@@ -1713,4 +1713,204 @@ mod tests {
             sb.total
         );
     }
+
+    /// A detached pane — no shell spawned — for the link tests.
+    fn test_pane() -> TermPane {
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
+        TermPane::new(80, 24, cell, None, &[], None, 1000, 1024 * 1024, false, None).unwrap()
+    }
+
+    /// Every viewport row as text, top row first.
+    fn viewport_text(term: &Terminal<'static, 'static>) -> Vec<String> {
+        let mut render_state = RenderState::new().unwrap();
+        let snapshot = render_state.update(term).unwrap();
+        let mut row_it = RowIterator::new().unwrap();
+        let mut rows = row_it.update(&snapshot).unwrap();
+        let mut cells = CellIterator::new().unwrap();
+        let mut buf = String::new();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next() {
+            let mut line = String::new();
+            let mut iter = cells.update(row).unwrap();
+            while let Some(cell) = iter.next() {
+                buf.clear();
+                if cell.graphemes_utf8(&mut buf).is_ok() {
+                    line.push_str(&buf);
+                } else {
+                    line.push(' ');
+                }
+            }
+            out.push(line.trim_end().to_string());
+        }
+        out
+    }
+
+    /// The 0.2.2 shape: an OSC 52 write with an empty payload carries no
+    /// representations, and the crate must hand us an empty iterator instead of
+    /// a zero-length slice over a NULL pointer (the 0.2.1 UB, upstream #74).
+    ///
+    /// This pins the behaviour. It cannot demonstrate the absence of UB — that
+    /// needs Miri, which is not part of this toolchain.
+    #[test]
+    fn paste_of_empty_osc52_payload_does_not_panic() {
+        let mut term =
+            Terminal::new(TerminalOptions { cols: 80, rows: 24, max_scrollback: 100 }).unwrap();
+        let writes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = writes.clone();
+        term.on_clipboard_write(move |_term, clip| {
+            for content in clip.contents() {
+                sink.lock().unwrap().push(content.data.to_string());
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        term.vt_write(b"\x1b]52;c;\x07");
+
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "an empty OSC 52 payload must not reach the clipboard"
+        );
+    }
+
+    /// A normal OSC 52 write still arrives at the callback with its payload.
+    #[test]
+    fn osc52_text_write_still_reaches_the_sink() {
+        let mut term =
+            Terminal::new(TerminalOptions { cols: 80, rows: 24, max_scrollback: 100 }).unwrap();
+        let writes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = writes.clone();
+        term.on_clipboard_write(move |_term, clip| {
+            for content in clip.contents() {
+                sink.lock().unwrap().push(content.data.to_string());
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // base64("hello")
+        term.vt_write(b"\x1b]52;c;aGVsbG8=\x07");
+
+        assert_eq!(writes.lock().unwrap().as_slice(), ["hello".to_string()]);
+    }
+
+    /// Compression is supported on this target and does not disturb the logical
+    /// contents: the oldest surviving scrollback row and the newest row both
+    /// read back unchanged after a full pass. This is the test that proves the
+    /// feature works on this build instead of being silently unsupported.
+    #[test]
+    fn compression_returns_complete_and_keeps_scrollback() {
+        let mut term = Terminal::new(TerminalOptions {
+            cols: 40,
+            rows: 6,
+            max_scrollback: 32 * 1024,
+        })
+        .unwrap();
+        // ~2x the scrollback budget, so there is real history to compress and
+        // some of it is pruned.
+        for i in 0..4000 {
+            term.vt_write(format!("line {i:05} ....\r\n").as_bytes());
+        }
+        term.vt_write(b"NEWEST-MARKER\r\n");
+        assert!(
+            term.scrollback_rows().unwrap() > 0,
+            "the writes must have left the primary screen"
+        );
+
+        term.scroll_viewport(ScrollViewport::Top);
+        let oldest = viewport_text(&term)
+            .into_iter()
+            .find(|row| !row.is_empty())
+            .expect("the top of the viewport must hold scrollback text");
+        assert!(
+            oldest.starts_with("line "),
+            "the oldest row is scrollback text, got {oldest:?}"
+        );
+
+        assert_eq!(
+            term.compress(CompressionMode::Full).unwrap(),
+            CompressionResult::Complete,
+            "aarch64 Linux reclaims retained mappings, so this build must not answer Unsupported"
+        );
+
+        term.scroll_viewport(ScrollViewport::Top);
+        let oldest_after = viewport_text(&term)
+            .into_iter()
+            .find(|row| !row.is_empty())
+            .expect("the top of the viewport must still hold scrollback text");
+        assert_eq!(
+            oldest_after, oldest,
+            "compression changes storage only, never the logical contents"
+        );
+
+        term.scroll_viewport(ScrollViewport::Bottom);
+        assert!(
+            viewport_text(&term)
+                .iter()
+                .any(|row| row.contains("NEWEST-MARKER")),
+            "the newest row must still be readable after compression"
+        );
+    }
+
+    /// The scheduling contract the idle stepper relies on: the activity token
+    /// moves when new output arrives and holds still when it does not. The token
+    /// is opaque and may wrap, so only equality is asserted — never an ordering.
+    #[test]
+    fn compression_activity_is_a_token() {
+        let mut term = Terminal::new(TerminalOptions {
+            cols: 40,
+            rows: 6,
+            max_scrollback: 32 * 1024,
+        })
+        .unwrap();
+        // Fill scrollback first: a short write may land without touching the
+        // compression window, and then the token legitimately would not move.
+        for i in 0..1000 {
+            term.vt_write(format!("line {i:05} ....\r\n").as_bytes());
+        }
+
+        let first = term.compression_activity().unwrap();
+        assert_eq!(
+            term.compression_activity().unwrap(),
+            first,
+            "reading the token does not change it"
+        );
+
+        for i in 0..1000 {
+            term.vt_write(format!("more {i:05} ....\r\n").as_bytes());
+        }
+        let second = term.compression_activity().unwrap();
+        assert_ne!(
+            second, first,
+            "new output must move the activity token; an unchanged token means the idle \
+             stepper would never run"
+        );
+    }
+
+    #[test]
+    fn link_at_cell_prefers_the_osc8_uri() {
+        let mut pane = test_pane();
+        // OSC 8 link over a label that is not the URI and would not match the
+        // text scan on its own.
+        pane.term
+            .vt_write(b"\x1b]8;;https://example.com/x\x1b\\docs\x1b]8;;\x1b\\\r\n");
+
+        let (target, start, end) = pane
+            .link_at_cell(0, 0)
+            .expect("the cell carries an OSC 8 hyperlink");
+        assert_eq!(target, "https://example.com/x");
+        assert_eq!((start, end), (0, 4), "the range covers the link's label");
+    }
+
+    #[test]
+    fn link_at_cell_still_finds_a_bare_url() {
+        let mut pane = test_pane();
+        pane.term.vt_write(b"see https://example.com/plain now\r\n");
+
+        let (target, start, end) = pane
+            .link_at_cell(0, 10)
+            .expect("a bare URL stays clickable");
+        assert_eq!(target, "https://example.com/plain");
+        assert_eq!((start, end), (4, 29));
+    }
 }
