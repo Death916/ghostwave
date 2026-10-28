@@ -357,10 +357,20 @@ pub fn pid_alive(pid: Pid) -> bool {
 
 /// Kill the pty child and its whole process group (the child is a session
 /// leader, so pgid == pid): SIGTERM, escalate to SIGKILL after `grace`.
+///
+/// A nonpositive `child` names no group this may signal, and the call returns
+/// without touching any process: the group is `-child`, so `Pid(0)` would
+/// become `kill(0, ..)` — the caller's own process group — and a negative
+/// `child` would be inverted into a positive pid belonging to an unrelated
+/// process. (`Pid(i32::MIN)` would also overflow the negation.)
+///
 /// Safe to call on a dead pid — errors are ignored. Used by the daemon's
 /// own cleanup AND by `ghostd kill` so a wedged daemon can't orphan the
 /// session's program.
 pub fn kill_child_group(child: Pid, grace: Duration) {
+    if child.as_raw() <= 0 {
+        return;
+    }
     let group = Pid::from_raw(-child.as_raw());
     let _ = signal::kill(group, Signal::SIGTERM);
     let deadline = std::time::Instant::now() + grace;
@@ -715,5 +725,145 @@ mod tests {
         assert!(!dir.join("s.sock").exists() && !dir.join("s.pid").exists());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Pipe end the probe's SIGTERM handler writes to (`-1` until installed).
+    static PROBE_WITNESS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    /// Async-signal-safe witness: one byte per SIGTERM that reaches the probe.
+    extern "C" fn probe_on_term(_: i32) {
+        let fd = PROBE_WITNESS.load(Ordering::SeqCst);
+        if fd >= 0 {
+            // SAFETY: the probe owns this pipe end until it exits, and write(2)
+            // is async-signal-safe.
+            unsafe { nix::libc::write(fd, b"!".as_ptr().cast(), 1) };
+        }
+    }
+
+    /// Fork a probe that leads its own process group, records every SIGTERM it
+    /// receives on a pipe, runs `body` and then exits 0.
+    ///
+    /// Returns only once the probe is ready to be signalled: it has called
+    /// `setsid` (so its process group holds nothing but the probe, and a
+    /// `kill(0, ..)` inside it can never reach the test harness) and has its
+    /// SIGTERM handler in place. Signalling earlier would land on a group that
+    /// does not exist yet, or kill the probe before it could witness anything.
+    ///
+    /// Returns the probe's pid and the read end of its witness pipe.
+    fn signal_probe(body: impl FnOnce()) -> (Pid, i32) {
+        let mut witness = [0i32; 2];
+        let mut ready = [0i32; 2];
+        assert_eq!(
+            unsafe { nix::libc::pipe(witness.as_mut_ptr()) },
+            0,
+            "the witness pipe is created"
+        );
+        assert_eq!(
+            unsafe { nix::libc::pipe(ready.as_mut_ptr()) },
+            0,
+            "the ready pipe is created"
+        );
+        match unsafe { unistd::fork() }.expect("the probe forks") {
+            unistd::ForkResult::Parent { child } => {
+                let _ = unsafe { nix::libc::close(witness[1]) };
+                let _ = unsafe { nix::libc::close(ready[1]) };
+                let mut byte = [0u8; 1];
+                let n = unsafe { nix::libc::read(ready[0], byte.as_mut_ptr().cast(), 1) };
+                let _ = unsafe { nix::libc::close(ready[0]) };
+                assert!(
+                    n == 1 && byte[0] == b'r',
+                    "the probe is ready with its SIGTERM handler in place: {byte:?}"
+                );
+                (child, witness[0])
+            }
+            unistd::ForkResult::Child => {
+                let _ = unsafe { nix::libc::close(witness[0]) };
+                let _ = unsafe { nix::libc::close(ready[0]) };
+                let _ = unistd::setsid();
+                PROBE_WITNESS.store(witness[1], Ordering::SeqCst);
+                let installed = unsafe {
+                    signal::sigaction(
+                        Signal::SIGTERM,
+                        &SigAction::new(
+                            SigHandler::Handler(probe_on_term),
+                            SaFlags::empty(),
+                            SigSet::empty(),
+                        ),
+                    )
+                };
+                let flag = if installed.is_ok() { b"r" } else { b"e" };
+                let _ = unsafe { nix::libc::write(ready[1], flag.as_ptr().cast(), 1) };
+                let _ = unsafe { nix::libc::close(ready[1]) };
+                body();
+                unsafe { nix::libc::_exit(0) };
+            }
+        }
+    }
+
+    /// Bytes the probe wrote to its witness pipe. Only called after the probe
+    /// was reaped, so a signal that never arrived reads as end-of-file (`0`).
+    fn witness_bytes(read_fd: i32) -> usize {
+        let mut seen = 0;
+        let mut buf = [0u8; 8];
+        loop {
+            let n = unsafe { nix::libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            seen += n as usize;
+        }
+        seen
+    }
+
+    #[test]
+    fn nonpositive_child_is_never_signalled() {
+        // Each of these, without the guard, aims a signal at something the
+        // caller never named: 0 at the caller's own process group, -own at the
+        // caller itself, -1 at every process it may signal, and i32::MIN at
+        // both an unrelated pid and an overflow of the negation. (An arbitrary
+        // negative value is the same negation as -own, so it is not repeated
+        // here: on a regression it could signal a stranger.)
+        let (probe, witness) = signal_probe(|| {
+            let own = unistd::getpid();
+            for raw in [0, -own.as_raw(), -1, i32::MIN] {
+                kill_child_group(Pid::from_raw(raw), Duration::from_millis(100));
+            }
+        });
+
+        let status = nix::sys::wait::waitpid(probe, None).expect("the probe is reaped");
+        let seen = witness_bytes(witness);
+        let _ = unsafe { nix::libc::close(witness) };
+        assert_eq!(
+            seen, 0,
+            "no signalled process group or pid reached the probe"
+        );
+        assert!(
+            matches!(status, nix::sys::wait::WaitStatus::Exited(_, 0)),
+            "the probe ran to the end of its body: {status:?}"
+        );
+    }
+
+    #[test]
+    fn positive_child_is_still_signalled_with_its_group() {
+        // The guard must not change the live path: SIGTERM to the child's group
+        // (the probe witnesses it), then SIGKILL when the grace runs out with
+        // the child still up.
+        let (probe, witness) = signal_probe(|| {
+            std::thread::sleep(Duration::from_secs(30));
+        });
+
+        kill_child_group(probe, Duration::from_millis(150));
+
+        let status = nix::sys::wait::waitpid(probe, None).expect("the probe is reaped");
+        let seen = witness_bytes(witness);
+        let _ = unsafe { nix::libc::close(witness) };
+        assert_eq!(seen, 1, "the child's process group received the SIGTERM");
+        assert!(
+            matches!(
+                status,
+                nix::sys::wait::WaitStatus::Signaled(_, Signal::SIGKILL, _)
+            ),
+            "and the grace ran out into a SIGKILL of the same group: {status:?}"
+        );
     }
 }
