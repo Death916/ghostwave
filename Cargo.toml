@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 # kitty graphics PNG decode (DecodePng impl in term.rs)
-png = "0.17"
+png = "0.18"
 # the AI pane's chat request (blocking HTTP in a worker thread)
 ureq = "2.10"
 # Native cross-platform clipboard (Wayland + X11 in-process)

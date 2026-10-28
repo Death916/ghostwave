@@ -1157,7 +1157,9 @@ impl graphics::DecodePng for PngDecoder {
         decoder.set_transformations(Transformations::ALPHA | Transformations::STRIP_16);
 
         let mut frame = decoder.read_info().ok()?;
-        let mut buf = vec![0u8; frame.output_buffer_size()];
+        // 0.18 answers None when the frame's output size cannot be computed
+        // (checked arithmetic), which is an image we cannot decode either.
+        let mut buf = vec![0u8; frame.output_buffer_size()?];
         let info = frame.next_frame(&mut buf).ok()?;
 
         let mut bytes = Bytes::new_with_alloc(alloc, info.buffer_size()).ok()?;
