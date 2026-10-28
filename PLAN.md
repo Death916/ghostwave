@@ -1196,3 +1196,239 @@ The honest statement stays, and is repeated in §5's `NEEDS-OWNER-VERIFY` and in
    canvas-local (`−1.2 → 0`)?
 5. **Standing:** §1.1's four rows, §1.2's table, §3's two changes, §4's RED/GREEN expectations, the
    scope in §7, and the no-clip finding that decides against `with_clip`.
+
+---
+
+# PLAN — libghostty-vt 0.2.2 now; ghostty 1.4's library gains are a separate card; and the 761 lines of hand-rolled selection the library already replaced
+
+Card: `t_df08b599` · repo `/home/death916/code/ghostwave` · worktree `.worktrees/t_df08b599` · branch `wt/t_df08b599` off `master` `a91a1a8`
+Owner's ask (verbatim): *"ghostty has released version 1.4 and i think libghostty was been updated. see if our depencies can be updated for it and also see if any of the featurees it brings weve already implemented and use the library ones instead. check for other things from lib we could use instead of handroll also to save on our own code complexity and ge tthe full benefits of libghostty"*
+
+## 0. The answers, before the evidence
+
+1. **"Can our dependencies be updated for 1.4?"** Not *for* 1.4. The only published binding is **`libghostty-vt` 0.2.2** (2026-09-28), and it vendors **the same ghostty commit as 0.2.1** — `a887df42c56f6de86c0fe6da9c4eeca37931e083`, `1.3.2-dev`, dated 2026-07-11. There is no libghostty release carrying 1.4, and the 1.4 notes say the libghostty API "broke compatibility several times during this cycle", so no tagged release exists. What we *can* do today is **0.2.1 → 0.2.2**, which is an API-identical soundness release, and that is worth doing on its own (§2).
+2. **"Features 1.4 brings that we already implemented — use the library ones."** None of the 1.4-only APIs is implemented by us. The two hand-rolled subsystems 1.4 *would* replace are find-in-rows (`src/search.rs`) and session replay (`src/session.rs` pane logs); both are un-swappable until a 1.4 binding exists (§3–§4). They are a follow-up card, not stage 3.
+3. **"Other things from the library we could use instead of hand-rolling."** Yes, three, all available in the pin we already link: a **dead 761-line hand-rolled selection module** (`src/selection.rs`), **scrollback compression** (`Terminal::compress`, never called — and it is 1.4's headline memory feature), and **OSC 8 hyperlinks** (`GridRef::hyperlink_uri`, while we re-scrape row text in `link_at_cell`).
+
+## 1. Measurement log (every claim below is reproducible)
+
+Registry/API, 2026-10-28:
+
+```sh
+curl -sS -H 'User-Agent: ghostwave-dev-plan' https://crates.io/api/v1/crates/libghostty-vt
+#   {"max_stable_version":"0.2.2","newest_version":"0.2.2", ... "created_at":"2026-09-28T12:46:33Z"}
+curl -sS -H 'User-Agent: ghostwave-dev-plan' \
+  https://crates.io/api/v1/crates/libghostty-vt-sys/0.2.2   # features: vendored (default), kitty-graphics, link-dynamic, pkg-config, bindgen-tool
+```
+
+Crate source diff, `0.2.1` vs `0.2.2` (both tarballs downloaded and unpacked side by side):
+
+```sh
+diff -ru src-0.2.1 src-0.2.2     # 237 diff lines, exactly 4 touched files
+```
+
+| file | change |
+|---|---|
+| `Cargo.toml`, `Cargo.lock`, `.cargo_vcs_info.json` | version bump, `libghostty-vt-sys` 0.2.2 |
+| `src/terminal.rs` | the only source change: clipboard soundness (below) |
+
+**No module added, no public signature changed, no new safe wrapper.** The 0.2.2 change is upstream issue #74: `ClipboardWrite::contents()` no longer calls `slice::from_raw_parts` on `NULL` (the "clear clipboard" shape: OSC 52 with an empty payload), and `ClipboardContent { mime, data }` no longer turns non-UTF-8 bytes into an invalid `&str` (`data` degrades to `""`; `mime` falls back to `application/octet-stream`). Both hunks are in `src/terminal.rs` at the `contents()`/`ClipboardContent::from_raw` sites; the tests added are `#[cfg(miri)]`.
+
+Vendored engine, both versions:
+
+```sh
+grep -n GHOSTTY_COMMIT libghostty-vt-sys-0.2.{1,2}/build.rs
+#   const GHOSTTY_COMMIT: &str = "a887df42c56f6de86c0fe6da9c4eeca37931e083";   ← identical, both
+diff -u libghostty-vt-sys-0.2.1/src/bindings.rs libghostty-vt-sys-0.2.2/src/bindings.rs
+#   (empty) — the FFI surface is byte-identical
+git -C <ghostty checkout> log -1   # a887df4 2026-07-11, build.zig.zon: .version = "1.3.2-dev"
+```
+
+Ghostty 1.4.0 was released **2026-10-27** (ghostty.org release notes), i.e. one day before this card, and three weeks *after* the newest crate. It requires **Zig 0.17** to build ("Changes for Package Maintainers"); our `shell.nix` pins `zig_0_15` (0.15.2) with the comment that the pinned ghostty needs it.
+
+C API delta, our pin vs `v1.4.0` (headers fetched from the tag, symbol sets diffed):
+
+```sh
+grep -rho 'ghostty_[a-z_0-9]*' <pin>/include/ghostty/vt/ <pin>/include/ghostty/vt.h | sort -u   # 190
+grep -rho 'ghostty_[a-z_0-9]*' h14/include/ghostty/vt/ h14/include/ghostty/vt.h | sort -u      # 215
+```
+
+New in 1.4 (38 symbols): `ghostty_search_{new,set,get,get_multi,run,feed,tick,free}`, `ghostty_snapshot_{encode,encode_alloc,encode_buf}`, `ghostty_snapshot_decoder_{new,new_buf,decode,next,ready,set,get,get_multi,free}`, `ghostty_terminal_continuation_{alloc,buf,write}` + `ghostty_terminal_vt_write_until`, `ghostty_terminal_paste`, `ghostty_kitty_graphics_animation_tick`, `ghostty_render_state_image_{get,get_multi,iterator_new,iterator_next,iterator_free}`, `ghostty_render_state_{clean,row_iterator_next_dirty}`, `ghostty_formatter_format`, `ghostty_osc_set`, `ghostty_wasm_*` rework.
+Removed/renamed in 1.4 (breaking): `ghostty_terminal_mode_get/set` → the `GHOSTTY_TERMINAL_OPT_MODE` terminal option (`ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_MODE, &cfg)`, `terminal.h:2050`), `ghostty_render_state_colors_get`, `ghostty_vt_osc_free` → `ghostty_osc_free`, and the per-type `ghostty_wasm_alloc_*` helpers collapse to `ghostty_wasm_alloc/free`.
+
+## 2. Why 0.2.2 is not cosmetic for us
+
+Our clipboard path takes the shape the fix is about. `src/term.rs:349`:
+
+```rust
+.on_clipboard_write(|_term, clip| {
+    for content in clip.contents() { ... }
+```
+
+Any program can send OSC 52 with an empty payload ("clear the clipboard"); libghostty then passes `contents = NULL, contents_len = 0`, and 0.2.1's `contents()` runs `std::slice::from_raw_parts(null, 0)` — UB that the rustbindings' own regression test documents (upstream #74, "`from_raw_parts` requires a non-null pointer even at length zero"). That is reachable from ordinary terminal content, so the bump is a soundness fix on a live code path, not housekeeping.
+
+**Honesty constraint for stage 3:** no test we can write *proves* the UB is gone — the upstream tests are Miri-gated and Miri is not part of our toolchain. Stage 3 must say exactly that: the evidence is (a) the version bump, (b) the upstream diff, (c) a regression test that the empty-payload OSC 52 shape is handled without a panic and without a clipboard write, which pins the behaviour but cannot demonstrate the absence of UB.
+
+## 3. What 1.4 would give us, and what it would replace here
+
+| 1.4 C API | what we have today | size it would delete |
+|---|---|---|
+| `ghostty_search_*` (`search.h`) | `src/search.rs` — re-scans every row through `RowIteration` on each tick (`run_on_rows`), plus the match model in `src/search_overlay.rs` | 322 lines + the match/highlight bookkeeping; lib matches are `Selection`s that survive alt-screen switches, resize/reflow and scrollback pruning — ours do not |
+| `ghostty_snapshot_encode/decode` (`snapshot.h`) | `src/session.rs` — tee raw pty bytes to a per-pane log, front-truncate at `max_log_mb`, replay with `vt_write` on restore | the log/truncate/replay machinery (`AsyncPaneLog`, `truncate_log_front`, `replay_pane_log`) |
+| `ghostty_terminal_paste` | `TermPane::paste_text` (`src/term.rs:836`) already uses `paste::encode` + `mode(BRACKETED_PASTE)` | nothing — the lib call only folds the mode check in; low value |
+| kitty graphics animation / relative placements + `render_state_image_*` | we render **no** kitty images at all; we only install a PNG decoder so the core accepts them (`term.rs:1138`) | n/a — a feature we do not have |
+| OSC 7501 program-status, OSC 99 notifications, OSC 72 drag&drop parsing | none | n/a — new capabilities |
+| `terminal_continuation_*` | we `vt_write` whole reads | n/a — we do not chunk |
+
+## 4. Why none of §3 can be in stage 3
+
+Three independent blockers, each measured:
+
+1. **No binding exists.** 0.2.2's `src/` is 0.2.1 plus five hunks in `terminal.rs` (§1). `search`/`snapshot`/`image` wrappers do not exist in any published crate — using 1.4 means writing them (a fork of `uzaaft/libghostty-rs`), on top of regenerating `libghostty-vt-sys/src/bindings.rs` with its `bindgen-tool` feature (`tools/gen_bindings.rs`).
+2. **Toolchain.** ghostty 1.4 needs Zig 0.17; `shell.nix:8-9` pins `zig_0_15` "REQUIRED by libghostty-vt-sys's vendored build (ghostty 1.3.2-dev pins it; zig 0.16 breaks the build)". Changing that is a Nix edit the **owner** builds — out of scope for any dev card, and certainly not something stage 3 may do silently.
+3. **Moving the pin is a source-level decision.** `libghostty-vt-sys` can be pointed at a checkout with `GHOSTTY_SOURCE_DIR`, but then the checked-in `bindings.rs` must match that checkout (it is generated, not built), and every removed symbol (§1) breaks the safe crate. That is a dedicated branch with its own review.
+
+**Routing:** the 1.4 work is a *separate card* — title `libghostty 1.4: move the vendored ghostty pin and adopt the search/snapshot APIs`, blocked on "owner builds a deevnv with Zig 0.17". It is not carved out of this plan as stage 3 scope, and this plan does not schedule it.
+
+## 5. What we can adopt today, measured against the code
+
+**a. Dead hand-rolled selection — delete `src/selection.rs` (761 lines, 10 `#[test]`s).**
+Every symbol in the file (`SelectionModel`, `GridCell`, `SelectionMode`, `expand_word_range`, `extract_selection_*`, `pixel_to_cell`, …) is unreferenced outside the file:
+
+```sh
+grep -rn 'SelectionModel\|GridCell\|SelectionMode\|pixel_to_cell\|cell_to_pixel' src/ tests/ | grep -v '^src/selection.rs'
+#   (no output)
+grep -n 'mod selection' src/main.rs          # 34:pub mod selection;   — the only reference
+```
+
+The live path already **is** the library: `src/term.rs:1005` `SelectionState` drives `selection::gesture::{Gesture, PressEvent, DragEvent, ReleaseEvent}`, `Selection::adjust`, `Terminal::set_selection`, and `copy_selection` copies through `FormatOptions::new().with_trim(true).with_unwrap(true)` (`term.rs:823`). Its four clipboard wrappers (`selection.rs:484-500`) just call `ghostwave::clipboard::{write_text,write_primary_text,read_text,read_primary_text}`, which `term.rs` calls directly. The 10 tests in the file test the dead model, so they leave with it.
+
+**b. Scrollback compression — `Terminal::compress`, present since before 0.2.1, never called.**
+
+```sh
+grep -rn 'compress\|CompressionMode' src/       # (no output)
+grep -n 'pub fn compress' <registry>/libghostty-vt-0.2.1/src/terminal.rs   # 482
+```
+
+`CompressionMode::{Incremental,Full}` + `CompressionResult::{Unsupported,Pending,Complete}` + `compression_activity()` are all in the API we already link (the 0.2.1→0.2.2 diff does not touch them). This is 1.4's memory headline ("70% to 90% less physical memory for typical text") available to us **today**, and it is caller-driven: incremental steps on idle, restart when `compression_activity()` changes. It changes storage only — "never its logical contents or scrollback limit; accessing compressed history restores it transparently".
+
+**c. OSC 8 hyperlinks — `GridRef::hyperlink_uri` (in 0.2.1's `screen.rs:116`; the 0.2.2 diff leaves `screen.rs` untouched).**
+`TermPane::link_at_cell` (`term.rs:888`) reconstructs the row as a string, strips variation selectors, and scans for `http(s)://` / path-shaped tokens. Consequence: an OSC 8 link whose display text is not its URL (the common case — `ls --hyperlink`, `git`'s docs links, systemd, many CLIs) is not clickable, and a long URI is truncated by the row scan. Fix: ask the cell for `hyperlink_uri` first (authoritative, and it survives wide chars / grapheme clusters), fall back to the text scan for bare URLs so the existing clickable-URL feature keeps working.
+
+**d. `png` 0.17 vs 0.18 — one dependency too many.**
+`Cargo.toml:30` says `png = "0.17"` for our kitty `DecodePng` impl; `libghostty-vt`'s `png` feature already pulls `png 0.18.1` (`Cargo.lock` contains both). The crate's own `RustPngDecoder` is still unusable — `graphics.rs:904` is a public struct with a private `buf` field and **no constructor** — so our impl stays, on 0.18. API delta measured against the vendored `png-0.18.1` source: identical except `output_buffer_size()` now returns `Option<usize>` (`decoder/mod.rs:668`), so `term.rs:1156` needs one `?`/`unwrap_or(0)`.
+
+**e. Considered and deliberately not in stage 3**
+
+| candidate | why not |
+|---|---|
+| `paste::is_safe` | available, unused; only meaningful with an "unsafe paste?" confirm prompt — UI scope, deserves its own card |
+| `focus::Event::encode` (mode 1004 in/out reporting) | we implement no focus reporting at all; adding it changes what every program receives — separate card |
+| `log::set_logger` | debugging aid, not code reduction |
+| `osc::Parser` for `src/font_query.rs` | the pin's `GHOSTTY_OSC_COMMAND_*` enum has **no OSC 50** (`osc.h:43-66`), so the hand-written scanner in that 339-line module is the only way to answer font queries — keep it |
+| `sgr::Parser`, `unicode::grapheme_width` | nothing in our tree hand-parses SGR or computes widths; no saving |
+| `fmt::Formatter` | we already copy through the lib's `FormatOptions`; the full-VT dump has no caller |
+| a pty layer | libghostty-vt has none by design; `src/pty.rs` (forkpty via `nix`) stays ours |
+
+## 6. Scope of stage 3 — the smallest honest set
+
+**In:**
+1. `libghostty-vt` `0.2.1` → `0.2.2` (`Cargo.toml:18`, lock refreshed for the crate + `libghostty-vt-sys`).
+2. Unify `png` on 0.18 (`Cargo.toml:30`, one line in `term.rs`'s decoder).
+3. Delete `src/selection.rs` and `src/main.rs:34` (`pub mod selection;`) — 761 lines, 10 tests.
+4. Idle scrollback compression: `TermPane::compress_idle_step()` + one bounded step per pane from `AppState::tick` (`src/app.rs:598`).
+5. OSC 8 first in `link_at_cell`, text-scan fallback preserved.
+6. Six new tests (§7).
+
+**Out, with reasons recorded:** everything in §3/§4 (needs a 1.4 binding + Zig 0.17), §5e (each has its own reason), and any UI change beyond what 4 and 5 require.
+
+## 7. Verification — commands and expected results
+
+Baseline is measured, not quoted. On `a91a1a8`, in the dev shell, with this card's own target dir:
+
+```sh
+cd /home/death916/code/ghostwave/.worktrees/t_df08b599
+export CARGO_TARGET_DIR=/var/build/ghostwave/t_df08b599
+BUILD_GATE_WAIT=900 bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell ./shell.nix --run 'cargo test --locked'
+```
+
+> **Baseline, measured on `a91a1a8` (this tree, 2026-10-28, exit 0):**
+>
+> | target | result |
+> |---|---|
+> | `unittests src/lib.rs` (`ghostwave` lib) | **76 passed, 0 failed** |
+> | `unittests src/main.rs` (`ghostwave` bin) | **190 passed, 0 failed** |
+> | `tests/flood_throughput.rs` | 1 passed |
+> | `tests/term_core.rs` | 6 passed |
+> | **total** | **273 passed, 0 failed**, finished in 6.5 s (bin) / 2.4 s (lib) |
+>
+> Pre-existing warnings at the base: 3, all in the bin test target (`src/main.rs:376` unused `VecDeque`, two "does not need to be mutable"); the lib target is warning-free. Stage 3 records these, fixes none of them, and adds none.
+
+The 10 tests that leave with `src/selection.rs` are in the **bin** target (`selection::tests::*`, seen in the bin run above), and the six new tests land in `src/term.rs`, i.e. the **lib** target.
+
+
+Per-module after the change (same gate, same target dir):
+
+```sh
+bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --locked term::'
+bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --locked app::'
+bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --locked'
+bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo clippy --locked --all-targets'
+```
+
+Expected after the change: **lib 82** (76 + the six new `term::` tests), **bin 180** (190 − the ten `selection::tests::`), integration **7** unchanged, i.e. **269 passed / 0 failed** total and exit 0. These are the arithmetic of measured numbers — stage 3 still asserts them by running, and if a target disagrees it reports the real line rather than adjusting it. Clippy: no new warnings (the base's three bin-target warnings are recorded, not fixed).
+
+Dependency proof:
+
+```sh
+cargo tree -i png --locked        # exactly one png, 0.18.x
+cargo tree -i libghostty-vt --locked   # 0.2.2; sys 0.2.2
+```
+
+Deletion proof:
+
+```sh
+git grep -n 'mod selection' -- src/ tests/    # no match after the change
+test ! -e src/selection.rs && echo gone
+```
+
+The six tests (all in `src/term.rs`'s `#[cfg(test)] mod tests`, no display, no pty):
+
+1. `paste_of_empty_osc52_payload_does_not_panic` — `on_clipboard_write` installed with a `Vec` sink; `vt_write(b"\x1b]52;c;\x07")`; asserts no panic **and** no write recorded. This is the 0.2.2 shape (§2) — a behaviour pin, not a UB proof; the summary must say so.
+2. `osc52_text_write_still_reaches_the_sink` — a normal `\x1b]52;c;` + base64 + BEL still writes text (no regression in the callback path).
+3. `compression_returns_complete_and_keeps_scrollback` — fill 2× scrollback, then `compress(Full)`; assert `CompressionResult::Complete` (fails loudly if the target reports `Unsupported`), then assert the oldest and newest lines are still readable through the render iterator. **This is the test that proves compression actually works on this build rather than being silently unsupported.**
+4. `compression_activity_is_a_token` — `compression_activity()` changes after new output and is stable when idle (the scheduling contract §5b relies on).
+5. `link_at_cell_prefers_the_osc8_uri` — write a row whose display text is `docs` and whose OSC 8 target is `https://example.com/x`; `link_at_cell(row, col_of_docs)` returns the URI, not `docs`.
+6. `link_at_cell_still_finds_a_bare_url` — a plain `https://example.com/plain` row still resolves (the fallback).
+
+## 8. Risks and how stage 3 handles them
+
+1. **Compression must be serialized with every other terminal operation** (lib doc: "not thread-safe with other operations on the same terminal… serialize it with writes, rendering, searches"). Our panes are `Arc<Mutex<PaneEntry>>`; the tick must take the same lock and hold it across exactly one `compress` call — never across panes (no nested locks, no lock held while sending messages).
+2. **`AppState::tick` runs at 16 ms (Fast) / 125 ms (Slow) / Off.** Compression steps must be budgeted per pane per tick (one `Incremental` step) and gated on `compression_activity()` changing, or an idle terminal burns CPU forever. If the token never changes and the result is `Pending`, stop scheduling.
+3. **`CompressionResult::Unsupported` is a legitimate answer** on some targets; the code must treat it as "do nothing, remember it, stop asking", and test 3 must fail rather than skip if it appears here (x86_64/aarch64 Linux are supported per the release notes — so on orac it must be `Complete`/`Pending`).
+4. **Deleting `src/selection.rs`** is safe today (grep-verified, §5a) but it is a removal of a public `mod` from the binary; a stale local branch could conflict. Stage 3 does the deletion in its own commit so it can be reverted alone.
+5. **`png` 0.18 rename surface** is limited to `output_buffer_size() -> Option<usize>`; if `cargo build` disagrees with that claim the honest move is to keep 0.17 and record it, not to rewrite the decoder.
+6. **`clip.at_cell` reordering (OSC 8 first)** must not change click-through for text that merely *contains* a URL with a hyperlink attached elsewhere; test 6 is the guard.
+
+## 9. Work items for stage 3, in order
+
+| # | change | files |
+|---|---|---|
+| C1 | bump `libghostty-vt` to 0.2.2, refresh lock | `Cargo.toml:18`, `Cargo.lock` |
+| C2 | unify `png` on 0.18 (+ `output_buffer_size` Option) | `Cargo.toml:30`, `src/term.rs:1145-1170` |
+| C3 | delete the dead selection module | `src/selection.rs` (−761), `src/main.rs:34` |
+| C4 | `TermPane::compress_idle_step()` + idle scheduling from the tick | `src/term.rs`, `src/app.rs:598` |
+| C5 | OSC 8 first in `link_at_cell` | `src/term.rs:888` |
+| C6 | the six tests of §7 | `src/term.rs` `#[cfg(test)]` |
+
+Each item is its own commit, so stage 4 can review and revert them independently.
+
+## 10. What stage 2 has to judge
+
+1. **B1** Is §1's central claim right — that 0.2.2 cannot carry 1.4 because `build.rs` pins the same `a887df42…` commit and `bindings.rs` is byte-identical — and is the evidence shown rather than asserted?
+2. **B2** Is §4's blocker list complete for *this* repo: missing wrappers, Zig 0.17 vs `shell.nix`'s `zig_0_15`, and the generated `bindings.rs`? Is anything there actually avoidable inside a dev card (i.e. is §4 using Nix as an excuse where a `GHOSTTY_SOURCE_DIR` override would work)?
+3. **B3** Is §2's reachability claim right — does `on_clipboard_write` really take the empty-payload shape — and does the plan refuse to claim a test proves the UB is gone?
+4. **B4** Is §5a's "dead" claim true under the whole tree (`src/`, `tests/`, and the `ghostwave` lib target), and is the 10-test subtraction the only test-count effect?
+5. **B5** Is §8.1–8.3's compression design (same lock, one step per tick, token-gated, `Unsupported` is terminal-but-not-a-skip) sufficient, and is test 3 the right pin?
+6. **B6** Is the scope in §6 actually the smallest honest set for the owner's ask — i.e. does it leave out something the ask plainly wanted, or include something it did not?
