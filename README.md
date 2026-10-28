@@ -90,23 +90,10 @@ wave_amplitude = 1.0        # wave height multiplier
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 api_key_env = "OPENAI_API_KEY"
-```
+
 
 Session data (pane logs + session state) lives in
 `~/.local/share/ghostwave/`.
-
-## Not in this build
-
-These were implemented in the macroquad front-end and are **not** ported yet.
-The archived branch is their only implementation:
-
-- **Remote / SSH panes** (`ghostd` durable sessions: `ds <host>`, attach,
-  reconnect with replay, kill). The `ghostd/` daemon crate is still here; only
-  the front-end's side is missing.
-- **Kitty graphics** (inline images in the terminal).
-- **Middle-click paste** and image previews.
-- **Session parking**: switching sessions saves the outgoing workspace, but its
-  processes end with it rather than continuing in the background.
 
 ## Retired: the macroquad front-end
 

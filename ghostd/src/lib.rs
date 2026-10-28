@@ -35,6 +35,26 @@ pub const DEFAULT_LOG_CAP_MB: u64 = 32;
 pub const DEFAULT_FIRST_ATTACH_SECS: u64 = 300;
 pub const ATTACH_RETRY_SECS: u64 = 5;
 
+/// `ghostd attach` exit status: there is no session to attach to.
+///
+/// This is the pre-existing meaning, kept so a daemon that predates the code
+/// still works: a caller may create the session. It is also what a session that
+/// is *busy* — a client is already attached elsewhere — returns, because the
+/// refusal arrives as the handshake's first bytes and never as an `OK\n` ack.
+/// A caller must not treat 1 alone as "safe to recreate": it must let `new`'s
+/// probe refuse a session that is merely in use.
+pub const ATTACH_NO_SESSION: i32 = 1;
+
+/// `ghostd attach` exit status: the daemon holds the session but never answered
+/// the handshake (wedged). The caller recovers the daemon and attaches again.
+pub const ATTACH_WEDGED: i32 = 3;
+
+/// `ghostd attach` exit status: the session exists but is over — the daemon
+/// closed the connection before acking, or the relay ended after the session
+/// was acked. A caller must not recreate it: this is the code that stops a
+/// duplicate pane from resurrecting a killed session.
+pub const ATTACH_ENDED: i32 = 4;
+
 /// Set when SIGTERM arrives (ghostd kill); the accept loop cleans up.
 pub static TERM_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -105,28 +125,116 @@ pub fn probe_session(name: &str) -> Probe {
     }
 }
 
-/// Terminate a wedged daemon (SIGTERM, then SIGKILL after a 1s grace) and
-/// drop its state files so `new` can rebind the session fresh.
-pub fn recover_session(name: &str) {
-    let pid_file = pid_path(name);
-    if let Ok(pid_str) = fs::read_to_string(&pid_file) {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            gdbg("recover", &format!("{name}: SIGTERM daemon {pid}"));
-            let _ = signal::kill(Pid::from_raw(pid), Signal::SIGTERM);
-            for _ in 0..10 {
-                if !pid_alive(Pid::from_raw(pid)) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
+/// Terminate a wedged daemon and drop its state so `new` can rebind the session
+/// fresh. Returns whether the old daemon is gone.
+///
+/// The pidfile is the only source of the victim: a session with no pidfile has
+/// nothing that names an owner, so this returns `false` and the caller reports
+/// it rather than guessing. SIGTERM, a 1 s grace, then SIGKILL, and the verdict
+/// is a liveness check after the escalation — a daemon that survives both is
+/// left alone, state and all, because binding a second daemon over a live one is
+/// the failure this function exists to remove. The session's pty child is killed
+/// with the daemon, so a recovered session does not orphan its program.
+pub fn recover_session(name: &str) -> bool {
+    let Some((daemon, child)) = read_pidfile(name) else {
+        gdbg("recover", &format!("{name}: no pidfile names a daemon"));
+        return false;
+    };
+    gdbg("recover", &format!("{name}: SIGTERM daemon {daemon}"));
+    let _ = signal::kill(daemon, Signal::SIGTERM);
+    for _ in 0..10 {
+        if pid_gone(daemon) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !pid_gone(daemon) {
+        // A stopped daemon (what a wedged one looks like) does not act on
+        // SIGTERM until it is continued, so SIGKILL is the escalation that
+        // actually ends it. Give the kernel and pid 1 a moment to finish.
+        gdbg("recover", &format!("{name}: daemon {daemon} stuck, SIGKILL"));
+        let _ = signal::kill(daemon, Signal::SIGKILL);
+        for _ in 0..10 {
+            if pid_gone(daemon) {
+                break;
             }
-            if pid_alive(Pid::from_raw(pid)) {
-                gdbg("recover", &format!("{name}: daemon {pid} stuck, SIGKILL"));
-                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
-            }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
+    if !pid_gone(daemon) {
+        return false;
+    }
+    if let Some(child) = child {
+        kill_child_group(child, Duration::from_secs(2));
+    }
+    remove_state_if_owned(name, daemon);
+    true
+}
+
+/// The daemon and pty-child pids `<name>.pid` records.
+///
+/// The file is two lines (daemon, then the session's program) for every daemon
+/// that writes it; a file from an older daemon holds one line, so the child is
+/// `None`. `None` overall means there is no pidfile or it does not parse —
+/// nothing that names an owner.
+pub fn read_pidfile(name: &str) -> Option<(Pid, Option<Pid>)> {
+    let text = fs::read_to_string(pid_path(name)).ok()?;
+    let mut lines = text.lines();
+    let daemon = lines.next()?.trim().parse::<i32>().ok()?;
+    let child = lines.next().and_then(|l| l.trim().parse::<i32>().ok());
+    Some((Pid::from_raw(daemon), child.map(Pid::from_raw)))
+}
+
+/// Whether `<name>.pid` still names `daemon` as the session's owner.
+///
+/// The ownership test every state removal goes through: a daemon may delete only
+/// the state it wrote, so a dying daemon cannot unlink its successor's socket and
+/// pidfile (which would leave a live daemon unreachable *and* unkillable).
+pub fn pidfile_names(name: &str, daemon: Pid) -> bool {
+    read_pidfile(name).is_some_and(|(owner, _)| owner == daemon)
+}
+
+/// Write `<name>.pid` through `<name>.pid.tmp` and a rename, so a concurrent
+/// reader never sees a half-written file and concludes the session has no owner.
+pub fn write_pidfile(name: &str, daemon: Pid, child: Option<Pid>) {
+    let mut body = daemon.as_raw().to_string();
+    if let Some(child) = child {
+        body.push('\n');
+        body.push_str(&child.as_raw().to_string());
+    }
+    let tmp = state_dir().join(format!("{name}.pid.tmp"));
+    if fs::write(&tmp, body).is_ok() {
+        let _ = fs::rename(&tmp, pid_path(name));
+    }
+}
+
+/// Remove `<name>.sock` and `<name>.pid` only when the pidfile still names
+/// `daemon`. Returns whether the state was removed (and therefore whether the
+/// caller may also drop the log, which belongs to that same daemon).
+pub fn remove_state_if_owned(name: &str, daemon: Pid) -> bool {
+    if !pidfile_names(name, daemon) {
+        gdbg("state", &format!("{name}: not owned by {daemon}, left alone"));
+        return false;
+    }
     let _ = fs::remove_file(socket_path(name));
-    let _ = fs::remove_file(pid_file);
+    let _ = fs::remove_file(pid_path(name));
+    true
+}
+
+/// Whether `pid` can no longer serve anything: gone, or killed and waiting to be
+/// reaped. `kill(pid, 0)` alone counts a zombie as alive, which would make every
+/// post-SIGKILL verdict wrong.
+pub fn pid_gone(pid: Pid) -> bool {
+    if !pid_alive(pid) {
+        return true;
+    }
+    match fs::read_to_string(format!("/proc/{}/stat", pid.as_raw())) {
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+            .unwrap_or(false),
+        Err(_) => true,
+    }
 }
 
 pub fn die(msg: &str) -> ! {
@@ -429,4 +537,87 @@ pub fn bind_listener(name: &str) -> std::io::Result<UnixListener> {
         fs::remove_file(&sock).ok();
     }
     UnixListener::bind(&sock)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// The tests point `GHOSTWAVE_STATE_DIR` at their own directory, so they hold
+    /// this lock for their whole run: the variable is process-wide, and a second
+    /// test setting it mid-run would aim one test's writes at another's dir.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A private state dir with `GHOSTWAVE_STATE_DIR` pointed at it; the returned
+    /// guard must outlive everything that touches the state.
+    fn state_dir_for(tag: &str) -> (MutexGuard<'static, ()>, PathBuf) {
+        let guard = env_lock();
+        let dir = std::env::temp_dir().join(format!("ghostd-lib-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a state dir is created");
+        // SAFETY: `set_var` is unsafe in edition 2024 because it races any other
+        // thread that reads the environment. The caller holds `env_lock` for the
+        // rest of the test, and no other thread in this binary reads the variable.
+        unsafe { std::env::set_var("GHOSTWAVE_STATE_DIR", &dir) };
+        (guard, dir)
+    }
+
+    #[test]
+    fn pidfile_names_reads_the_two_line_file() {
+        let (_guard, dir) = state_dir_for("read");
+        let daemon = Pid::from_raw(100);
+        let child = Pid::from_raw(200);
+
+        write_pidfile("s", daemon, Some(child));
+        assert_eq!(read_pidfile("s"), Some((daemon, Some(child))));
+        assert_eq!(
+            fs::read_to_string(dir.join("s.pid")).expect("the pidfile is written"),
+            "100\n200",
+            "daemon first, then the session's program"
+        );
+        assert!(pidfile_names("s", daemon));
+        assert!(!pidfile_names("s", child), "the child is never the owner");
+
+        fs::write(dir.join("s.pid"), "101\n").expect("a one-line file is written");
+        assert_eq!(
+            read_pidfile("s"),
+            Some((Pid::from_raw(101), None)),
+            "a file from a daemon that predates the child pid still names its owner"
+        );
+
+        fs::write(dir.join("s.pid"), "not a pid\n").expect("a garbage file is written");
+        assert_eq!(read_pidfile("s"), None, "garbage names no owner");
+        assert!(!pidfile_names("s", Pid::from_raw(101)));
+        assert_eq!(read_pidfile("absent"), None, "no pidfile names no owner");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_files_are_removed_only_by_their_owner() {
+        let (_guard, dir) = state_dir_for("own");
+        let owner = Pid::from_raw(100);
+        write_pidfile("s", owner, None);
+        fs::write(dir.join("s.sock"), b"").expect("a socket file is written");
+
+        assert!(
+            !remove_state_if_owned("s", Pid::from_raw(200)),
+            "a daemon that does not own the name removes nothing"
+        );
+        assert!(dir.join("s.sock").exists() && dir.join("s.pid").exists());
+
+        assert!(
+            remove_state_if_owned("s", owner),
+            "the owner removes its own state"
+        );
+        assert!(!dir.join("s.sock").exists() && !dir.join("s.pid").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

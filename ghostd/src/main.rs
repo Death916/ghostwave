@@ -28,10 +28,12 @@ use nix::{
 };
 
 use ghostd::{
-    daemonize, dcs_size_msg, die, fd_poll, fd_read, gdbg, install_term_handler, kill_child_group,
-    log_path, pid_alive, pid_path, probe_session, recover_session, set_nonblock, set_term_size,
-    socket_path, spawn_child, state_dir, term_size, truncate_log_front, write_all_blocking,
-    DEFAULT_FIRST_ATTACH_SECS, DEFAULT_LOG_CAP_MB, Probe, TERM_REQUESTED, VERSION,
+    bind_listener, daemonize, dcs_size_msg, die, fd_poll, fd_read, gdbg, install_term_handler,
+    kill_child_group, log_path, pid_gone, probe_session, read_pidfile, recover_session,
+    remove_state_if_owned, set_nonblock, set_term_size, socket_path, spawn_child, state_dir,
+    term_size, truncate_log_front, write_all_blocking, write_pidfile, ATTACH_ENDED,
+    ATTACH_NO_SESSION, ATTACH_WEDGED, DEFAULT_FIRST_ATTACH_SECS, DEFAULT_LOG_CAP_MB, Probe,
+    TERM_REQUESTED, VERSION,
 };
 
 fn eprintln_exit(msg: &str) -> ! {
@@ -43,12 +45,10 @@ fn eprintln_exit(msg: &str) -> ! {
 fn accept_loop(listener: UnixListener, name: &str, log_cap: u64, first_attach_secs: u64) {
     let log_file = log_path(name);
     let (pty_fd, child_pid) = spawn_child(&[]);
-    // Two-line pidfile: daemon pid, then the pty child's pid. `ghostd kill`
-    // needs both so a wedged daemon can't orphan the session's program.
-    let _ = fs::write(
-        pid_path(name),
-        format!("{}\n{}", nix::unistd::getpid(), child_pid.as_raw()),
-    );
+    // Two-line pidfile (daemon, then the pty child), written atomically: `kill`
+    // and `recover_session` both read it to decide whose state this is, and a
+    // half-written file names no owner at all.
+    write_pidfile(name, nix::unistd::getpid(), Some(child_pid));
     let mut log = OpenOptions::new().create(true).append(true).open(&log_file).unwrap_or_else(|e| die(&format!("log: {e}")));
     let mut log_bytes = fs::metadata(&log_file).map(|m| m.len()).unwrap_or(0);
 
@@ -130,8 +130,13 @@ fn accept_loop(listener: UnixListener, name: &str, log_cap: u64, first_attach_se
     // every process this user owns on the host.
     kill_child_group(child_pid, Duration::from_secs(2));
     let _ = wait::waitpid(Pid::from_raw(-1), None);
-    let _ = fs::remove_file(socket_path(name));
-    let _ = fs::remove_file(pid_path(name));
+    // Our own state only: a daemon that took the name over meanwhile owns those
+    // files now, and deleting them would leave it unreachable and unkillable. The
+    // log goes with them — replay is only ever the history of the daemon that is
+    // attached to, and this one is done.
+    if remove_state_if_owned(name, nix::unistd::getpid()) {
+        let _ = fs::remove_file(&log_file);
+    }
 }
 
 /// One attached client: apply size, ack, replay the log, then live relay.
@@ -338,6 +343,15 @@ fn handle_client(
 // ---------------------------------------------------------------------------
 // commands
 
+/// Create a session and hand it to a daemon.
+///
+/// The order is the guarantee: probe first (a healthy session is never touched,
+/// and a busy one is never created over), then recover a wedged daemon or refuse
+/// to bind over it, then discard the previous daemon's log — replay is only ever
+/// the history of the daemon that is attached to, and a session no daemon holds
+/// has nothing to replay — then bind **before** daemonizing, so a stale socket is
+/// cleared and a bind failure reaches the caller with a real exit status instead
+/// of vanishing into `/dev/null`.
 fn cmd_new(name: &str, cmd: &[String], log_cap: u64, first_attach_secs: u64) {
     if name.is_empty() || name.contains('/') {
         die("bad session name");
@@ -351,17 +365,22 @@ fn cmd_new(name: &str, cmd: &[String], log_cap: u64, first_attach_secs: u64) {
         Probe::Healthy => die(&format!("session '{name}' already exists (attach instead)")),
         Probe::Unresponsive => {
             gdbg("new", &format!("{name}: wedged daemon — recovering"));
-            recover_session(name);
+            if !recover_session(name) {
+                die(&format!(
+                    "'{name}' is held by a wedged daemon that will not die — kill it by hand"
+                ));
+            }
         }
         Probe::NoSession => {}
     }
+    let log = log_path(name);
+    if fs::metadata(&log).map(|m| m.len() > 0).unwrap_or(false) {
+        eprintln!("ghostd: '{name}': discarding the previous session's log");
+    }
+    let _ = fs::write(&log, b"");
+    let listener = bind_listener(name).unwrap_or_else(|e| die(&format!("{e}")));
     daemonize();
     install_term_handler();
-    let sock = socket_path(name);
-    let listener = match UnixListener::bind(&sock) {
-        Ok(l) => l,
-        Err(e) => die(&format!("bind {sock:?}: {e}")),
-    };
     set_nonblock(listener.as_raw_fd());
     gdbg(
         "new",
@@ -373,7 +392,7 @@ fn cmd_new(name: &str, cmd: &[String], log_cap: u64, first_attach_secs: u64) {
 fn cmd_attach(name: &str) {
     let Some(mut stream) = ghostd::connect_with_retry(name) else {
         eprintln!("ghostd: no session '{name}'");
-        std::process::exit(1);
+        std::process::exit(ATTACH_NO_SESSION);
     };
     // Send our terminal size; listen for SIGWINCH and re-send as DCS.
     // Always send a SIZE line (the daemon's handshake requires it) —
@@ -412,11 +431,18 @@ fn cmd_attach(name: &str) {
     let mut in_buf = [0u8; 32768];
     let mut out_buf: Vec<u8> = Vec::new(); // pending bytes to stdout
 
-    // Handshake: wait (bounded) for the daemon's "OK\n" ack. A healthy
-    // daemon acks right after the SIZE line; a wedged one never answers —
-    // exit 1 so the caller's `|| new` fallback recovers the session
-    // instead of hanging forever with zero output.
+    // Handshake: wait (bounded) for the daemon's "OK\n" ack. A healthy daemon
+    // acks right after the SIZE line; a wedged one never answers — exit 3 so the
+    // caller recovers the daemon instead of hanging forever with zero output. A
+    // daemon that accepts and then closes before acking has ended the session:
+    // exit 4, the code that says "do not recreate me".
+    //
+    // `ok_seen` is what the relay's own EOF is read against: a session that ends
+    // *after* the ack ended while we were attached (4), while a connection that
+    // closed without ever acking was never a session we had — that is the busy
+    // shape, whose refusal text arrives as this first chunk (1).
     let deadline = Instant::now() + Duration::from_secs(8);
+    let mut ok_seen = false;
     loop {
         if fd_poll(&mut [(stream.as_raw_fd(), true)], 200)
             .map(|r| r.is_empty())
@@ -424,18 +450,19 @@ fn cmd_attach(name: &str) {
         {
             if Instant::now() >= deadline {
                 eprintln!("ghostd: session '{name}' not responding — recovering");
-                std::process::exit(1);
+                std::process::exit(ATTACH_WEDGED);
             }
             continue;
         }
         match fd_read(stream.as_raw_fd(), &mut in_buf) {
             Ok(0) => {
                 eprintln!("ghostd: session '{name}' closed");
-                std::process::exit(1);
+                std::process::exit(ATTACH_ENDED);
             }
             Ok(n) => {
                 let data = &in_buf[..n];
                 if out_buf.is_empty() && data.starts_with(b"OK\n") {
+                    ok_seen = true;
                     out_buf.extend_from_slice(&data[3..]);
                 } else {
                     out_buf.extend_from_slice(data);
@@ -443,7 +470,7 @@ fn cmd_attach(name: &str) {
                 break;
             }
             Err(Errno::EAGAIN) => {}
-            Err(_) => std::process::exit(1),
+            Err(_) => std::process::exit(ATTACH_NO_SESSION),
         }
     }
     gdbg("attach", &format!("{name}: handshake ok, relaying"));
@@ -478,10 +505,27 @@ fn cmd_attach(name: &str) {
         }
         if ready.contains(&1) {
             match fd_read(stream.as_raw_fd(), &mut in_buf) {
-                Ok(0) => std::process::exit(1), // daemon gone: session over
+                // The daemon closed the connection. After the ack the session is
+                // over (it ended, or was killed, while we were attached) — 4, so
+                // a caller does not recreate it. Without an ack there was never a
+                // session to have: a busy daemon refuses and drops the stream
+                // before `OK\n`, and that must stay 1 so the pane retries.
+                Ok(0) => std::process::exit(if ok_seen {
+                    ATTACH_ENDED
+                } else {
+                    ATTACH_NO_SESSION
+                }),
                 Err(Errno::EAGAIN) => {}
                 Ok(n) => out_buf.extend_from_slice(&in_buf[..n]),
-                Err(_) => break,
+                // A reset is the same event as an EOF — the daemon closed while
+                // our SIZE line was still unread, which is exactly what the busy
+                // refusal does — so it takes the same decision instead of a clean
+                // exit that would leave the pane with zero retries.
+                Err(_) => std::process::exit(if ok_seen {
+                    ATTACH_ENDED
+                } else {
+                    ATTACH_NO_SESSION
+                }),
             }
             // stdout is blocking: write as much as possible now.
             let mut i = 0;
@@ -522,44 +566,62 @@ fn cmd_list() {
     }
 }
 
+/// Kill a session's daemon, verify that it died, and drop the state it owned.
+///
+/// The pidfile names the victim; without one there is no owner to signal, so a
+/// socket that still answers means a live daemon we must not delete out from
+/// under (report it), and a refused socket is stale state we may clear. State is
+/// removed only after the daemon is confirmed dead *and* the pidfile still names
+/// it, so a daemon that took the name over meanwhile keeps its own files. The log
+/// goes with them: replay is only ever the history of the daemon that is attached
+/// to, and this daemon no longer is.
 fn cmd_kill(name: &str) {
-    let pid_file = pid_path(name);
-    let Ok(pid_str) = fs::read_to_string(&pid_file) else {
-        // Stale state cleanup.
-        let _ = fs::remove_file(socket_path(name));
+    let Some((daemon, child)) = read_pidfile(name) else {
+        let sock = socket_path(name);
+        if UnixStream::connect(&sock).is_ok() {
+            eprintln!("ghostd: '{name}' has no pidfile but its daemon answers — kill it by hand");
+            std::process::exit(1);
+        }
+        let _ = fs::remove_file(&sock);
         eprintln!("ghostd: no session '{name}'");
         std::process::exit(1);
     };
-    // Two-line pidfile: daemon pid, then the pty child's pid (old files
-    // have a single line — child unknown, daemon kill still works).
-    let mut lines = pid_str.lines();
-    let Some(daemon) = lines.next().and_then(|l| l.trim().parse::<i32>().ok()) else {
-        eprintln!("ghostd: bad pid for '{name}'");
-        std::process::exit(1);
-    };
-    let child = lines.next().and_then(|l| l.trim().parse::<i32>().ok());
-    let daemon = Pid::from_raw(daemon);
     // SIGTERM the daemon; its handler cleans up its own files. If it's
     // wedged, escalate: SIGKILL it and kill the session's process group
     // directly so a stuck daemon can't orphan the running program.
     let _ = signal::kill(daemon, Signal::SIGTERM);
-    let mut alive = true;
     for _ in 0..30 {
-        if !pid_alive(daemon) {
-            alive = false;
+        if pid_gone(daemon) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    if alive {
+    if !pid_gone(daemon) {
         gdbg("kill", &format!("{name}: daemon {daemon} stuck, SIGKILL"));
         let _ = signal::kill(daemon, Signal::SIGKILL);
+        for _ in 0..10 {
+            if pid_gone(daemon) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
     if let Some(c) = child {
-        kill_child_group(Pid::from_raw(c), Duration::from_secs(2));
+        kill_child_group(c, Duration::from_secs(2));
     }
-    let _ = fs::remove_file(socket_path(name));
-    let _ = fs::remove_file(pid_file);
+    if !pid_gone(daemon) {
+        // Say what happened rather than claiming a kill that did not happen.
+        eprintln!("ghostd: daemon {daemon} for '{name}' survived SIGKILL");
+        std::process::exit(1);
+    }
+    // The daemon removes its own socket and pidfile as it exits, so "no pidfile
+    // left" is the normal death path and not a successor. A pidfile that still
+    // exists names a daemon that took the name over meanwhile — that one's state
+    // and log are not ours to delete.
+    let successor = !remove_state_if_owned(name, daemon) && read_pidfile(name).is_some();
+    if !successor {
+        let _ = fs::remove_file(log_path(name));
+    }
     println!("ghostd: killed '{name}'");
 }
 
