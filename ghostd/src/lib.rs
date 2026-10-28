@@ -175,14 +175,30 @@ pub fn recover_session(name: &str) -> bool {
 ///
 /// The file is two lines (daemon, then the session's program) for every daemon
 /// that writes it; a file from an older daemon holds one line, so the child is
-/// `None`. `None` overall means there is no pidfile or it does not parse —
-/// nothing that names an owner.
+/// `None`. `None` overall means there is no pidfile or its first line does not
+/// parse as a pid — nothing that names an owner.
+///
+/// Both pids are strictly positive on the way out. A pid of `0` or below is not a
+/// pid a signal may be aimed at: `kill(0, sig)` signals the caller's own process
+/// group and `kill(-1, sig)` every process the caller may signal, so a stale or
+/// corrupt line must never become a victim. An unusable daemon line therefore
+/// names no owner at all, while an unusable child line only costs the child: the
+/// daemon pid still names a real owner, so the session stays killable and
+/// recoverable instead of being pinned by a file we refuse to read.
 pub fn read_pidfile(name: &str) -> Option<(Pid, Option<Pid>)> {
     let text = fs::read_to_string(pid_path(name)).ok()?;
     let mut lines = text.lines();
-    let daemon = lines.next()?.trim().parse::<i32>().ok()?;
-    let child = lines.next().and_then(|l| l.trim().parse::<i32>().ok());
-    Some((Pid::from_raw(daemon), child.map(Pid::from_raw)))
+    let daemon = parse_pid(lines.next()?)?;
+    let child = lines.next().and_then(parse_pid);
+    Some((daemon, child))
+}
+
+/// One pidfile line as a pid a signal may be aimed at: strictly positive.
+///
+/// Anything else — zero, a negative value, a non-number — is `None`.
+fn parse_pid(line: &str) -> Option<Pid> {
+    let raw = line.trim().parse::<i32>().ok()?;
+    (raw > 0).then(|| Pid::from_raw(raw))
 }
 
 /// Whether `<name>.pid` still names `daemon` as the session's owner.
@@ -595,6 +611,86 @@ mod tests {
         assert_eq!(read_pidfile("s"), None, "garbage names no owner");
         assert!(!pidfile_names("s", Pid::from_raw(101)));
         assert_eq!(read_pidfile("absent"), None, "no pidfile names no owner");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pidfile_with_a_nonpositive_daemon_names_no_owner() {
+        let (_guard, dir) = state_dir_for("bad-daemon");
+        // kill(0, ..) signals the caller's own process group and kill(-1, ..)
+        // signals everything the caller may signal, so neither may ever come out
+        // of the parser as a daemon.
+        for raw in ["0", "-1", "-4242"] {
+            fs::write(dir.join("s.pid"), format!("{raw}\n200")).expect("a pidfile is written");
+            fs::write(dir.join("s.sock"), b"").expect("a socket file is written");
+
+            assert_eq!(
+                read_pidfile("s"),
+                None,
+                "pidfile daemon {raw} names no owner"
+            );
+            let named = Pid::from_raw(raw.parse::<i32>().expect("the test wrote an i32"));
+            assert!(!pidfile_names("s", named), "and does not own the name");
+            assert!(
+                !remove_state_if_owned("s", named),
+                "so no state removal runs for daemon {raw}"
+            );
+            assert!(
+                dir.join("s.sock").exists() && dir.join("s.pid").exists(),
+                "the files of an unparseable pidfile are left alone"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pidfile_with_a_nonpositive_child_drops_the_child() {
+        let (_guard, dir) = state_dir_for("bad-child");
+        // The daemon pid is still a real owner, so the session stays recoverable;
+        // the child is what must not survive, because kill_child_group would turn
+        // it into kill(0, ..) / kill(-1, ..).
+        for raw in ["0", "-1", "-4242"] {
+            fs::write(dir.join("s.pid"), format!("100\n{raw}")).expect("a pidfile is written");
+
+            assert_eq!(
+                read_pidfile("s"),
+                Some((Pid::from_raw(100), None)),
+                "child {raw} is dropped, the daemon kept"
+            );
+            assert!(
+                pidfile_names("s", Pid::from_raw(100)),
+                "the daemon still owns the name"
+            );
+        }
+
+        fs::write(dir.join("s.pid"), "100\nnot a pid").expect("a garbage child is written");
+        assert_eq!(
+            read_pidfile("s"),
+            Some((Pid::from_raw(100), None)),
+            "a malformed child line is not a child"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_pidfile_drives_no_signal_or_state_removal() {
+        let (_guard, dir) = state_dir_for("no-signal");
+        fs::write(dir.join("s.pid"), "0\n0").expect("a pidfile is written");
+        fs::write(dir.join("s.sock"), b"").expect("a socket file is written");
+
+        // recover_session is the path that SIGTERMs a daemon and then the child's
+        // process group: with no owner named it must not reach either.
+        assert!(
+            !recover_session("s"),
+            "a pidfile with no owner recovers nothing"
+        );
+        assert!(
+            dir.join("s.sock").exists() && dir.join("s.pid").exists(),
+            "and removes no state"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
