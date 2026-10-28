@@ -31,7 +31,6 @@ mod pty_bridge;
 mod remote;
 pub mod scratchpad;
 pub mod search_overlay;
-pub mod selection;
 mod ui_session;
 pub mod sessions_overlay;
 mod tick;
