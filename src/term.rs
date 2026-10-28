@@ -21,9 +21,9 @@ use libghostty_vt::{
     screen::Screen,
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     terminal::{
-        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
-        PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
-        SizeReportSize,
+        CompressionActivity, CompressionMode, CompressionResult, ConformanceLevel,
+        DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point, PointCoordinate,
+        PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes, SizeReportSize,
     },
     selection::FormatOptions,
 };
@@ -211,6 +211,37 @@ pub struct TermPane {
     pub log: Option<crate::session::AsyncPaneLog>,
     /// Optional cursor visual style override (from config).
     pub cursor_style: Option<libghostty_vt::render::CursorVisualStyle>,
+    /// Idle scrollback-compression bookkeeping; see [`TermPane::compress_idle_step`].
+    compression: IdleCompression,
+}
+
+/// How long a terminal must sit unchanged before its scrollback is compressed.
+const COMPRESSION_IDLE_DELAY: Duration = Duration::from_secs(2);
+
+/// Schedule state for one terminal's idle scrollback compression.
+///
+/// The library's activity token is opaque: only equality is meaningful, and it
+/// may wrap, so nothing here orders two tokens.
+struct IdleCompression {
+    /// The token the idle delay is measured from; `None` until first observed.
+    token: Option<CompressionActivity>,
+    /// When `token` last changed — the start of the idle delay.
+    changed_at: Instant,
+    /// The token a pass is already complete for: nothing to do until it moves.
+    complete_for: Option<CompressionActivity>,
+    /// The target told us reclamation is unavailable: stop asking.
+    unsupported: bool,
+}
+
+impl IdleCompression {
+    fn new() -> Self {
+        Self {
+            token: None,
+            changed_at: Instant::now(),
+            complete_for: None,
+            unsupported: false,
+        }
+    }
 }
 
 impl TermPane {
@@ -400,6 +431,7 @@ impl TermPane {
             log_name,
             log,
             cursor_style: None,
+            compression: IdleCompression::new(),
         })
         .map(|mut pane| {
             if spawn {
@@ -407,6 +439,54 @@ impl TermPane {
             }
             pane
         })
+    }
+
+    /// Offer the library one bounded scrollback-compression step.
+    ///
+    /// Returns whether a step ran. A step is offered only while the terminal's
+    /// activity token is unchanged (i.e. nothing was written) for
+    /// [`COMPRESSION_IDLE_DELAY`], and only once per token after a pass reports
+    /// [`CompressionResult::Complete`]. `CompressionResult::Unsupported` — the
+    /// target cannot reclaim retained mappings — is remembered, so the pane
+    /// stops being asked.
+    ///
+    /// Compression rewrites storage only: it never changes the logical
+    /// contents or the scrollback limit, so the caller needs no repaint. The
+    /// library requires it to be serialized with every other operation on the
+    /// terminal, which the pane's own lock provides — call this with that lock
+    /// held, never per frame.
+    pub fn compress_idle_step(&mut self) -> bool {
+        if self.compression.unsupported {
+            return false;
+        }
+        let Ok(token) = self.term.compression_activity() else {
+            return false;
+        };
+        if self.compression.token != Some(token) {
+            // New output since the last offer: restart the idle delay.
+            self.compression.token = Some(token);
+            self.compression.changed_at = Instant::now();
+            return false;
+        }
+        if self.compression.complete_for == Some(token)
+            || self.compression.changed_at.elapsed() < COMPRESSION_IDLE_DELAY
+        {
+            return false;
+        }
+        match self.term.compress(CompressionMode::Incremental) {
+            Ok(CompressionResult::Pending) => true,
+            Ok(CompressionResult::Complete) => {
+                self.compression.complete_for = Some(token);
+                true
+            }
+            Ok(CompressionResult::Unsupported) => {
+                self.compression.unsupported = true;
+                false
+            }
+            // A failed call is not the target saying "unsupported"; leave the
+            // state alone and let the next offer retry.
+            Err(_) => false,
+        }
     }
 
     /// Parse a cursor style name string to `CursorVisualStyle`.

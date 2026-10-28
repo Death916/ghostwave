@@ -892,6 +892,26 @@ impl AppState {
         self.tabs.iter().find_map(|tab| tab.shared(id))
     }
 
+    /// Whether any tab holds a terminal pane.
+    pub fn has_term_panes(&self) -> bool {
+        self.tabs.iter().any(|tab| !tab.term_handles().is_empty())
+    }
+
+    /// Offers each idle terminal one bounded scrollback-compression step.
+    ///
+    /// One pane's lock is taken, used and released per iteration, so no two
+    /// panes are locked at once and no lock is held while anything else runs.
+    /// Driven by [`Message::CompressTick`](crate::Message::CompressTick) on its
+    /// own ticker rather than by [`AppState::tick`]: the latter does not run at
+    /// all when [`AppState::tick_rate`] is `Off`.
+    pub fn compress_idle_step(&self) {
+        for tab in &self.tabs {
+            for handle in tab.term_handles() {
+                handle.lock().unwrap().term.compress_idle_step();
+            }
+        }
+    }
+
     /// Opens a fresh tab and focuses it.
     pub fn new_tab(&mut self) {
         let (_, pane) = match self.spawn_pane() {
@@ -1590,6 +1610,53 @@ fn holds(node: &pane_grid::Node, pane: pane_grid::Pane) -> bool {
     match node {
         pane_grid::Node::Pane(cell) => *cell == pane,
         pane_grid::Node::Split { a, b, .. } => holds(a, pane) || holds(b, pane),
+    }
+}
+
+/// The scrollback-compression ticker: publishes a [`Message::CompressTick`] on
+/// a fixed period, on its own thread.
+///
+/// It is deliberately not part of [`crate::tick`]: `tick_rate()` answers `Off`
+/// for an idle terminal, and `main` subscribes no ticker at all in that case,
+/// which is exactly the pane that compression exists for. Modelled on
+/// [`crate::autosave`].
+pub mod compression {
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    use iced::futures::channel::mpsc as fmpsc;
+    use iced::futures::Stream;
+
+    use crate::Message;
+
+    /// How often a pane is offered one bounded compression step.
+    const PERIOD: Duration = Duration::from_secs(4);
+
+    /// The compression subscription's identity, so iced keeps one publisher.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct CompressTick;
+
+    /// Starts the compression ticker and streams its
+    /// [`Message::CompressTick`]s.
+    pub fn stream(slot: &CompressTick) -> Pin<Box<dyn Stream<Item = Message> + Send>> {
+        let _ = slot;
+        let (tx, rx) = fmpsc::unbounded::<Message>();
+
+        let spawned = std::thread::Builder::new()
+            .name("ghost-iced-compress".into())
+            .spawn(move || loop {
+                std::thread::sleep(PERIOD);
+                if tx.unbounded_send(Message::CompressTick).is_err() {
+                    return;
+                }
+            });
+
+        if let Err(e) = spawned {
+            eprintln!("[ghostwave] compression thread failed to start: {e}");
+            return Box::pin(iced::futures::stream::pending::<Message>());
+        }
+
+        Box::pin(rx)
     }
 }
 
