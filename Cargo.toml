@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Ghostty terminal emulation, safe Rust bindings (vendored zig build of libghostty-vt)
-libghostty-vt = { version = "0.2.1", features = ["png"] }
+libghostty-vt = { version = "0.2.2", features = ["png"] }
 # the front-end: windowing, layout, widgets and the painting surface
 iced = { version = "0.14", features = ["canvas"] }
 # PTY handling (forkpty, winsize) — pty module lives under the "term" feature
