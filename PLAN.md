@@ -1207,7 +1207,7 @@ Owner's ask (verbatim): *"ghostty has released version 1.4 and i think libghostt
 ## 0. The answers, before the evidence
 
 1. **"Can our dependencies be updated for 1.4?"** Not by bumping what we depend on — but a 1.4 binding *does* exist, and it is not the crate we use. **`ghostty-vt` / `ghostty-vt-sys` `0.8.0+ghostty.1.4.0-main.83fb956`** were published **2026-10-28T07:23Z** (§1), a fork of our own dependency ("Adapted from libghostty-vt 0.2.2", `ghostty-vt src/lib.rs:37`) re-pinned to ghostty `83fb956` = `1.4.0-main`. Adopting it is a **migration, not a bump**: it replaces our 9 `on_*` callbacks with an `Event` drain, drops allocators, and needs rustc 1.96 + Zig 0.17 (§4). The crate we actually depend on — **`libghostty-vt` 0.2.2** (2026-09-28) — vendors **the same ghostty commit as 0.2.1**: `a887df42c56f6de86c0fe6da9c4eeca37931e083`, `1.3.2-dev`, dated 2026-07-11, so *our* dependency carries no 1.4 API at all. What we do in this card is **0.2.1 → 0.2.2**, an API-identical soundness release (§2), and the fork goes to its own card (§4 Routing).
-2. **"Features 1.4 brings that we already implemented — use the library ones."** None of the 1.4-only APIs is implemented by us. The two hand-rolled subsystems 1.4 *would* replace are find-in-rows (`src/search.rs`) and session replay (`src/session.rs` pane logs); both are un-swappable inside this card — our pin has no 1.4 API, and the one published 1.4 binding is the migration of §4 — so they are a follow-up card, not stage 3.
+2. **"Features 1.4 brings that we already implemented — use the library ones."** None of the 1.4-only APIs is implemented by us. The two hand-rolled subsystems 1.4 *would* replace are find-in-rows (`src/search.rs`) and session replay (`src/session.rs` pane logs); both are un-swappable inside this card — our pin has no 1.4 API, and the only 1.4 candidate here that is a crate-level safe binding over a ghostty source it vendors and pins itself is the migration of §4 — so they are a follow-up card, not stage 3.
 3. **"Other things from the library we could use instead of hand-rolling."** Yes, three, all available in the pin we already link: a **dead 761-line hand-rolled selection module** (`src/selection.rs`), **scrollback compression** (`Terminal::compress`, never called — and it is 1.4's headline memory feature), and **OSC 8 hyperlinks** (`GridRef::hyperlink_uri`, while we re-scrape row text in `link_at_cell`).
 
 ## 1. Measurement log (every claim below is reproducible)
@@ -1230,7 +1230,7 @@ curl -sS -H 'User-Agent: ghostwave-dev-plan' 'https://crates.io/api/v1/crates?q=
 #   zgx-ghostty-sys · embers-ghostty-sys · betamax-core · qwertty-term-vt · …
 ```
 
-Two *projects* there are real candidates for a 1.4 binding — three crates — and neither is ours (per-crate `.../api/v1/crates/<name>`, same headers, 2026-10-28T07:2xZ):
+Five crates from four projects are the candidates for a 1.4 binding — three published 2026-10-27/28, two 2026-09 — and ours is in the same table only for comparison (per-crate `GET /api/v1/crates/<name>` and `/api/v1/crates/<name>/<version>`, 2026-10-28T13:2xZ):
 
 | crate | version | published | `rust-version` | downloads (crate / that version) |
 |---|---|---|---|---|
@@ -1238,8 +1238,17 @@ Two *projects* there are real candidates for a 1.4 binding — three crates — 
 | `ghostty-vt-sys` | `0.8.0+ghostty.1.4.0-main.83fb956` | 2026-10-28T07:23:13Z | 1.96 | 459 / 21 |
 | `ghostty-vt-rs-sys` | `0.2.0` | 2026-10-27T18:59:19Z | 1.90 | 565 / 50 |
 | `libghostty-vt` (ours) | `0.2.2` | 2026-09-28T12:46:33Z | 1.90 | 182 706 / 8 485 |
+| `khostty-vt` | `0.1.0` | 2026-09-20T09:00:03Z | 1.75 | 20 / 20 |
+| `gpui-libghostty` | `0.3.1` | 2026-09-25T14:51:45Z | 1.95 | 836 / 371 |
 
-`ghostty-vt` is the only **safe** 1.4 binding, and it is what §4 evaluates. Measured from the downloaded tarball:
+Round 2's table listed four of these and never evaluated the last two. Both are rejected on a fact read out of their own tarballs, not on a hunch:
+
+| crate | the measured fact that decides it |
+|---|---|
+| `khostty-vt` `0.1.0` | It *is* a safe 1.4 wrapper — `Search` (`src/search/mod.rs:60`), `SnapshotDecoder` (`src/snapshot/mod.rs:89`) over `ghostty_search_new` / `ghostty_snapshot_encode` (`src/ffi.rs:1838`, `:1870`) — but it vendors and pins **no** ghostty source: `build.rs:18-20`, `:59`, `:73` look for an already-built `libghostty-vt` through `GHOSTTY_VT_LIB` / `GHOSTTY_VT_LIB_DIR`, and `build.rs:161-165` warns *"Build it with `zig build -Dlibghostty-vt=true`"*. It is a route only if we build and ship the C library ourselves — strictly more than §4's migration. |
+| `gpui-libghostty` `0.3.1` | It is a GPUI terminal *component*, not a binding for our term core: `src/lib.rs:1-9` renders through Ghostty's Metal / Wayland-OpenGL surface and binds `Terminal` to the host application's GPUI via `bind_gpui!(gpui)`. It does vendor 1.4 source — `vendor/ghostty/VENDOR.md:4` (commit `9f0e1719`), with `ghostty_snapshot_encode` in `vendor/ghostty/include/ghostty/vt/snapshot.h:284` — but exposes nothing `src/term.rs` could call. |
+
+`ghostty-vt` is the only 1.4 candidate here that is a crate-level safe binding over a ghostty source it vendors and pins itself, and it is what §4 evaluates. Measured from the downloaded tarball:
 
 ```sh
 # ghostty-vt-0.8.0+ghostty.1.4.0-main.83fb956
@@ -1259,7 +1268,7 @@ for s in ghostty_search_new ghostty_snapshot_encode ghostty_terminal_paste \
 
 So the 1.4 API surface §3 needs **is published and wrapped** — by a fork, not by our crate. `ghostty_terminal_mode_get` is gone, but the safe crate keeps `Terminal::mode()` (`src/terminal.rs:409`, now returning `Result`), so the loss is at the C level, not at the API level we use (`term.rs:840`).
 
-`ghostty-vt-rs-sys` 0.2.0 is **raw FFI only** — there is no `ghostty-vt-rs` safe crate on crates.io (`GET /api/v1/crates/ghostty-vt-rs` → 404) — but it is the interesting second lead: it ships **prebuilt static libraries** for seven targets including `aarch64-unknown-linux-gnu` (`prebuilt.rs:9`), so it needs **no Zig at all**, and its pinned commit `4a4fc017…` is dated 2026-10-27T16:34Z with the message `up to 1.4.1-dev`. It carries the same 1.4 symbol set (`ghostty_search_new`, `ghostty_snapshot_encode`, no `ghostty_terminal_mode_get`). Writing our own safe wrappers over it is strictly more work than §4's migration, so it is recorded as an alternative, not a route.
+`ghostty-vt-rs-sys` 0.2.0 is **raw FFI only** — there is no `ghostty-vt-rs` safe crate on crates.io (`GET /api/v1/crates/ghostty-vt-rs` → 404) — but it is the interesting second lead: it ships **prebuilt static libraries** for eight targets including `aarch64-unknown-linux-gnu` (`prebuilt.rs:9`) and `wasm32-unknown-unknown` (`prebuilt.rs:10`), so it needs **no Zig at all**, and its pinned commit `4a4fc017…` is dated 2026-10-27T16:34Z with the message `up to 1.4.1-dev`. It carries the same 1.4 symbol set (`ghostty_search_new`, `ghostty_snapshot_encode`, no `ghostty_terminal_mode_get`). Writing our own safe wrappers over it is strictly more work than §4's migration, so it is recorded as an alternative, not a route.
 
 
 Crate source diff, `0.2.1` vs `0.2.2` (both tarballs downloaded and unpacked side by side):
@@ -1338,7 +1347,7 @@ Any program can send OSC 52 with an empty payload ("clear the clipboard"); libgh
 
 Three independent blockers, each measured:
 
-1. **Our dependency carries no 1.4 API, and the one published 1.4 binding is a migration, not a bump.** `libghostty-vt` 0.2.2 vendors ghostty `a887df42` (`1.3.2-dev`); `search`/`snapshot`/`image` wrappers do not exist in it (§1). The alternative — `ghostty-vt` `0.8.0+ghostty.1.4.0-main.83fb956` (§1) — does wrap them, and this is what adopting it costs in *our* tree, measured:
+1. **Our dependency carries no 1.4 API, and the only 1.4 candidate here that is a crate-level safe binding over a ghostty source it vendors and pins itself is a migration, not a bump.** `libghostty-vt` 0.2.2 vendors ghostty `a887df42` (`1.3.2-dev`); `search`/`snapshot`/`image` wrappers do not exist in it (§1). The alternative — `ghostty-vt` `0.8.0+ghostty.1.4.0-main.83fb956` (§1) — does wrap them, and this is what adopting it costs in *our* tree, measured:
    - terminal effects become an **`Event` drain** (`Terminal::events`, `ghostty-vt src/terminal.rs:271`; `Event` enum at `:1223`, `ClipboardWrite` included) where we register **9 callbacks** — `on_pty_write`, `on_size`, `on_device_attributes`, `on_xtversion`, `on_color_scheme`, `on_title_changed`, `on_pwd_changed`, `on_bell`, `on_clipboard_write` at `term.rs:290,299,311,329,330,331,337,343,349`;
    - it has **no custom allocators and no `'alloc` lifetime**, so `format_selection_alloc(None, opts)` (`term.rs:698`, `:825`) becomes `fmt::Formatter` + `FormatterOptions::with_selection` (`ghostty-vt src/fmt.rs:20,71`), and `Bytes::new_with_alloc` (`term.rs:1163`) goes away;
    - every getter returns `Result` (its `README.md`), and the crate is Apache-2.0-only where ours is `MIT OR Apache-2.0`.
@@ -1508,6 +1517,14 @@ Each item is its own commit, so stage 4 can review and revert them independently
 | note: `term.rs:1156` | §5d | the call is at `term.rs:1160` |
 
 **One correction to the D3 brief itself.** The card says the `Off` config makes compression "advance ~once/hour". Measured, it is worse: `main.rs:658-661` never subscribes a ticker when `tick_rate()` is `Off`, so `AppState::tick` is not called at all and `tick.rs:26`'s `Off → 3600 s` is unreachable from that path. The `Off` config gets **no** compression, not a slow one — which is why §8.2 now takes the trigger off `tick_rate()` entirely instead of budgeting within the tick.
+
+### Round-3 changelog (round 2's standing defect: false universals about the 1.4 binding)
+
+| defect | what changed | evidence now in the plan |
+|---|---|---|
+| **U1** the plan called `ghostty-vt` uniquely safe and the sole published 1.4 binding — false, `khostty-vt` 0.1.0 is a published safe 1.4 wrapper | §0.2 (`PLAN.md:1210`), §1 (`:1251`), §4.1 (`:1350`) now carry **one identical** qualifier — *the only 1.4 candidate here that is a crate-level safe binding over a ghostty source it vendors and pins itself* | §1 rejection table below the registry table: `khostty-vt` `build.rs:18-20,59,73,161-165` (needs an externally built `libghostty-vt`), `gpui-libghostty` `src/lib.rs:1-9` + `vendor/ghostty/VENDOR.md:4` (GPUI component that vendors source) |
+| **U2** the two candidates were in the plan's own registry output but never evaluated | §1 registry table gains both rows (version/published/`rust-version`/downloads) and a per-crate "fact that decides it" row naming the file it was read from | `GET /api/v1/crates/khostty-vt[/0.1.0]`, `…/gpui-libghostty[/0.3.1]` (2026-10-28T13:2xZ); the `.crate` tarballs unpacked in `~/.hermes/profiles/dev/cache/scratch/lgvt-r3/` |
+| **U3** target count was one short | §1 now says **eight** prebuilt targets and names the missing one, `wasm32-unknown-unknown` | `ghostty-vt-rs-sys-0.2.0/prebuilt.rs:5-13` — the `PREBUILT` slice has eight entries, `wasm32-unknown-unknown` at `:10` |
 
 ---
 
