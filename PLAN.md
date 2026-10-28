@@ -1353,17 +1353,19 @@ BUILD_GATE_WAIT=900 bash ~/.hermes/scripts/build_gate.sh \
   nix-shell ./shell.nix --run 'cargo test --locked'
 ```
 
-> **Baseline, measured on `a91a1a8` (this tree, 2026-10-28, exit 0):**
+> **Baseline, measured on the merged base `75da9ce` (`origin/master` brought forward on 2026-10-28, exit 0):**
 >
 > | target | result |
 > |---|---|
 > | `unittests src/lib.rs` (`ghostwave` lib) | **76 passed, 0 failed** |
-> | `unittests src/main.rs` (`ghostwave` bin) | **190 passed, 0 failed** |
+> | `unittests src/main.rs` (`ghostwave` bin) | **191 passed, 0 failed** |
 > | `tests/flood_throughput.rs` | 1 passed |
 > | `tests/term_core.rs` | 6 passed |
-> | **total** | **273 passed, 0 failed**, finished in 6.5 s (bin) / 2.4 s (lib) |
+> | **total** | **274 passed, 0 failed**, exit 0 |
 >
 > Pre-existing warnings at the base: 3, all in the bin test target (`src/main.rs:376` unused `VecDeque`, two "does not need to be mutable"); the lib target is warning-free. Stage 3 records these, fixes none of them, and adds none.
+>
+> (Measured twice: `273` on the pre-rebase `a91a1a8`, `274` after `origin/master` added one `src/remote.rs` test. Stage 3 starts from the merged base, so **274** is the number it must hold to.)
 
 The 10 tests that leave with `src/selection.rs` are in the **bin** target (`selection::tests::*`, seen in the bin run above), and the six new tests land in `src/term.rs`, i.e. the **lib** target.
 
@@ -1377,7 +1379,7 @@ bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --l
 bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo clippy --locked --all-targets'
 ```
 
-Expected after the change: **lib 82** (76 + the six new `term::` tests), **bin 180** (190 − the ten `selection::tests::`), integration **7** unchanged, i.e. **269 passed / 0 failed** total and exit 0. These are the arithmetic of measured numbers — stage 3 still asserts them by running, and if a target disagrees it reports the real line rather than adjusting it. Clippy: no new warnings (the base's three bin-target warnings are recorded, not fixed).
+Expected after the change: **lib 82** (76 + the six new `term::` tests), **bin 181** (191 − the ten `selection::tests::`), integration **7** unchanged, i.e. **270 passed / 0 failed** total and exit 0. These are the arithmetic of measured numbers — stage 3 still asserts them by running, and if a target disagrees it reports the real line rather than adjusting it. Clippy: no new warnings (the base's three bin-target warnings are recorded, not fixed).
 
 Dependency proof:
 
@@ -1432,6 +1434,9 @@ Each item is its own commit, so stage 4 can review and revert them independently
 4. **B4** Is §5a's "dead" claim true under the whole tree (`src/`, `tests/`, and the `ghostwave` lib target), and is the 10-test subtraction the only test-count effect?
 5. **B5** Is §8.1–8.3's compression design (same lock, one step per tick, token-gated, `Unsupported` is terminal-but-not-a-skip) sufficient, and is test 3 the right pin?
 6. **B6** Is the scope in §6 actually the smallest honest set for the owner's ask — i.e. does it leave out something the ask plainly wanted, or include something it did not?
+
+---
+
 # PLAN — a killed durable session must not come back (`t_6abf6154`)
 
 Card: `t_6abf6154` · repo `/home/death916/code/ghostwave` · branch `wt/t_6abf6154` off `master` `a91a1a8`.
