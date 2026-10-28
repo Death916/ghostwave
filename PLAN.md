@@ -1504,7 +1504,7 @@ Each item is its own commit, so stage 4 can review and revert them independently
 | **D2** follow-up card's blocker misstated | §1 (toolchain block), §4.2, §4 Routing (new title + no-Nix blocker) | `build.rs:397/404/409/437` (Zig resolution via `ZIG`), `shell.nix:8-9,27`, dev-shell `rustc 1.95.0 / zig 0.15.2`, nixpkgs has **no** `zig_0_17` (max `zig_0_16`), `rustPackages_1_97.rustc` = 1.97.1, ziglang.org `0.17.0` aarch64-linux tarball |
 | **D3** tick-`Off` had no stated behaviour | §6 item 4, §8.2 (new decision paragraph), §9-C4, §10-B5 | `app.rs:643-658`, `config.rs:167`, `main.rs:658-661`, `tick.rs:26` |
 | note: wrong pane type | §8.1, §9-C4 | `pane.rs:26`, `pane.rs:602-604`, `app.rs:86` |
-| note: test 4 could be flaky | §7 test 4 | `libghostty-vt-0.2.2/src/terminal.rs:494-500` (token may wrap) |
+| note: test 4 could be flaky | §7 test 4 | `libghostty-vt-0.2.2/src/terminal.rs:493-496` (token is opaque and may wrap; fill scrollback first) |
 | note: `term.rs:1156` | §5d | the call is at `term.rs:1160` |
 
 **One correction to the D3 brief itself.** The card says the `Off` config makes compression "advance ~once/hour". Measured, it is worse: `main.rs:658-661` never subscribes a ticker when `tick_rate()` is `Off`, so `AppState::tick` is not called at all and `tick.rs:26`'s `Off → 3600 s` is unreachable from that path. The `Off` config gets **no** compression, not a slow one — which is why §8.2 now takes the trigger off `tick_rate()` entirely instead of budgeting within the tick.
