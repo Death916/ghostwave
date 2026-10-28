@@ -13,6 +13,7 @@ use std::{
 
 use libghostty_vt::{
     Terminal, TerminalOptions,
+    Error as VtError,
     alloc::Bytes,
     key::{self, Key, Mods},
     kitty::graphics::{self},
@@ -965,7 +966,16 @@ impl TermPane {
 
     /// Detect if the cell at (row_idx, col_idx) contains a clickable URL or file path.
     /// Returns (target_string, start_col, end_col) if found.
+    ///
+    /// An OSC 8 hyperlink on the cell wins: its target is the URI the program
+    /// declared, which need not appear in the visible text at all (`ls
+    /// --hyperlink`, links whose label is a word) and is authoritative across
+    /// wide glyphs and grapheme clusters. Bare URLs and paths in the row text
+    /// are the fallback, so they stay clickable.
     pub fn link_at_cell(&mut self, row_idx: u32, col_idx: u16) -> Option<(String, u16, u16)> {
+        if let Some(hit) = self.osc8_link_at(row_idx, col_idx) {
+            return Some(hit);
+        }
         let snapshot = self.render_state.update(&self.term).ok()?;
         let mut row_it = self.row_it.update(&snapshot).ok()?;
         let mut cur_row = 0u32;
@@ -1032,6 +1042,43 @@ impl TermPane {
             cur_row += 1;
         }
         None
+    }
+
+    /// The OSC 8 hyperlink covering a viewport cell, with the column range of
+    /// the run of cells that shares it.
+    fn osc8_link_at(&self, row: u32, col: u16) -> Option<(String, u16, u16)> {
+        let uri = self.hyperlink_at(row, col)?;
+        let mut start = col;
+        while start > 0 && self.hyperlink_at(row, start - 1).as_deref() == Some(uri.as_str()) {
+            start -= 1;
+        }
+        let mut end = col + 1;
+        while end < self.cols && self.hyperlink_at(row, end).as_deref() == Some(uri.as_str()) {
+            end += 1;
+        }
+        Some((uri, start, end))
+    }
+
+    /// The OSC 8 target a program declared for one viewport cell, if any.
+    fn hyperlink_at(&self, row: u32, col: u16) -> Option<String> {
+        let point = Point::Viewport(PointCoordinate { x: col, y: row });
+        let grid_ref = self.term.grid_ref(point).ok()?;
+        let mut buf = vec![0u8; 256];
+        loop {
+            match grid_ref.hyperlink_uri(&mut buf) {
+                Ok(0) => return None,
+                Ok(len) => return String::from_utf8(buf[..len].to_vec()).ok(),
+                // The URI is longer than the buffer we guessed with; the
+                // library reports the size it needs.
+                Err(VtError::OutOfSpace { required }) if required > buf.len() => {
+                    if required > 64 * 1024 {
+                        return None;
+                    }
+                    buf.resize(required, 0);
+                }
+                Err(_) => return None,
+            }
+        }
     }
 }
 
