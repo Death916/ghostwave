@@ -1199,6 +1199,335 @@ The honest statement stays, and is repeated in §5's `NEEDS-OWNER-VERIFY` and in
 
 ---
 
+# PLAN — libghostty-vt 0.2.2 now; ghostty 1.4's library gains are a separate card; and the 761 lines of hand-rolled selection the library already replaced
+
+Card: `t_df08b599` · repo `/home/death916/code/ghostwave` · worktree `.worktrees/t_df08b599` · branch `wt/t_df08b599` off `master` `a91a1a8`
+Owner's ask (verbatim): *"ghostty has released version 1.4 and i think libghostty was been updated. see if our depencies can be updated for it and also see if any of the featurees it brings weve already implemented and use the library ones instead. check for other things from lib we could use instead of handroll also to save on our own code complexity and ge tthe full benefits of libghostty"*
+
+## 0. The answers, before the evidence
+
+1. **"Can our dependencies be updated for 1.4?"** Not by bumping what we depend on — but a 1.4 binding *does* exist, and it is not the crate we use. **`ghostty-vt` / `ghostty-vt-sys` `0.8.0+ghostty.1.4.0-main.83fb956`** were published **2026-10-28T07:23Z** (§1), a fork of our own dependency ("Adapted from libghostty-vt 0.2.2", `ghostty-vt src/lib.rs:37`) re-pinned to ghostty `83fb956` = `1.4.0-main`. Adopting it is a **migration, not a bump**: it replaces our 9 `on_*` callbacks with an `Event` drain, drops allocators, and needs rustc 1.96 + Zig 0.17 (§4). The crate we actually depend on — **`libghostty-vt` 0.2.2** (2026-09-28) — vendors **the same ghostty commit as 0.2.1**: `a887df42c56f6de86c0fe6da9c4eeca37931e083`, `1.3.2-dev`, dated 2026-07-11, so *our* dependency carries no 1.4 API at all. What we do in this card is **0.2.1 → 0.2.2**, an API-identical soundness release (§2), and the fork goes to its own card (§4 Routing).
+2. **"Features 1.4 brings that we already implemented — use the library ones."** None of the 1.4-only APIs is implemented by us. The two hand-rolled subsystems 1.4 *would* replace are find-in-rows (`src/search.rs`) and session replay (`src/session.rs` pane logs); both are un-swappable inside this card — our pin has no 1.4 API, and the only 1.4 candidate here that is a crate-level safe binding over a ghostty source it vendors and pins itself is the migration of §4 — so they are a follow-up card, not stage 3.
+3. **"Other things from the library we could use instead of hand-rolling."** Yes, three, all available in the pin we already link: a **dead 761-line hand-rolled selection module** (`src/selection.rs`), **scrollback compression** (`Terminal::compress`, never called — and it is 1.4's headline memory feature), and **OSC 8 hyperlinks** (`GridRef::hyperlink_uri`, while we re-scrape row text in `link_at_cell`).
+
+## 1. Measurement log (every claim below is reproducible)
+
+Registry/API, 2026-10-28:
+
+```sh
+curl -sS -H 'User-Agent: ghostwave-dev-plan' https://crates.io/api/v1/crates/libghostty-vt
+#   {"max_stable_version":"0.2.2","newest_version":"0.2.2", ... "created_at":"2026-09-28T12:46:33Z"}
+curl -sS -H 'User-Agent: ghostwave-dev-plan' \
+  https://crates.io/api/v1/crates/libghostty-vt-sys/0.2.2   # features: vendored (default), kitty-graphics, link-dynamic, pkg-config, bindgen-tool
+```
+
+The registry landscape, from a search (this is the command that reproduces §0.1 and §4 — the two per-crate lookups above cannot see a crate that is not `libghostty-vt`):
+
+```sh
+curl -sS -H 'User-Agent: ghostwave-dev-plan' 'https://crates.io/api/v1/crates?q=libghostty&per_page=50'
+#   libghostty · libghostty-vt · libghostty-vt-sys · ghostty-vt · ghostty-vt-sys ·
+#   ghostty-vt-rs-sys · mnml-libghostty-vt(-sys) · khostty-vt · spyc-vt-sys ·
+#   zgx-ghostty-sys · embers-ghostty-sys · betamax-core · qwertty-term-vt · …
+```
+
+Five crates from four projects are the candidates for a 1.4 binding — three published 2026-10-27/28, two 2026-09 — and ours is in the same table only for comparison (per-crate `GET /api/v1/crates/<name>` and `/api/v1/crates/<name>/<version>`, 2026-10-28T13:2xZ):
+
+| crate | version | published | `rust-version` | downloads (crate / that version) |
+|---|---|---|---|---|
+| `ghostty-vt` | `0.8.0+ghostty.1.4.0-main.83fb956` | 2026-10-28T07:23:15Z | 1.96 | 362 / 15 |
+| `ghostty-vt-sys` | `0.8.0+ghostty.1.4.0-main.83fb956` | 2026-10-28T07:23:13Z | 1.96 | 459 / 21 |
+| `ghostty-vt-rs-sys` | `0.2.0` | 2026-10-27T18:59:19Z | 1.90 | 565 / 50 |
+| `libghostty-vt` (ours) | `0.2.2` | 2026-09-28T12:46:33Z | 1.90 | 182 706 / 8 485 |
+| `khostty-vt` | `0.1.0` | 2026-09-20T09:00:03Z | 1.75 | 20 / 20 |
+| `gpui-libghostty` | `0.3.1` | 2026-09-25T14:51:45Z | 1.95 | 836 / 371 |
+
+Round 2's table listed four of these and never evaluated the last two. Both are rejected on a fact read out of their own tarballs, not on a hunch:
+
+| crate | the measured fact that decides it |
+|---|---|
+| `khostty-vt` `0.1.0` | It *is* a safe 1.4 wrapper — `Search` (`src/search/mod.rs:60`), `SnapshotDecoder` (`src/snapshot/mod.rs:89`) over `ghostty_search_new` / `ghostty_snapshot_encode` (`src/ffi.rs:1838`, `:1870`) — but it vendors and pins **no** ghostty source: `build.rs:18-20`, `:59`, `:73` look for an already-built `libghostty-vt` through `GHOSTTY_VT_LIB` / `GHOSTTY_VT_LIB_DIR`, and `build.rs:161-165` warns *"Build it with `zig build -Dlibghostty-vt=true`"*. It is a route only if we build and ship the C library ourselves — strictly more than §4's migration. |
+| `gpui-libghostty` `0.3.1` | It is a GPUI terminal *component*, not a binding for our term core: `src/lib.rs:1-9` renders through Ghostty's Metal / Wayland-OpenGL surface and binds `Terminal` to the host application's GPUI via `bind_gpui!(gpui)`. It does vendor 1.4 source — `vendor/ghostty/VENDOR.md:4` (commit `9f0e1719`), with `ghostty_snapshot_encode` in `vendor/ghostty/include/ghostty/vt/snapshot.h:284` — but exposes nothing `src/term.rs` could call. |
+
+`ghostty-vt` is the only 1.4 candidate here that is a crate-level safe binding over a ghostty source it vendors and pins itself, and it is what §4 evaluates. Measured from the downloaded tarball:
+
+```sh
+# ghostty-vt-0.8.0+ghostty.1.4.0-main.83fb956
+grep -n 'Adapted from' src/lib.rs                      # 37://! Adapted from libghostty-vt 0.2.2 (MIT OR Apache-2.0).
+grep -n 'rust-version' Cargo.toml                      # 14:rust-version = "1.96"
+# ghostty-vt-sys-0.8.0+…/GHOSTTY.lock:
+#   commit = 83fb95624b0439ee660c2679b43b38c8b63769cd
+#   version = 1.4.0-main+83fb956
+grep -n 'pub fn ' ghostty-vt-…/src/search.rs           # Search::new/tick/run/feed/matches/viewport_matches/select_next/select_prev/…
+grep -n 'pub fn \|pub struct ' ghostty-vt-…/src/snapshot.rs   # encode, encode_to, Decoder::{new,decode,ready,next_page}
+for s in ghostty_search_new ghostty_snapshot_encode ghostty_terminal_paste \
+         ghostty_terminal_continuation_alloc ghostty_terminal_mode_get; do
+  printf '%-40s %s\n' "$s" "$(grep -c "$s" ghostty-vt-sys-…/src/bindings.rs)"; done
+#   ghostty_search_new 1 · ghostty_snapshot_encode 3 · ghostty_terminal_paste 6
+#   ghostty_terminal_continuation_alloc 1 · ghostty_terminal_mode_get 0
+```
+
+So the 1.4 API surface §3 needs **is published and wrapped** — by a fork, not by our crate. `ghostty_terminal_mode_get` is gone, but the safe crate keeps `Terminal::mode()` (`src/terminal.rs:409`, now returning `Result`), so the loss is at the C level, not at the API level we use (`term.rs:840`).
+
+`ghostty-vt-rs-sys` 0.2.0 is **raw FFI only** — there is no `ghostty-vt-rs` safe crate on crates.io (`GET /api/v1/crates/ghostty-vt-rs` → 404) — but it is the interesting second lead: it ships **prebuilt static libraries** for eight targets including `aarch64-unknown-linux-gnu` (`prebuilt.rs:9`) and `wasm32-unknown-unknown` (`prebuilt.rs:10`), so it needs **no Zig at all**, and its pinned commit `4a4fc017…` is dated 2026-10-27T16:34Z with the message `up to 1.4.1-dev`. It carries the same 1.4 symbol set (`ghostty_search_new`, `ghostty_snapshot_encode`, no `ghostty_terminal_mode_get`). Writing our own safe wrappers over it is strictly more work than §4's migration, so it is recorded as an alternative, not a route.
+
+
+Crate source diff, `0.2.1` vs `0.2.2` (both tarballs downloaded and unpacked side by side):
+
+```sh
+diff -ru src-0.2.1 src-0.2.2     # 237 diff lines, exactly 4 touched files
+```
+
+| file | change |
+|---|---|
+| `Cargo.toml`, `Cargo.lock`, `.cargo_vcs_info.json` | version bump, `libghostty-vt-sys` 0.2.2 |
+| `src/terminal.rs` | the only source change: clipboard soundness (below) |
+
+**No module added, no public signature changed, no new safe wrapper.** The 0.2.2 change is upstream issue #74: `ClipboardWrite::contents()` no longer calls `slice::from_raw_parts` on `NULL` (the "clear clipboard" shape: OSC 52 with an empty payload), and `ClipboardContent { mime, data }` no longer turns non-UTF-8 bytes into an invalid `&str` (`data` degrades to `""`; `mime` falls back to `application/octet-stream`). Both hunks are in `src/terminal.rs` at the `contents()`/`ClipboardContent::from_raw` sites; the tests added are `#[cfg(miri)]`.
+
+Vendored engine, both versions:
+
+```sh
+grep -n GHOSTTY_COMMIT libghostty-vt-sys-0.2.{1,2}/build.rs
+#   const GHOSTTY_COMMIT: &str = "a887df42c56f6de86c0fe6da9c4eeca37931e083";   ← identical, both
+diff -u libghostty-vt-sys-0.2.1/src/bindings.rs libghostty-vt-sys-0.2.2/src/bindings.rs
+#   (empty) — the FFI surface is byte-identical
+git -C <ghostty checkout> log -1   # a887df4 2026-07-11, build.zig.zon: .version = "1.3.2-dev"
+```
+
+Ghostty 1.4.0 was released **2026-10-27** (ghostty.org release notes), i.e. one day before this card, and three weeks *after* the newest `libghostty-vt` crate. It requires **Zig 0.17** to build ("Changes for Package Maintainers"); our `shell.nix` pins `zig_0_15` (0.15.2, `shell.nix:27`) with the comment that the pinned ghostty needs it (`shell.nix:8-9`).
+
+Toolchain on this box, measured (every number is a command in §4.2):
+
+```sh
+nix-shell ./shell.nix --run 'rustc --version; zig version'
+#   rustc 1.95.0 (59807616e 2026-04-14) · 0.15.2   (/nix/store/d01f6ax…-zig-0.15.2/bin/zig)
+nix-instantiate --eval -E '(import <nixpkgs> {}).lib.version'          # "26.05pre-git"
+nix-instantiate --eval -E '(import <nixpkgs> {}).zig_0_17.version'
+#   error: undefined variable — "Did you mean one of zig_0_12 … zig_0_16?"   ← no 0.17 in nixpkgs
+nix-instantiate --eval -E '(import <nixpkgs> {}).rustPackages_1_97.rustc.version'   # "1.97.1"
+nix-instantiate --eval -E '(import <nixpkgs> {}).rustPackages_1_98.rustc.version'   # "1.98.1"
+curl -sS https://ziglang.org/download/index.json | grep -c '0.17.0'    # 0.17.0, 2026-10-01
+```
+
+C API delta, our pin vs `v1.4.0` (headers fetched from the tag, symbol sets diffed):
+
+```sh
+grep -rho 'ghostty_[a-z_0-9]*' <pin>/include/ghostty/vt/ <pin>/include/ghostty/vt.h | sort -u   # 190
+grep -rho 'ghostty_[a-z_0-9]*' h14/include/ghostty/vt/ h14/include/ghostty/vt.h | sort -u      # 215
+```
+
+New in 1.4 (38 symbols): `ghostty_search_{new,set,get,get_multi,run,feed,tick,free}`, `ghostty_snapshot_{encode,encode_alloc,encode_buf}`, `ghostty_snapshot_decoder_{new,new_buf,decode,next,ready,set,get,get_multi,free}`, `ghostty_terminal_continuation_{alloc,buf,write}` + `ghostty_terminal_vt_write_until`, `ghostty_terminal_paste`, `ghostty_kitty_graphics_animation_tick`, `ghostty_render_state_image_{get,get_multi,iterator_new,iterator_next,iterator_free}`, `ghostty_render_state_{clean,row_iterator_next_dirty}`, `ghostty_formatter_format`, `ghostty_osc_set`, `ghostty_wasm_*` rework.
+Removed/renamed in 1.4 (breaking): `ghostty_terminal_mode_get/set` → the `GHOSTTY_TERMINAL_OPT_MODE` terminal option (`ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_MODE, &cfg)`, `terminal.h:2050`), `ghostty_render_state_colors_get`, `ghostty_vt_osc_free` → `ghostty_osc_free`, and the per-type `ghostty_wasm_alloc_*` helpers collapse to `ghostty_wasm_alloc/free`.
+
+## 2. Why 0.2.2 is not cosmetic for us
+
+Our clipboard path takes the shape the fix is about. `src/term.rs:349`:
+
+```rust
+.on_clipboard_write(|_term, clip| {
+    for content in clip.contents() { ... }
+```
+
+Any program can send OSC 52 with an empty payload ("clear the clipboard"); libghostty then passes `contents = NULL, contents_len = 0`, and 0.2.1's `contents()` runs `std::slice::from_raw_parts(null, 0)` — UB that the rustbindings' own regression test documents (upstream #74, "`from_raw_parts` requires a non-null pointer even at length zero"). That is reachable from ordinary terminal content, so the bump is a soundness fix on a live code path, not housekeeping.
+
+**Honesty constraint for stage 3:** no test we can write *proves* the UB is gone — the upstream tests are Miri-gated and Miri is not part of our toolchain. Stage 3 must say exactly that: the evidence is (a) the version bump, (b) the upstream diff, (c) a regression test that the empty-payload OSC 52 shape is handled without a panic and without a clipboard write, which pins the behaviour but cannot demonstrate the absence of UB.
+
+## 3. What 1.4 would give us, and what it would replace here
+
+| 1.4 C API | what we have today | size it would delete |
+|---|---|---|
+| `ghostty_search_*` (`search.h`) | `src/search.rs` — re-scans every row through `RowIteration` on each tick (`run_on_rows`), plus the match model in `src/search_overlay.rs` | 322 lines + the match/highlight bookkeeping; lib matches are `Selection`s that survive alt-screen switches, resize/reflow and scrollback pruning — ours do not |
+| `ghostty_snapshot_encode/decode` (`snapshot.h`) | `src/session.rs` — tee raw pty bytes to a per-pane log, front-truncate at `max_log_mb`, replay with `vt_write` on restore | the log/truncate/replay machinery (`AsyncPaneLog`, `truncate_log_front`, `replay_pane_log`) |
+| `ghostty_terminal_paste` | `TermPane::paste_text` (`src/term.rs:836`) already uses `paste::encode` + `mode(BRACKETED_PASTE)` | nothing — the lib call only folds the mode check in; low value |
+| kitty graphics animation / relative placements + `render_state_image_*` | we render **no** kitty images at all; we only install a PNG decoder so the core accepts them (`term.rs:1138`) | n/a — a feature we do not have |
+| OSC 7501 program-status, OSC 99 notifications, OSC 72 drag&drop parsing | none | n/a — new capabilities |
+| `terminal_continuation_*` | we `vt_write` whole reads | n/a — we do not chunk |
+
+## 4. Why none of §3 can be in stage 3
+
+Three independent blockers, each measured:
+
+1. **Our dependency carries no 1.4 API, and the only 1.4 candidate here that is a crate-level safe binding over a ghostty source it vendors and pins itself is a migration, not a bump.** `libghostty-vt` 0.2.2 vendors ghostty `a887df42` (`1.3.2-dev`); `search`/`snapshot`/`image` wrappers do not exist in it (§1). The alternative — `ghostty-vt` `0.8.0+ghostty.1.4.0-main.83fb956` (§1) — does wrap them, and this is what adopting it costs in *our* tree, measured:
+   - terminal effects become an **`Event` drain** (`Terminal::events`, `ghostty-vt src/terminal.rs:271`; `Event` enum at `:1223`, `ClipboardWrite` included) where we register **9 callbacks** — `on_pty_write`, `on_size`, `on_device_attributes`, `on_xtversion`, `on_color_scheme`, `on_title_changed`, `on_pwd_changed`, `on_bell`, `on_clipboard_write` at `term.rs:290,299,311,329,330,331,337,343,349`;
+   - it has **no custom allocators and no `'alloc` lifetime**, so `format_selection_alloc(None, opts)` (`term.rs:698`, `:825`) becomes `fmt::Formatter` + `FormatterOptions::with_selection` (`ghostty-vt src/fmt.rs:20,71`), and `Bytes::new_with_alloc` (`term.rs:1163`) goes away;
+   - every getter returns `Result` (its `README.md`), and the crate is Apache-2.0-only where ours is `MIT OR Apache-2.0`.
+   That is **12 call sites rewritten in `src/term.rs`** — the same file stage 3 edits for the 0.2.2 bump. Doing both in one card would bury an API-identical soundness fix inside a pane/effects rewrite and make stage 4 review nothing useful.
+2. **Toolchain: real, but a Nix rebuild is *not* what unblocks it.** Measured in §1, argued here:
+   - **Zig** — `ghostty-vt-sys` 0.8.0 hard-checks `0.17.x` (`build.rs:437`) but *resolves* zig as `ZIG` first (`build.rs:397`), then `PATH` if it reports 0.17 (`:404`), then `mise which zig` (`:409`), panicking with "set ZIG to the Zig 0.17 binary" (`:424-429`) otherwise. So **`ZIG=/path/to/zig-0.17.0/zig` is sufficient and no `shell.nix` edit is required to point at a 0.17 binary.** Our pinned nixpkgs *has no* `zig_0_17` (highest is `zig_0_16` = 0.16.0) and `/nix/store` holds only `zig-0.15.2`, so the 0.17 binary has to come from ziglang.org — `0.17.0`, 2026-10-01, `zig-aarch64-linux-0.17.0.tar.xz` exists — or from `mise`. **A Nix rebuild cannot produce one from this channel.**
+   - **rustc** — `ghostty-vt` needs `>= 1.96` (`Cargo.toml:14`); the dev shell measures **1.95.0**. nixpkgs carries `rustPackages_1_97.rustc` = 1.97.1 and `rustPackages_1_98.rustc` = 1.98.1, usable ad hoc (`nix-shell -p …`), again with no rebuild.
+   - **Opposite toolchains** — these conflict *only while both sys crates are in one build graph*: `libghostty-vt-sys` 0.2.2 builds ghostty 1.3.2-dev, which requires zig **0.15.2** (`shell.nix:8-9`, `:27`), while `ghostty-vt-sys` 0.8.0 requires **0.17.x**. A straight swap has one sys crate and therefore one toolchain; a side-by-side evaluation cannot have both.
+3. **Moving the pin is a source-level decision.** `libghostty-vt-sys` can be pointed at a checkout with `GHOSTTY_SOURCE_DIR`, but then the checked-in `bindings.rs` must match that checkout (it is generated, not built), and every removed symbol (§1) breaks the safe crate. That is a dedicated branch with its own review — which is exactly what Routing below is.
+
+**Routing:** the 1.4 work is a *separate card*, title **`libghostty 1.4: evaluate ghostty-vt 0.8.0 (the published 1.4 binding) against our src/search.rs and src/session.rs`**. Its blocker is **not** "owner builds a devenv with Zig 0.17" — nothing external blocks it: `ZIG=` covers Zig 0.17 and `nix-shell -p` covers rustc 1.96+, both without a Nix edit. It is a *scoped migration* with three measured costs to weigh (12 call sites, day-old fork with 15 downloads of that version, Apache-2.0-only vendor) against the measured prize (the `search`/`snapshot` wrappers that would delete `src/search.rs` and the pane-log replay), and the second lead `ghostty-vt-rs-sys` 0.2.0 (prebuilt static libs for `aarch64-unknown-linux-gnu`, no Zig at all) is the fallback if the 0.17 toolchain proves painful. It is not carved out of this plan as stage 3 scope, and this plan does not schedule it.
+
+## 5. What we can adopt today, measured against the code
+
+**a. Dead hand-rolled selection — delete `src/selection.rs` (761 lines, 10 `#[test]`s).**
+Every symbol in the file (`SelectionModel`, `GridCell`, `SelectionMode`, `expand_word_range`, `extract_selection_*`, `pixel_to_cell`, …) is unreferenced outside the file:
+
+```sh
+grep -rn 'SelectionModel\|GridCell\|SelectionMode\|pixel_to_cell\|cell_to_pixel' src/ tests/ | grep -v '^src/selection.rs'
+#   (no output)
+grep -n 'mod selection' src/main.rs          # 34:pub mod selection;   — the only reference
+```
+
+The live path already **is** the library: `src/term.rs:1005` `SelectionState` drives `selection::gesture::{Gesture, PressEvent, DragEvent, ReleaseEvent}`, `Selection::adjust`, `Terminal::set_selection`, and `copy_selection` copies through `FormatOptions::new().with_trim(true).with_unwrap(true)` (`term.rs:823`). Its four clipboard wrappers (`selection.rs:484-500`) just call `ghostwave::clipboard::{write_text,write_primary_text,read_text,read_primary_text}`, which `term.rs` calls directly. The 10 tests in the file test the dead model, so they leave with it.
+
+**b. Scrollback compression — `Terminal::compress`, present since before 0.2.1, never called.**
+
+```sh
+grep -rn 'compress\|CompressionMode' src/       # (no output)
+grep -n 'pub fn compress' <registry>/libghostty-vt-0.2.1/src/terminal.rs   # 482
+```
+
+`CompressionMode::{Incremental,Full}` + `CompressionResult::{Unsupported,Pending,Complete}` + `compression_activity()` are all in the API we already link (the 0.2.1→0.2.2 diff does not touch them). This is 1.4's memory headline ("70% to 90% less physical memory for typical text") available to us **today**, and it is caller-driven: incremental steps on idle, restart when `compression_activity()` changes. It changes storage only — "never its logical contents or scrollback limit; accessing compressed history restores it transparently".
+
+**c. OSC 8 hyperlinks — `GridRef::hyperlink_uri` (in 0.2.1's `screen.rs:116`; the 0.2.2 diff leaves `screen.rs` untouched).**
+`TermPane::link_at_cell` (`term.rs:888`) reconstructs the row as a string, strips variation selectors, and scans for `http(s)://` / path-shaped tokens. Consequence: an OSC 8 link whose display text is not its URL (the common case — `ls --hyperlink`, `git`'s docs links, systemd, many CLIs) is not clickable, and a long URI is truncated by the row scan. Fix: ask the cell for `hyperlink_uri` first (authoritative, and it survives wide chars / grapheme clusters), fall back to the text scan for bare URLs so the existing clickable-URL feature keeps working.
+
+**d. `png` 0.17 vs 0.18 — one dependency too many.**
+`Cargo.toml:30` says `png = "0.17"` for our kitty `DecodePng` impl; `libghostty-vt`'s `png` feature already pulls `png 0.18.1` (`Cargo.lock` contains both). The crate's own `RustPngDecoder` is still unusable — `graphics.rs:904` is a public struct with a private `buf` field and **no constructor** — so our impl stays, on 0.18. API delta measured against the vendored `png-0.18.1` source: identical except `output_buffer_size()` now returns `Option<usize>` (`decoder/mod.rs:668`), so the call at `term.rs:1160` needs one `?`/`unwrap_or(0)`.
+
+**e. Considered and deliberately not in stage 3**
+
+| candidate | why not |
+|---|---|
+| `paste::is_safe` | available, unused; only meaningful with an "unsafe paste?" confirm prompt — UI scope, deserves its own card |
+| `focus::Event::encode` (mode 1004 in/out reporting) | we implement no focus reporting at all; adding it changes what every program receives — separate card |
+| `log::set_logger` | debugging aid, not code reduction |
+| `osc::Parser` for `src/font_query.rs` | the pin's `GHOSTTY_OSC_COMMAND_*` enum has **no OSC 50** (`osc.h:43-66`), so the hand-written scanner in that 339-line module is the only way to answer font queries — keep it |
+| `sgr::Parser`, `unicode::grapheme_width` | nothing in our tree hand-parses SGR or computes widths; no saving |
+| `fmt::Formatter` | we already copy through the lib's `FormatOptions`; the full-VT dump has no caller |
+| a pty layer | libghostty-vt has none by design; `src/pty.rs` (forkpty via `nix`) stays ours |
+
+## 6. Scope of stage 3 — the smallest honest set
+
+**In:**
+1. `libghostty-vt` `0.2.1` → `0.2.2` (`Cargo.toml:18`, lock refreshed for the crate + `libghostty-vt-sys`).
+2. Unify `png` on 0.18 (`Cargo.toml:30`, one line in `term.rs`'s decoder).
+3. Delete `src/selection.rs` and `src/main.rs:34` (`pub mod selection;`) — 761 lines, 10 tests.
+4. Idle scrollback compression: `TermPane::compress_idle_step()` + one bounded step per pane from a dedicated low-rate ticker (§8.2 — **not** `AppState::tick`, which in the `Off` config never runs at all).
+5. OSC 8 first in `link_at_cell`, text-scan fallback preserved.
+6. Six new tests (§7).
+
+**Out, with reasons recorded:** everything in §3/§4 (needs the §4 migration — a fork of our own crate, rustc 1.96, Zig 0.17 outside nixpkgs — not a dependency bump), §5e (each has its own reason), and any UI change beyond what 4 and 5 require.
+
+## 7. Verification — commands and expected results
+
+Baseline is measured, not quoted. On `a91a1a8`, in the dev shell, with this card's own target dir:
+
+```sh
+cd /home/death916/code/ghostwave/.worktrees/t_df08b599
+export CARGO_TARGET_DIR=/var/build/ghostwave/t_df08b599
+BUILD_GATE_WAIT=900 bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell ./shell.nix --run 'cargo test --locked'
+```
+
+> **Baseline, measured on the merged base `75da9ce` (`origin/master` brought forward on 2026-10-28, exit 0):**
+>
+> | target | result |
+> |---|---|
+> | `unittests src/lib.rs` (`ghostwave` lib) | **76 passed, 0 failed** |
+> | `unittests src/main.rs` (`ghostwave` bin) | **191 passed, 0 failed** |
+> | `tests/flood_throughput.rs` | 1 passed |
+> | `tests/term_core.rs` | 6 passed |
+> | **total** | **274 passed, 0 failed**, exit 0 |
+>
+> Pre-existing warnings at the base: 3, all in the bin test target (`src/main.rs:376` unused `VecDeque`, two "does not need to be mutable"); the lib target is warning-free. Stage 3 records these, fixes none of them, and adds none.
+>
+> (Measured twice: `273` on the pre-rebase `a91a1a8`, `274` after `origin/master` added one `src/remote.rs` test. Stage 3 starts from the merged base, so **274** is the number it must hold to.)
+
+The 10 tests that leave with `src/selection.rs` are in the **bin** target (`selection::tests::*`, seen in the bin run above), and the six new tests land in `src/term.rs`, i.e. the **lib** target.
+
+
+Per-module after the change (same gate, same target dir):
+
+```sh
+bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --locked term::'
+bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --locked app::'
+bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --locked'
+bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo clippy --locked --all-targets'
+```
+
+Expected after the change: **lib 82** (76 + the six new `term::` tests), **bin 181** (191 − the ten `selection::tests::`), integration **7** unchanged, i.e. **270 passed / 0 failed** total and exit 0. These are the arithmetic of measured numbers — stage 3 still asserts them by running, and if a target disagrees it reports the real line rather than adjusting it. Clippy: no new warnings (the base's three bin-target warnings are recorded, not fixed).
+
+Dependency proof:
+
+```sh
+cargo tree -i png --locked        # exactly one png, 0.18.x
+cargo tree -i libghostty-vt --locked   # 0.2.2; sys 0.2.2
+```
+
+Deletion proof:
+
+```sh
+git grep -n 'mod selection' -- src/ tests/    # no match after the change
+test ! -e src/selection.rs && echo gone
+```
+
+The six tests (all in `src/term.rs`'s `#[cfg(test)] mod tests`, no display, no pty):
+
+1. `paste_of_empty_osc52_payload_does_not_panic` — `on_clipboard_write` installed with a `Vec` sink; `vt_write(b"\x1b]52;c;\x07")`; asserts no panic **and** no write recorded. This is the 0.2.2 shape (§2) — a behaviour pin, not a UB proof; the summary must say so.
+2. `osc52_text_write_still_reaches_the_sink` — a normal `\x1b]52;c;` + base64 + BEL still writes text (no regression in the callback path).
+3. `compression_returns_complete_and_keeps_scrollback` — fill 2× scrollback, then `compress(Full)`; assert `CompressionResult::Complete` (fails loudly if the target reports `Unsupported`), then assert the oldest and newest lines are still readable through the render iterator. **This is the test that proves compression actually works on this build rather than being silently unsupported.**
+4. `compression_activity_is_a_token` — `compression_activity()` changes after new output and is stable when idle (the scheduling contract §5b relies on). The token is documented as **opaque, comparable only by equality, and may wrap** (`libghostty-vt-0.2.2/src/terminal.rs:493-496`: "The value may wrap and changes in either direction have the same meaning"), so the assertion is `token != previous`, never an ordering — and fill scrollback first (write enough lines to leave the primary screen) so the activity is guaranteed to move rather than depending on where a short write lands in the compression window.
+5. `link_at_cell_prefers_the_osc8_uri` — write a row whose display text is `docs` and whose OSC 8 target is `https://example.com/x`; `link_at_cell(row, col_of_docs)` returns the URI, not `docs`.
+6. `link_at_cell_still_finds_a_bare_url` — a plain `https://example.com/plain` row still resolves (the fallback).
+
+## 8. Risks and how stage 3 handles them
+
+1. **Compression must be serialized with every other terminal operation** (lib doc: "not thread-safe with other operations on the same terminal… serialize it with writes, rendering, searches", `libghostty-vt-0.2.2/src/terminal.rs:479-481`). The pane handle is `SharedPane = Arc<Mutex<Pane>>` (`src/pane.rs:26`), reached as `PaneEntry::Term(SharedPane)` (`pane.rs:602-604`) out of `Tab.panes: Vec<Option<PaneEntry>>` (`src/app.rs:86`) — there is no `Arc<Mutex<PaneEntry>>` in the tree. The stepper takes one pane's `Mutex<Pane>` and holds it across exactly one `compress` call, then releases it before touching the next pane: never two locks at once, never a lock held while sending messages.
+2. **`AppState::tick` runs at 16 ms (Fast) / 125 ms (Slow) — and in `Off` it does not run at all, so compression must not hang off `tick_rate()`.** `tick_rate()` (`app.rs:643-658`) returns `Off` when there is no toast, no wave energy, `visual_wave == false`, no visualizer, `dynamic_title == Off`, no AI reply pending and no remote activity; `visual_wave` defaults to `true` (`config.rs:167`). Critically, `main.rs:658-661` does `match self.state.tick_rate() { app::TickRate::Off => {} … }` — **no ticker subscription is created**, so `AppState::tick` is never called and `TickSlot::period()`'s `Off → 3600 s` (`tick.rs:26`) is unreachable from the subscription path. A user with `visual_wave = false` and `dynamic_title = "off"` would therefore get **no compression at all** (not one step an hour) in exactly the idle-terminal scenario the feature exists for. **Decision — chosen trigger:** compression runs off a dedicated low-rate ticker, not the animation tick. Concretely: a `Message::CompressTick` delivered by a 4 s stream (modelled on `tick::stream` / `autosave::stream`) subscribed whenever any tab holds a `PaneEntry::Term`, *independent of `tick_rate()`*; its handler `AppState::compress_idle_step()` walks the panes and, per pane, reads `compression_activity()`, keeps the token cached, and calls `compress(Incremental)` **exactly once** when the token is unchanged from the cached one and the pane has been idle for ≥ 2 s since the token last changed. This is the crate's own contract ("cache it and restart its compression idle delay whenever the value changes", `terminal.rs:493-496`), it costs one token read per pane per 4 s, and it is what makes the `Off` config work. When a step returns `Complete` for the current token, nothing more is done until the token changes again. Explicitly rejected: promoting `tick_rate()` to `Slow` while work is pending (that subscribes the app's 125 ms tick-and-repaint loop — wave, toasts, visualizer — for housekeeping) and changing `tick.rs:26`'s `Off → 3600 s` (recorded here as dead code on the `main.rs:660` path so stage 3 does not "fix" it or depend on it).
+3. **`CompressionResult::Unsupported` is a legitimate answer** on some targets; the code must treat it as "do nothing, remember it, stop asking", and test 3 must fail rather than skip if it appears here (x86_64/aarch64 Linux are supported per the release notes — so on orac it must be `Complete`/`Pending`).
+4. **Deleting `src/selection.rs`** is safe today (grep-verified, §5a) but it is a removal of a public `mod` from the binary; a stale local branch could conflict. Stage 3 does the deletion in its own commit so it can be reverted alone.
+5. **`png` 0.18 rename surface** is limited to `output_buffer_size() -> Option<usize>`; if `cargo build` disagrees with that claim the honest move is to keep 0.17 and record it, not to rewrite the decoder.
+6. **`clip.at_cell` reordering (OSC 8 first)** must not change click-through for text that merely *contains* a URL with a hyperlink attached elsewhere; test 6 is the guard.
+
+## 9. Work items for stage 3, in order
+
+| # | change | files |
+|---|---|---|
+| C1 | bump `libghostty-vt` to 0.2.2, refresh lock | `Cargo.toml:18`, `Cargo.lock` |
+| C2 | unify `png` on 0.18 (+ `output_buffer_size` Option) | `Cargo.toml:30`, `src/term.rs:1145-1170` |
+| C3 | delete the dead selection module | `src/selection.rs` (−761), `src/main.rs:34` |
+| C4 | `TermPane::compress_idle_step()` + `AppState::compress_idle_step()` + `Message::CompressTick` on its own 4 s stream (§8.2 — independent of `tick_rate()`) | `src/term.rs`, `src/app.rs`, `src/main.rs` (`Message`, update handler, `subscription()`) |
+| C5 | OSC 8 first in `link_at_cell` | `src/term.rs:888` |
+| C6 | the six tests of §7 | `src/term.rs` `#[cfg(test)]` |
+
+Each item is its own commit, so stage 4 can review and revert them independently.
+
+## 10. What stage 2 has to judge
+
+1. **B1** Is §1's central claim right — that the crate *we* depend on cannot carry 1.4 because its `build.rs` pins `a887df42…` and its `bindings.rs` is byte-identical 0.2.1→0.2.2 — and does §1/§4 keep that separate from the **fork** that does carry 1.4 (`ghostty-vt` 0.8.0), each with a command that reproduces it rather than an assertion?
+2. **B2** Is §4's cost list complete for *this* repo — the fork's 12 call sites (9 callbacks, 2 `format_selection_alloc`, 1 `Bytes::new_with_alloc`), Zig 0.17 vs a nixpkgs that has no `zig_0_17`, rustc 1.95 vs the fork's 1.96 floor, and the generated `bindings.rs`? §4 now says a Nix rebuild is **not** the blocker (`ZIG=`, `nix-shell -p rustPackages_1_97`) — is that right, and does the Routing card overstate what is already possible?
+3. **B3** Is §2's reachability claim right — does `on_clipboard_write` really take the empty-payload shape — and does the plan refuse to claim a test proves the UB is gone?
+4. **B4** Is §5a's "dead" claim true under the whole tree (`src/`, `tests/`, and the `ghostwave` lib target), and is the 10-test subtraction the only test-count effect?
+5. **B5** Is §8.1–8.3's compression design (one pane lock at a time, one `Incremental` step per pane per 4 s ticker, idle-delay gated on `compression_activity()`, `Unsupported` is terminal-but-not-a-skip) sufficient, and is test 3 the right pin?
+6. **B6** Is the scope in §6 actually the smallest honest set for the owner's ask — i.e. does it leave out something the ask plainly wanted, or include something it did not?
+
+### Round-2 changelog (what this revision changed, and why)
+
+| defect | what changed | evidence now in the plan |
+|---|---|---|
+| **D1** "only published binding" was false | §0.1, §0.2, §1 (registry landscape block + candidate table + tarball measurements), §4.1, §4 Routing | `curl …'?q=libghostty&per_page=50'`; `crates.io` per-crate versions/dates/`rust-version`/downloads; `ghostty-vt` `src/lib.rs:37`, `Cargo.toml:14`, `src/search.rs`, `src/snapshot.rs`; `ghostty-vt-sys` `GHOSTTY.lock` and `src/bindings.rs` symbol counts |
+| **D2** follow-up card's blocker misstated | §1 (toolchain block), §4.2, §4 Routing (new title + no-Nix blocker) | `build.rs:397/404/409/437` (Zig resolution via `ZIG`), `shell.nix:8-9,27`, dev-shell `rustc 1.95.0 / zig 0.15.2`, nixpkgs has **no** `zig_0_17` (max `zig_0_16`), `rustPackages_1_97.rustc` = 1.97.1, ziglang.org `0.17.0` aarch64-linux tarball |
+| **D3** tick-`Off` had no stated behaviour | §6 item 4, §8.2 (new decision paragraph), §9-C4, §10-B5 | `app.rs:643-658`, `config.rs:167`, `main.rs:658-661`, `tick.rs:26` |
+| note: wrong pane type | §8.1, §9-C4 | `pane.rs:26`, `pane.rs:602-604`, `app.rs:86` |
+| note: test 4 could be flaky | §7 test 4 | `libghostty-vt-0.2.2/src/terminal.rs:493-496` (token is opaque and may wrap; fill scrollback first) |
+| note: `term.rs:1156` | §5d | the call is at `term.rs:1160` |
+
+**One correction to the D3 brief itself.** The card says the `Off` config makes compression "advance ~once/hour". Measured, it is worse: `main.rs:658-661` never subscribes a ticker when `tick_rate()` is `Off`, so `AppState::tick` is not called at all and `tick.rs:26`'s `Off → 3600 s` is unreachable from that path. The `Off` config gets **no** compression, not a slow one — which is why §8.2 now takes the trigger off `tick_rate()` entirely instead of budgeting within the tick.
+
+### Round-3 changelog (round 2's standing defect: false universals about the 1.4 binding)
+
+| defect | what changed | evidence now in the plan |
+|---|---|---|
+| **U1** the plan called `ghostty-vt` uniquely safe and the sole published 1.4 binding — false, `khostty-vt` 0.1.0 is a published safe 1.4 wrapper | §0.2 (`PLAN.md:1210`), §1 (`:1251`), §4.1 (`:1350`) now carry **one identical** qualifier — *the only 1.4 candidate here that is a crate-level safe binding over a ghostty source it vendors and pins itself* | §1 rejection table below the registry table: `khostty-vt` `build.rs:18-20,59,73,161-165` (needs an externally built `libghostty-vt`), `gpui-libghostty` `src/lib.rs:1-9` + `vendor/ghostty/VENDOR.md:4` (GPUI component that vendors source) |
+| **U2** the two candidates were in the plan's own registry output but never evaluated | §1 registry table gains both rows (version/published/`rust-version`/downloads) and a per-crate "fact that decides it" row naming the file it was read from | `GET /api/v1/crates/khostty-vt[/0.1.0]`, `…/gpui-libghostty[/0.3.1]` (2026-10-28T13:2xZ); the `.crate` tarballs unpacked in `~/.hermes/profiles/dev/cache/scratch/lgvt-r3/` |
+| **U3** target count was one short | §1 now says **eight** prebuilt targets and names the missing one, `wasm32-unknown-unknown` | `ghostty-vt-rs-sys-0.2.0/prebuilt.rs:5-13` — the `PREBUILT` slice has eight entries, `wasm32-unknown-unknown` at `:10` |
+
+---
+
 # PLAN — a killed durable session must not come back (`t_6abf6154`)
 
 Card: `t_6abf6154` · repo `/home/death916/code/ghostwave` · branch `wt/t_6abf6154` off `master` `a91a1a8`.

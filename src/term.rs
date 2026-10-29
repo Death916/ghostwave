@@ -13,6 +13,7 @@ use std::{
 
 use libghostty_vt::{
     Terminal, TerminalOptions,
+    Error as VtError,
     alloc::Bytes,
     key::{self, Key, Mods},
     kitty::graphics::{self},
@@ -21,9 +22,9 @@ use libghostty_vt::{
     screen::Screen,
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     terminal::{
-        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
-        PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
-        SizeReportSize,
+        CompressionActivity, CompressionMode, CompressionResult, ConformanceLevel,
+        DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point, PointCoordinate,
+        PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes, SizeReportSize,
     },
     selection::FormatOptions,
 };
@@ -211,6 +212,37 @@ pub struct TermPane {
     pub log: Option<crate::session::AsyncPaneLog>,
     /// Optional cursor visual style override (from config).
     pub cursor_style: Option<libghostty_vt::render::CursorVisualStyle>,
+    /// Idle scrollback-compression bookkeeping; see [`TermPane::compress_idle_step`].
+    compression: IdleCompression,
+}
+
+/// How long a terminal must sit unchanged before its scrollback is compressed.
+const COMPRESSION_IDLE_DELAY: Duration = Duration::from_secs(2);
+
+/// Schedule state for one terminal's idle scrollback compression.
+///
+/// The library's activity token is opaque: only equality is meaningful, and it
+/// may wrap, so nothing here orders two tokens.
+struct IdleCompression {
+    /// The token the idle delay is measured from; `None` until first observed.
+    token: Option<CompressionActivity>,
+    /// When `token` last changed — the start of the idle delay.
+    changed_at: Instant,
+    /// The token a pass is already complete for: nothing to do until it moves.
+    complete_for: Option<CompressionActivity>,
+    /// The target told us reclamation is unavailable: stop asking.
+    unsupported: bool,
+}
+
+impl IdleCompression {
+    fn new() -> Self {
+        Self {
+            token: None,
+            changed_at: Instant::now(),
+            complete_for: None,
+            unsupported: false,
+        }
+    }
 }
 
 impl TermPane {
@@ -400,6 +432,7 @@ impl TermPane {
             log_name,
             log,
             cursor_style: None,
+            compression: IdleCompression::new(),
         })
         .map(|mut pane| {
             if spawn {
@@ -407,6 +440,54 @@ impl TermPane {
             }
             pane
         })
+    }
+
+    /// Offer the library one bounded scrollback-compression step.
+    ///
+    /// Returns whether a step ran. A step is offered only while the terminal's
+    /// activity token is unchanged (i.e. nothing was written) for
+    /// [`COMPRESSION_IDLE_DELAY`], and only once per token after a pass reports
+    /// [`CompressionResult::Complete`]. `CompressionResult::Unsupported` — the
+    /// target cannot reclaim retained mappings — is remembered, so the pane
+    /// stops being asked.
+    ///
+    /// Compression rewrites storage only: it never changes the logical
+    /// contents or the scrollback limit, so the caller needs no repaint. The
+    /// library requires it to be serialized with every other operation on the
+    /// terminal, which the pane's own lock provides — call this with that lock
+    /// held, never per frame.
+    pub fn compress_idle_step(&mut self) -> bool {
+        if self.compression.unsupported {
+            return false;
+        }
+        let Ok(token) = self.term.compression_activity() else {
+            return false;
+        };
+        if self.compression.token != Some(token) {
+            // New output since the last offer: restart the idle delay.
+            self.compression.token = Some(token);
+            self.compression.changed_at = Instant::now();
+            return false;
+        }
+        if self.compression.complete_for == Some(token)
+            || self.compression.changed_at.elapsed() < COMPRESSION_IDLE_DELAY
+        {
+            return false;
+        }
+        match self.term.compress(CompressionMode::Incremental) {
+            Ok(CompressionResult::Pending) => true,
+            Ok(CompressionResult::Complete) => {
+                self.compression.complete_for = Some(token);
+                true
+            }
+            Ok(CompressionResult::Unsupported) => {
+                self.compression.unsupported = true;
+                false
+            }
+            // A failed call is not the target saying "unsupported"; leave the
+            // state alone and let the next offer retry.
+            Err(_) => false,
+        }
     }
 
     /// Parse a cursor style name string to `CursorVisualStyle`.
@@ -885,7 +966,16 @@ impl TermPane {
 
     /// Detect if the cell at (row_idx, col_idx) contains a clickable URL or file path.
     /// Returns (target_string, start_col, end_col) if found.
+    ///
+    /// An OSC 8 hyperlink on the cell wins: its target is the URI the program
+    /// declared, which need not appear in the visible text at all (`ls
+    /// --hyperlink`, links whose label is a word) and is authoritative across
+    /// wide glyphs and grapheme clusters. Bare URLs and paths in the row text
+    /// are the fallback, so they stay clickable.
     pub fn link_at_cell(&mut self, row_idx: u32, col_idx: u16) -> Option<(String, u16, u16)> {
+        if let Some(hit) = self.osc8_link_at(row_idx, col_idx) {
+            return Some(hit);
+        }
         let snapshot = self.render_state.update(&self.term).ok()?;
         let mut row_it = self.row_it.update(&snapshot).ok()?;
         let mut cur_row = 0u32;
@@ -952,6 +1042,43 @@ impl TermPane {
             cur_row += 1;
         }
         None
+    }
+
+    /// The OSC 8 hyperlink covering a viewport cell, with the column range of
+    /// the run of cells that shares it.
+    fn osc8_link_at(&self, row: u32, col: u16) -> Option<(String, u16, u16)> {
+        let uri = self.hyperlink_at(row, col)?;
+        let mut start = col;
+        while start > 0 && self.hyperlink_at(row, start - 1).as_deref() == Some(uri.as_str()) {
+            start -= 1;
+        }
+        let mut end = col + 1;
+        while end < self.cols && self.hyperlink_at(row, end).as_deref() == Some(uri.as_str()) {
+            end += 1;
+        }
+        Some((uri, start, end))
+    }
+
+    /// The OSC 8 target a program declared for one viewport cell, if any.
+    fn hyperlink_at(&self, row: u32, col: u16) -> Option<String> {
+        let point = Point::Viewport(PointCoordinate { x: col, y: row });
+        let grid_ref = self.term.grid_ref(point).ok()?;
+        let mut buf = vec![0u8; 256];
+        loop {
+            match grid_ref.hyperlink_uri(&mut buf) {
+                Ok(0) => return None,
+                Ok(len) => return String::from_utf8(buf[..len].to_vec()).ok(),
+                // The URI is longer than the buffer we guessed with; the
+                // library reports the size it needs.
+                Err(VtError::OutOfSpace { required }) if required > buf.len() => {
+                    if required > 64 * 1024 {
+                        return None;
+                    }
+                    buf.resize(required, 0);
+                }
+                Err(_) => return None,
+            }
+        }
     }
 }
 
@@ -1157,7 +1284,9 @@ impl graphics::DecodePng for PngDecoder {
         decoder.set_transformations(Transformations::ALPHA | Transformations::STRIP_16);
 
         let mut frame = decoder.read_info().ok()?;
-        let mut buf = vec![0u8; frame.output_buffer_size()];
+        // 0.18 answers None when the frame's output size cannot be computed
+        // (checked arithmetic), which is an image we cannot decode either.
+        let mut buf = vec![0u8; frame.output_buffer_size()?];
         let info = frame.next_frame(&mut buf).ok()?;
 
         let mut bytes = Bytes::new_with_alloc(alloc, info.buffer_size()).ok()?;
@@ -1583,5 +1712,205 @@ mod tests {
             "scrollbar total rows should retain all 2000 lines, got {}",
             sb.total
         );
+    }
+
+    /// A detached pane — no shell spawned — for the link tests.
+    fn test_pane() -> TermPane {
+        let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
+        TermPane::new(80, 24, cell, None, &[], None, 1000, 1024 * 1024, false, None).unwrap()
+    }
+
+    /// Every viewport row as text, top row first.
+    fn viewport_text(term: &Terminal<'static, 'static>) -> Vec<String> {
+        let mut render_state = RenderState::new().unwrap();
+        let snapshot = render_state.update(term).unwrap();
+        let mut row_it = RowIterator::new().unwrap();
+        let mut rows = row_it.update(&snapshot).unwrap();
+        let mut cells = CellIterator::new().unwrap();
+        let mut buf = String::new();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next() {
+            let mut line = String::new();
+            let mut iter = cells.update(row).unwrap();
+            while let Some(cell) = iter.next() {
+                buf.clear();
+                if cell.graphemes_utf8(&mut buf).is_ok() {
+                    line.push_str(&buf);
+                } else {
+                    line.push(' ');
+                }
+            }
+            out.push(line.trim_end().to_string());
+        }
+        out
+    }
+
+    /// The 0.2.2 shape: an OSC 52 write with an empty payload carries no
+    /// representations, and the crate must hand us an empty iterator instead of
+    /// a zero-length slice over a NULL pointer (the 0.2.1 UB, upstream #74).
+    ///
+    /// This pins the behaviour. It cannot demonstrate the absence of UB — that
+    /// needs Miri, which is not part of this toolchain.
+    #[test]
+    fn paste_of_empty_osc52_payload_does_not_panic() {
+        let mut term =
+            Terminal::new(TerminalOptions { cols: 80, rows: 24, max_scrollback: 100 }).unwrap();
+        let writes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = writes.clone();
+        term.on_clipboard_write(move |_term, clip| {
+            for content in clip.contents() {
+                sink.lock().unwrap().push(content.data.to_string());
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        term.vt_write(b"\x1b]52;c;\x07");
+
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "an empty OSC 52 payload must not reach the clipboard"
+        );
+    }
+
+    /// A normal OSC 52 write still arrives at the callback with its payload.
+    #[test]
+    fn osc52_text_write_still_reaches_the_sink() {
+        let mut term =
+            Terminal::new(TerminalOptions { cols: 80, rows: 24, max_scrollback: 100 }).unwrap();
+        let writes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = writes.clone();
+        term.on_clipboard_write(move |_term, clip| {
+            for content in clip.contents() {
+                sink.lock().unwrap().push(content.data.to_string());
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // base64("hello")
+        term.vt_write(b"\x1b]52;c;aGVsbG8=\x07");
+
+        assert_eq!(writes.lock().unwrap().as_slice(), ["hello".to_string()]);
+    }
+
+    /// Compression is supported on this target and does not disturb the logical
+    /// contents: the oldest surviving scrollback row and the newest row both
+    /// read back unchanged after a full pass. This is the test that proves the
+    /// feature works on this build instead of being silently unsupported.
+    #[test]
+    fn compression_returns_complete_and_keeps_scrollback() {
+        let mut term = Terminal::new(TerminalOptions {
+            cols: 40,
+            rows: 6,
+            max_scrollback: 32 * 1024,
+        })
+        .unwrap();
+        // ~2x the scrollback budget, so there is real history to compress and
+        // some of it is pruned.
+        for i in 0..4000 {
+            term.vt_write(format!("line {i:05} ....\r\n").as_bytes());
+        }
+        term.vt_write(b"NEWEST-MARKER\r\n");
+        assert!(
+            term.scrollback_rows().unwrap() > 0,
+            "the writes must have left the primary screen"
+        );
+
+        term.scroll_viewport(ScrollViewport::Top);
+        let oldest = viewport_text(&term)
+            .into_iter()
+            .find(|row| !row.is_empty())
+            .expect("the top of the viewport must hold scrollback text");
+        assert!(
+            oldest.starts_with("line "),
+            "the oldest row is scrollback text, got {oldest:?}"
+        );
+
+        assert_eq!(
+            term.compress(CompressionMode::Full).unwrap(),
+            CompressionResult::Complete,
+            "aarch64 Linux reclaims retained mappings, so this build must not answer Unsupported"
+        );
+
+        term.scroll_viewport(ScrollViewport::Top);
+        let oldest_after = viewport_text(&term)
+            .into_iter()
+            .find(|row| !row.is_empty())
+            .expect("the top of the viewport must still hold scrollback text");
+        assert_eq!(
+            oldest_after, oldest,
+            "compression changes storage only, never the logical contents"
+        );
+
+        term.scroll_viewport(ScrollViewport::Bottom);
+        assert!(
+            viewport_text(&term)
+                .iter()
+                .any(|row| row.contains("NEWEST-MARKER")),
+            "the newest row must still be readable after compression"
+        );
+    }
+
+    /// The scheduling contract the idle stepper relies on: the activity token
+    /// moves when new output arrives and holds still when it does not. The token
+    /// is opaque and may wrap, so only equality is asserted — never an ordering.
+    #[test]
+    fn compression_activity_is_a_token() {
+        let mut term = Terminal::new(TerminalOptions {
+            cols: 40,
+            rows: 6,
+            max_scrollback: 32 * 1024,
+        })
+        .unwrap();
+        // Fill scrollback first: a short write may land without touching the
+        // compression window, and then the token legitimately would not move.
+        for i in 0..1000 {
+            term.vt_write(format!("line {i:05} ....\r\n").as_bytes());
+        }
+
+        let first = term.compression_activity().unwrap();
+        assert_eq!(
+            term.compression_activity().unwrap(),
+            first,
+            "reading the token does not change it"
+        );
+
+        for i in 0..1000 {
+            term.vt_write(format!("more {i:05} ....\r\n").as_bytes());
+        }
+        let second = term.compression_activity().unwrap();
+        assert_ne!(
+            second, first,
+            "new output must move the activity token; an unchanged token means the idle \
+             stepper would never run"
+        );
+    }
+
+    #[test]
+    fn link_at_cell_prefers_the_osc8_uri() {
+        let mut pane = test_pane();
+        // OSC 8 link over a label that is not the URI and would not match the
+        // text scan on its own.
+        pane.term
+            .vt_write(b"\x1b]8;;https://example.com/x\x1b\\docs\x1b]8;;\x1b\\\r\n");
+
+        let (target, start, end) = pane
+            .link_at_cell(0, 0)
+            .expect("the cell carries an OSC 8 hyperlink");
+        assert_eq!(target, "https://example.com/x");
+        assert_eq!((start, end), (0, 4), "the range covers the link's label");
+    }
+
+    #[test]
+    fn link_at_cell_still_finds_a_bare_url() {
+        let mut pane = test_pane();
+        pane.term.vt_write(b"see https://example.com/plain now\r\n");
+
+        let (target, start, end) = pane
+            .link_at_cell(0, 10)
+            .expect("a bare URL stays clickable");
+        assert_eq!(target, "https://example.com/plain");
+        assert_eq!((start, end), (4, 29));
     }
 }
