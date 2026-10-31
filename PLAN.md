@@ -1470,11 +1470,14 @@ BUILD_GATE_WAIT=600 BUILD_JOBS=3 bash ~/.hermes/scripts/build_gate.sh \
 # the new tests, individually (build_info is a lib module; palette/input are bin modules)
 CARGO_TARGET_DIR=/var/build/ghostwave-<id> bash ~/.hermes/scripts/build_gate.sh \
   nix-shell --run 'cargo test --lib build_info:: && \
-                   cargo test --bin ghostwave palette::about && \
+                   cargo test --bin ghostwave palette::tests::about && \
                    cargo test --bin ghostwave executing_about'
 ```
-→ 5 tests in the lib target, 3 in the bin target named `palette::…`, 1 in the bin target from
-`input::tests` — all listed by name and passing.
+→ 5 tests in the lib target, **3** in the bin target named `palette::tests::about_…`, 1 in the bin
+target from `input::tests` — all listed by name and passing. The `palette::tests::` segment is
+required: the three tests live in the existing `mod tests` of `src/palette.rs`, so their full paths
+are `palette::tests::about_…`, and a filter of `palette::about` matches **nothing** while still
+reporting `test result: ok. 0 passed` (§9 D2).
 
 ```sh
 CARGO_TARGET_DIR=/var/build/ghostwave-<id> bash ~/.hermes/scripts/build_gate.sh \
@@ -1495,16 +1498,41 @@ rustfmt --edition 2024 --check build.rs src/build_info.rs    # (inside the dev s
 **not** run repo-wide `cargo fmt` (5033 lines of pre-existing drift, §0.5).
 
 ```sh
-# proves build.rs -> env! -> the row's text, without opening a window
-strings /var/build/ghostwave-<id>/debug/ghostwave \
-  | grep -E 'ghostwave 0\.1\.3 — built [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} UTC'
+# the end-to-end wire (build.rs -> env! -> summary()) — two tests, not a strings grep
+CARGO_TARGET_DIR=/var/build/ghostwave-<id> bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell --run 'cargo test --lib build_info::'
 ```
-→ exactly one match, dated today (UTC).
+→ `the_build_stamp_is_wired` passes: it parses `BUILD_EPOCH` (`env!("GHOSTWAVE_BUILD_EPOCH")`, written
+by `build.rs`) as a `u64` and asserts it is a real epoch `> 1_600_000_000` — so a missing
+`build.rs`/stamp fails loudly instead of printing `1970-01-01`. `summary_names_the_version_and_the_date` passes:
+`summary()` starts with `ghostwave `, carries `env!("CARGO_PKG_VERSION")`, contains ` — built `, and
+ends with ` UTC`. Together these are the whole chain; there is no third assertion to make.
+
+**There is deliberately no `strings` gate, because one cannot work.** `summary()` assembles the line
+at runtime (`format!` over `format_utc(BUILD_EPOCH)`), so the joined text never exists as a
+contiguous literal in the binary, and `strings` (default ASCII charset) additionally breaks any run
+at the multi-byte em dash `—`. Measured on this box with rustc 1.95.0 in the repo's own dev shell, on
+a same-shape minimal program (`const VERSION`/`const BUILD_EPOCH` + runtime `format_utc` +
+`format!("ghostwave {VERSION} — built {}", …)`, §9 D1):
+
+| probe (`≈ /var/build/ghostwave-<id>/debug/ghostwave`) | result |
+|---|---|
+| `./repro_bin` (runtime) | `ghostwave 0.1.3 — built 2026-10-31 03:10 UTC` |
+| `strings repro_bin \| grep -aF '<that exact line>'` | **exit 1, no match** |
+| `strings repro_bin \| grep -aE 'ghostwave 0\.1\.3 — built [0-9]{4}'` | **exit 1, no match** (also unoptimized) |
+| `strings repro_bin \| grep 'ghostwave'` | one line, exactly `ghostwave ` — the fragment, not the line |
+| `strings repro_bin \| grep -x ' built '` | one line, ` built ` |
+| `grep -c 1793416227 repro_bin_debug` (unoptimized) | `1` — the epoch literal is there |
+| `grep -c 1793416227 repro_bin` (`-O`) | `0` — const-folded away; do **not** grep for it in an optimised build |
+
+So: do not add a `strings` check, do not grep for the epoch in a release/`-O` artefact, and do not
+"fix" the code if such a grep fails — it fails on correct code. The `0.1.3` string is present in the
+binary but proves nothing (it is already there from `CARGO_PKG_VERSION` in `src/remote.rs`, §0.2).
 
 **Not verifiable on orac, and stage 3 must say so instead of implying a visual check:** the box is
-headless, so nobody can open the palette and *look*. The tests pin the row's text/category/action and
-`strings` pins the stamp inside the binary; the on-screen appearance is the owner's
-(`NEEDS-OWNER-VERIFY` line, or a `NEEDS-VULCAN:` follow-up if he wants it checked on the laptop).
+headless, so nobody can open the palette and *look*. The tests pin the wiring, the row's
+text/category/action and the toast; the pixels are the owner's (`NEEDS-OWNER-VERIFY` line, or a
+`NEEDS-VULCAN:` follow-up if he wants it checked on the laptop).
 
 ## 5. Risks
 
@@ -1540,12 +1568,13 @@ headless, so nobody can open the palette and *look*. The tests pin the row's tex
 1. Work in a worktree whose HEAD is `origin/master` (`f607c5b`) or later; confirm
    `git merge-base --is-ancestor f607c5b HEAD`. Record the real baseline test count first (§4).
 2. `build.rs` (§2.1) + `src/build_info.rs` (§2.2) + the `lib.rs` line; then the five `build_info`
-   tests (§3) and `cargo test --lib build_info::` green. Then the `strings` check (§4) — C1's
-   end-to-end evidence, taken **before** the palette work so a wiring failure cannot hide behind it.
+   tests (§3) and `cargo test --lib build_info::` green — that is C1's end-to-end evidence
+   (`the_build_stamp_is_wired` + `summary_names_the_version_and_the_date`), taken **before** the
+   palette work so a wiring failure cannot hide behind it. Do **not** add a `strings` check (§4).
 3. `keymap.rs` `About` + `input.rs` arm (§2.3, §2.4) + the `input.rs` toast test.
 4. `palette.rs`: const, `about_item`, the query branch, the inventory row, the hint string
    (§2.5) + the three palette tests.
-5. Full suite, clippy, `strings` (all §4) — paste the real output.
+5. Full suite, clippy, per-test filters (all §4) — paste the real output. No `strings` command.
 6. Commit on the job branch, `fleet_push.sh dev "$PWD" origin <branch>`, open the PR against
    `master` and read it back (state, head sha, base). `ghostwave` is a **public** repo, so the merge
    is the owner's — state that in the PR body.
@@ -1559,10 +1588,93 @@ headless, so nobody can open the palette and *look*. The tests pin the row's tex
    than a fresh way to freeze the stamp?
 2. **Is the grammar right:** `about`/`version` plus ≥3-char prefixes return exactly one row, while
    `a`/`v` and any longer word fall through (§2.5.3, §3 R6)?
-3. **Does the plan separate what it can prove from what it cannot?** The row's text/action and the
-   stamp inside the binary are testable headless (§4); the pixels are not, and §4 says so.
+3. **Does the plan separate what it can prove from what it cannot?** The row's text/action, the toast
+   and the `build.rs → env! → summary()` wiring are testable headless (§4); the pixels are not, and
+   §4 says so — and §9 removed the one §4 check that was not actually verifiable.
 4. **Are the file list and the test count complete** (6 touched files, +9 tests, one exhaustive
    `Action` match at `input.rs:352`), and is anything in §6 silently in scope?
+
+## 9. Errata — round-1 plan review (`t_9ddaca09`), fixed 2026-10-30
+
+Round 1 returned **changes-required** on two §4 verification defects only. The design (§1, §2, §3,
+§5, §6) is unchanged and was explicitly verified sound — C1 (`build.rs` stamp), the ≥3-prefix
+grammar, the 6-file/9-test surface and every line citation are **not** re-opened here. Both defects
+below were reproduced independently by me on orac, in this repo's own dev shell
+(`nix-shell shell.nix`, rustc 1.95.0), before editing §4.
+
+### D1 — the §4 `strings | grep` "end-to-end evidence" could never match (removed)
+
+`summary()` builds its line with `format!` over a **runtime** date (`build_date()` → `format_utc()`),
+so the joined text is never one contiguous literal. Repro: a same-shape minimal program
+(`const VERSION: &str = "0.1.3"`, `const BUILD_EPOCH: &str = "1793416227"`, runtime `format_utc`,
+`format!("ghostwave {VERSION} — built {}", …)`), compiled with `rustc -O` **and** unoptimized:
+
+```
+$ ./repro_bin
+ghostwave 0.1.3 — built 2026-10-31 03:10 UTC
+
+$ strings repro_bin | grep -aF "ghostwave 0.1.3 — built 2026-10-31 03:10 UTC"
+grep exit=1                       # no match, on correct code — optimized and unoptimized both
+
+$ strings repro_bin | grep -aE 'ghostwave 0\.1\.3 — built [0-9]{4}'
+grep exit=1
+
+$ strings repro_bin | grep 'ghostwave'
+ghostwave                          # the fragment only (line ends there)
+$ strings repro_bin | grep -x ' built '
+ built
+```
+
+Two independent causes: the line is runtime-assembled, and `strings`' default ASCII charset breaks a
+run at the multi-byte em dash `—` (the em dash bytes *are* in the binary — `grep -c $'\xe2\x80\x94'`
+→ 1 — just not in a printable run).
+
+Extra measured trap for stage 3: the **epoch literal** is only a raw byte string in an unoptimized
+build — `grep -c 1793416227 repro_bin_debug` → `1`, but `grep -c 1793416227 repro_bin` (`-O`) → `0`
+(`.parse::<u64>()` on a const is folded and the literal is dropped). So an epoch grep is not a
+release-safe check either.
+
+**Fix:** the `strings` command is **deleted** from §4 and from §7 steps 2 and 5; no verification step
+gates on it. The honest end-to-end evidence is the pair of tests the plan already specified —
+`the_build_stamp_is_wired` (parses `BUILD_EPOCH` = `env!("GHOSTWAVE_BUILD_EPOCH")` as a real epoch
+`> 1_600_000_000`) and `summary_names_the_version_and_the_date` (the `summary()` shape) — both run by
+`cargo test --lib build_info::`. §4 now states plainly why the joined line is not in the binary, and
+warns against "fixing" code when such a grep fails. The `0.1.3` string *is* present, but proves
+nothing: `CARGO_PKG_VERSION` is already in the binary via `src/remote.rs` (§0.2).
+
+### D2 — `cargo test --bin ghostwave palette::about` matched 0 tests (filter fixed)
+
+The three palette tests live in the existing `mod tests` of `src/palette.rs`, so their full paths are
+`palette::tests::about_…`; `cargo test` filters by **substring of the full path**, and the `::tests`
+infix breaks `palette::about`. `src/palette.rs:802` is `mod tests {` inside `pub mod palette`, and the
+three test names are `about_and_version_show_the_build_info_row`,
+`about_prefixes_resolve_but_short_queries_do_not`, `about_is_browsable_in_the_inventory` (§3).
+
+Probe crate with the identical layout and the identical three test names:
+
+```
+$ cargo test --bin probe palette::about
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; ...
+        # ^ "ok / 0 passed" — the trap: stage 3 could read this as success
+
+$ cargo test --bin probe palette::tests::about
+running 3 tests
+test palette::tests::about_is_browsable_in_the_inventory ... ok
+test palette::tests::about_and_version_show_the_build_info_row ... ok
+test palette::tests::about_prefixes_resolve_but_short_queries_do_not ... ok
+test result: ok. 3 passed; 0 failed; ...; 1 filtered out
+```
+
+**Fix:** §4's filter is now `palette::tests::about`, expected result restated as **3** tests named
+`palette::tests::about_…`, with a note that a bare `palette::about` matches nothing yet still prints
+`ok`. The other two filters were re-checked and are correct as written: `--lib build_info::` matches
+`build_info::tests::…`, and bare `executing_about` matches `input::tests::executing_about_…`
+(substring, and no other test in `input.rs` carries that infix).
+
+Nothing else in §0–§8 changed; §7 step 2 keeps the same ordered position for the wiring evidence
+(it is now the `build_info` test run, not a grep), so the palette work stays blocked behind a
+failure it cannot hide.
 
 ---
 
