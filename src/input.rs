@@ -483,6 +483,7 @@ pub(crate) fn execute(state: &mut AppState, action: Action) {
 
         Action::Quit => state.quit = true,
         Action::Lock => state.mode = Mode::Locked,
+        Action::About => state.toast(ghostwave::build_info::summary()),
         Action::Unlock => state.mode = Mode::Normal,
         Action::Copy => {
             if let Some(pane) = state.active_pane() {
@@ -2483,5 +2484,14 @@ mod tests {
 
         assert_eq!(toast(&s), "no remote session in active pane");
         assert_eq!(live_panes(&s), before, "no pane was closed");
+    }
+
+    #[test]
+    fn executing_about_toasts_the_version_and_build_date() {
+        let mut s = state();
+
+        execute(&mut s, Action::About);
+
+        assert_eq!(toast(&s), ghostwave::build_info::summary());
     }
 }

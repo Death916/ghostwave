@@ -118,6 +118,8 @@ pub enum Action {
     // global
     Quit,
     Lock,
+    /// Reports this binary's version and build date (palette `about` / `version`).
+    About,
     Unlock,
     OpenCommandBar,
     OpenSearch,
