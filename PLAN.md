@@ -1199,6 +1199,373 @@ The honest statement stays, and is repeated in §5's `NEEDS-OWNER-VERIFY` and in
 
 ---
 
+# PLAN — version + build date when `about` or `version` is typed in the palette
+
+relay: job=`t_f275a01b` · stage 1 (PLAN) · repo `ghostwave` · branch **`wt/palette-version-build-date`**
+cut from `origin/master` `f607c5b` (§0.1) · owner ask, verbatim:
+
+> "add version/build date info to the command pallet when about is typed or version. its hard to
+> see what version is running without checking when the running binary was built"
+
+Read literally: with the palette open (`Ctrl+Shift+P`), typing **`about`** or **`version`** must show
+which ghostwave is running *and when that binary was compiled*. Today neither exists anywhere in the
+UI, and the binary has no `--version` either.
+
+## 0. Measured starting point
+
+### 0.1 The worktree was cut from a stale local `master` — the plan is cut at `origin/master`
+
+```
+$ git log --oneline -1                     # worktree HEAD as the dispatcher left it
+a91a1a8 Merge pull request 'fix(panes): keep a pane's canvas inside its frame stroke' (#20) …
+$ git log --oneline -1 origin/master
+f607c5b Merge pull request 'libghostty-vt 0.2.2 + adopt three library features …' (#25)
+$ git -C /home/death916/code/ghostwave status -sb
+## master...origin/master [behind 25]
+$ git merge-base --is-ancestor origin/master a91a1a8 ; echo $?
+1                                          # the stale head is NOT on top of origin/master
+$ git checkout -b wt/palette-version-build-date origin/master
+Switched to a new branch 'wt/palette-version-build-date'
+```
+
+Every citation below was re-read **on `f607c5b`** after that switch (the 25 missing commits are the
+libghostty-vt 0.2.2 work; they do not move any line cited here, but the numbers were re-checked
+rather than carried over). The stale branch is not rewritten — no `reset --hard` on a worktree.
+
+### 0.2 There is no version surface anywhere in the app
+
+```
+$ grep -n '^version' Cargo.toml
+3:version = "0.1.3"
+$ grep -rn "CARGO_PKG_VERSION" --include=*.rs src/
+src/remote.rs:212,470,539,892,1144,1178      # the ghostd handshake / upload check: the *remote
+                                             # daemon's* version string, unrelated to this binary
+$ grep -rn "\-\-version" src/main.rs
+                                             # no output: the binary has no CLI version flag
+```
+
+So `0.1.3` exists only in `Cargo.toml`; nothing in the UI or on the command line reports it, and
+nothing anywhere records **when** the binary was built. That is exactly the owner's complaint.
+
+### 0.3 The palette's query grammar today (`src/palette.rs`)
+
+`PaletteState::filtered_items` (`palette.rs:110`) handles, in order:
+
+| query | result | where |
+|---|---|---|
+| empty | the whole inventory | `palette.rs:112` |
+| `open <path>` | one `Open file:` row | `palette.rs:117` |
+| `ds <host>` | one durable-SSH row | `palette.rs:129` |
+| `durable`, `durable <text>` | the known durable sessions | `palette.rs:141-157` |
+| `ssh <host>` | SSH row (+ its durable twin) | `palette.rs:159` |
+| anything else | `score_item` fuzzy over title/category/shortcut | `palette.rs:177-194` |
+
+`default_items` (`palette.rs:730`) builds the inventory — Pane/Tab/Terminal/Session/View/App rows
+plus one row per theme, ending with `Lock Terminal` (`palette.rs:786`). **No About or version row
+exists**, and no inventory title/category/shortcut contains "about" or "version", so both queries
+land in the fuzzy branch and return an empty list (the "No matching commands" hint,
+`palette.rs:542`).
+
+### 0.4 The four facts the design rests on (each checked, not assumed)
+
+1. **One dispatch site.** `Action` (`keymap.rs:65-146`) is matched **exhaustively** at
+   `input.rs:352` (`pub(crate) fn execute`). The other `match action` sites are their own enums:
+   `preview.rs:324` (`PreviewAction`) and `ui_session.rs:262` (`SessionsAction`). A new variant
+   therefore costs exactly one arm, and the compiler finds anything else.
+2. **Toasts are transient.** `AppState::toast` (`app.rs:662`) stores `(String, Instant)`
+   (`app.rs:371`) and the tick clears it after **2.5 s** (`app.rs:624`). So the toast can confirm,
+   but the **palette row is the durable display** of the text.
+3. **Row geometry.** A row is one title line at `size 14.0` plus a category badge and an optional
+   shortcut, inside a 600 px × 380 px modal (`palette.rs:555-668`, `:683-700`). A ~48-char title
+   (`48 × ~8.4 px ≈ 400 px`) fits with no wrap and no truncation.
+4. **The palette is rebuilt on every open**, so nothing needs invalidating:
+   `Action::OpenCommandBar` (`input.rs:513`) constructs
+   `PaletteState::with_durables(default_items(&theme::names()), durable_targets(state))`.
+
+### 0.5 Baseline (measured on this branch at `f607c5b`, this worktree)
+
+```
+$ BUILD_GATE_WAIT=600 BUILD_JOBS=3 bash ~/.hermes/scripts/build_gate.sh \
+    env CARGO_TARGET_DIR=/var/build/ghostwave-t_f275a01b nix-shell --run 'cargo test'
+running 82 tests    test result: ok. 82 passed; 0 failed …   (lib)
+running 181 tests   test result: ok. 181 passed; 0 failed …  (bin "ghostwave")
+running 1 test      test result: ok. 1 passed; 0 failed …    (tests/flood_throughput.rs)
+running 6 tests     test result: ok. 6 passed; 0 failed …    (tests/term_core.rs)
+running 0 tests     test result: ok. 0 passed …              (doc-tests)
+                                     → 270 passed / 0 failed / 0 ignored
+
+$ … nix-shell --run 'cargo clippy --all-targets'
+exit 0, and 64 unique warnings are ALREADY on the base
+  ("ghostwave (bin) generated 38 warnings", "(lib) generated 26 warnings");
+  per file: term.rs 19, app.rs 12, search.rs 10, scratchpad.rs 9, input.rs 7, clipboard.rs 7,
+  main.rs 4, palette.rs 3, … , keymap.rs 0, lib.rs 0.
+  → `cargo clippy -- -D warnings` is NOT achievable on this tree; §4 does not ask for it.
+
+$ … nix-shell --run 'cargo fmt --check'
+exit 1 at the base: 5033 diff lines, the first in src/clipboard.rs (import order).
+  → repo-wide rustfmt is already dirty; this diff must not "fix" it (§4).
+```
+
+The first compile of a fresh target dir is the long pole: `libghostty-vt-sys` runs a `zig build` of
+the vendored ghostty (measured here: ~10 min wall on this 4-core box, ~2.6 GB of target dir before
+the Rust crates finish). Budget for it rather than assuming a fast first `cargo test`.
+
+## 1. Candidates, and why the chosen one wins
+
+| # | Where the "when was it built" number could come from | Evidence | Verdict |
+|---|---|---|---|
+| C1 | `build.rs` stamps the compile clock into an env var (`GHOSTWAVE_BUILD_EPOCH`) | no dependency, no external `date`, no file written; rebuilds move it | **chosen** — it is literally the compile instant, and it is testable |
+| C2 | `std::fs::metadata(std::env::current_exe()).modified()` at runtime | reports the **file's** mtime — every `cp`/`rsync`/install of the binary resets it, and `cargo run` after a relink reports link time, not compile time | rejected: a different question ("when was this file copied") with a wrong-feeling answer |
+| C3 | `option_env!("SOURCE_DATE_EPOCH")` / nix-provided timestamp | nothing in this repo's `shell.nix`/`devenv.nix` exports one; would report the *nix build* time only when built through nix, which `cargo test`/`cargo run` are not | rejected: silently absent in the normal dev flow |
+| C4 | Version only, no date (`env!("CARGO_PKG_VERSION")`) | never goes stale, but it is precisely what the owner says is not enough — `0.1.3` does not distinguish today's build from last week's | rejected by the ask |
+| C5 | Version in the status bar / title bar instead of the palette | the owner named the palette (`about` / `version`); the status bar is a different product decision | not this card (§6) |
+
+## 2. Design (binding — stage 3 does not re-litigate)
+
+Pipeline: **compile clock → one env const → lib formatter → palette row**, and the same string as a
+toast when the row is submitted.
+
+### 2.1 `build.rs` (new, package root, ~10 lines)
+
+```rust
+fn main() {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("cargo:rustc-env=GHOSTWAVE_BUILD_EPOCH={secs}");
+}
+```
+
+* One env var, **unix seconds** — the script does no date formatting, so the date math lives in the
+  lib where it can be unit-tested (§2.2, §3). No dependency, no external `date`, nothing written.
+* **It deliberately emits no `rerun-if-changed`.** Cargo's default then applies: rerun when *any*
+  file in the package changes, i.e. the stamp moves whenever the crate is genuinely recompiled. (A
+  `rerun-if-changed=build.rs` alone would freeze the stamp across source edits — the exact failure
+  that would make the feature useless.)
+* Consequence, documented in `build_info`'s docs rather than hidden: a build that only *relinks* an
+  unchanged crate keeps the previous stamp. That is the honest answer — the crate was compiled then.
+
+### 2.2 `src/build_info.rs` (new, in the lib) + `pub mod build_info;` in `src/lib.rs`
+
+`src/lib.rs` is an alphabetical list (`clipboard`, `config`, `font_query`, …), so the new line goes
+**before** `pub mod clipboard;` (`lib.rs:3`).
+
+```rust
+//! What the running binary is: its crate version and the instant it was compiled.
+
+/// The crate version from `Cargo.toml` (`0.1.3`).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Unix seconds of the compile, written by `build.rs`.
+pub const BUILD_EPOCH: &str = env!("GHOSTWAVE_BUILD_EPOCH");
+
+/// Formats a unix timestamp as `YYYY-MM-DD HH:MM UTC` (civil-from-days, no dependency).
+pub fn format_utc(epoch_secs: u64) -> String;
+
+/// When this crate was compiled, `YYYY-MM-DD HH:MM UTC`.
+pub fn build_date() -> String;
+
+/// `ghostwave 0.1.3 — built 2026-10-30 05:12 UTC` — the one line both surfaces show.
+pub fn summary() -> String;
+```
+
+`build_date` parses `BUILD_EPOCH` with
+`.parse().expect("build.rs sets GHOSTWAVE_BUILD_EPOCH to unix seconds")` — **loud**, not
+`unwrap_or(0)`: a build with no stamp must fail rather than claim 1970. Every cargo build sets it,
+and §3 pins that it parses.
+
+### 2.3 `src/keymap.rs` — one variant
+
+`About,` in the `// global` group of `Action`, immediately after `Lock,` (`keymap.rs:120`).
+
+### 2.4 `src/input.rs` — one arm
+
+In `execute`, in the `// global` region next to `Action::Quit`/`Action::OpenCommandBar`
+(`input.rs:484`, `:513`):
+
+```rust
+Action::About => state.toast(ghostwave::build_info::summary()),
+```
+
+### 2.5 `src/palette.rs` — the row
+
+1. `const ABOUT_CATEGORY: &str = "About";` beside `DURABLE_CATEGORY` (`palette.rs:51`).
+2. ```rust
+   /// The single row shown for `about`/`version`: what this binary is and when it was built.
+   fn about_item() -> PaletteItem {
+       PaletteItem::new(ghostwave::build_info::summary(), ABOUT_CATEGORY, None, Action::About)
+   }
+   ```
+3. In `filtered_items`, **after** the `ssh ` branch (`palette.rs:175`) and **before**
+   `let is_theme_filter = …` (`palette.rs:177`):
+
+   ```rust
+   if lower.len() >= 3 && ["about", "version"].iter().any(|w| w.starts_with(&lower)) {
+       return vec![about_item()];
+   }
+   ```
+
+   Grammar: `about`, `abo`, `version`, `vers`, `ver` → exactly the one info row. A 1–2 char query
+   (`a`, `v`) keeps the normal fuzzy list, so nothing is hijacked while the user is typing some
+   other command. Anything longer than the word (`aboutx`) falls through to fuzzy.
+4. Inventory (`default_items`, after `Lock Terminal`, `palette.rs:786`):
+   `PaletteItem::new("About ghostwave", "App", None, About),` — browsable, and findable by fuzzy
+   (`abo`) and by substring; also the anchor for a future keybind.
+5. Empty-state hint (`palette.rs:542`) gains `| about`:
+   `"No matching commands (try: open <path> | ssh <host> | ds <host> | durable | theme <name> | about)"`.
+
+The row and the toast print the **identical** string (`build_info::summary()`), so the two can never
+disagree.
+
+## 3. Tests (all headless)
+
+`src/build_info.rs`, `#[cfg(test)]`:
+
+| test | asserts |
+|---|---|
+| `formats_the_epoch` | `format_utc(0) == "1970-01-01 00:00 UTC"` |
+| `formats_a_known_modern_instant` | `format_utc(1_700_000_000) == "2023-11-14 22:13 UTC"` |
+| `formats_a_leap_day` | `format_utc(951_782_400) == "2000-02-29 00:00 UTC"` |
+| `the_build_stamp_is_wired` | `BUILD_EPOCH.parse::<u64>()` is `Ok(n)` with `n > 1_600_000_000` (proves `build.rs` ran) |
+| `summary_names_the_version_and_the_date` | `summary()` starts with `"ghostwave "`, contains `env!("CARGO_PKG_VERSION")`, contains `" — built "`, ends with `" UTC"` |
+
+`src/palette.rs`, in the existing `mod tests`:
+
+| test | asserts |
+|---|---|
+| `about_and_version_show_the_build_info_row` | for `about` and `version`: `filtered_items().len() == 1`, `category == "About"`, `title == ghostwave::build_info::summary()`, `action == Action::About` |
+| `about_prefixes_resolve_but_short_queries_do_not` | `abo`, `ver`, `vers` → the same single row; `a` → the info row is **absent** (normal filtering applies) |
+| `about_is_browsable_in_the_inventory` | `default_inventory()` contains an item titled `"About ghostwave"` with `Action::About` |
+
+`src/input.rs`, in the existing `mod tests` (helper `fn state() -> AppState`, `input.rs:785`):
+
+| test | asserts |
+|---|---|
+| `executing_about_toasts_the_version_and_build_date` | after `execute(&mut s, Action::About)`, `s.toast` message == `ghostwave::build_info::summary()` |
+
+No test needs a display, a pty child, or the network; `state()` already spawns the first pane the way
+every neighbouring test does.
+
+## 4. Verification — exact commands, expected results
+
+Per-card target dir, every compile through the gate:
+
+```sh
+cd /home/death916/code/ghostwave/.worktrees/<stage-3 workspace>
+export CARGO_TARGET_DIR=/var/build/ghostwave-<stage-3 card id>
+BUILD_GATE_WAIT=600 BUILD_JOBS=3 bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell --run 'cargo test'
+```
+
+* Expected: `0 failed`, `0 ignored`, and the pass count is **279** — the §0.5 baseline **270 + 9**
+  (5 in `build_info` → lib 82→87, 3 in `palette` + 1 in `input` → bin 181→185, the two integration
+  targets unchanged). Stage 3 must **re-measure the baseline on its own workspace** and paste both
+  numbers; a quoted constant from here is not evidence.
+* Gate exit 3 = another heavy build holds the lock → `kanban_comment` + block `kind=transient`,
+  never compile around it. Exit 4 = < 5000 MB available → retry later. Never share a target dir
+  between worktrees (stale rlibs).
+
+```sh
+# the new tests, individually (build_info is a lib module; palette/input are bin modules)
+CARGO_TARGET_DIR=/var/build/ghostwave-<id> bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell --run 'cargo test --lib build_info:: && \
+                   cargo test --bin ghostwave palette::about && \
+                   cargo test --bin ghostwave executing_about'
+```
+→ 5 tests in the lib target, 3 in the bin target named `palette::…`, 1 in the bin target from
+`input::tests` — all listed by name and passing.
+
+```sh
+CARGO_TARGET_DIR=/var/build/ghostwave-<id> bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell --run 'cargo clippy --all-targets'
+```
+→ exit 0, and **no warning that is not already on the base**. This tree carries 64 pre-existing
+clippy warnings (§0.5), so `-D warnings` is not the bar and must not be added — the bar is that the
+warning set is unchanged. The four pre-existing sites in the files this diff touches are
+`palette.rs:193` (`sort_by_key`), `palette.rs:325` and `palette.rs:443` (collapsible `if`),
+`input.rs:170`, `:560`, `:1046`, `:1073`, `:1353`, `:1435`, `:2281`; `keymap.rs` and `lib.rs` are
+clean. New code must not add a warning, and those ten must be left alone.
+
+```sh
+# formatting: the two NEW files only — repo-wide `cargo fmt --check` already fails at the base
+rustfmt --edition 2024 --check build.rs src/build_info.rs    # (inside the dev shell)
+```
+→ exit 0 for the new files. In the four existing files, match the surrounding style by hand; do
+**not** run repo-wide `cargo fmt` (5033 lines of pre-existing drift, §0.5).
+
+```sh
+# proves build.rs -> env! -> the row's text, without opening a window
+strings /var/build/ghostwave-<id>/debug/ghostwave \
+  | grep -E 'ghostwave 0\.1\.3 — built [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} UTC'
+```
+→ exactly one match, dated today (UTC).
+
+**Not verifiable on orac, and stage 3 must say so instead of implying a visual check:** the box is
+headless, so nobody can open the palette and *look*. The tests pin the row's text/category/action and
+`strings` pins the stamp inside the binary; the on-screen appearance is the owner's
+(`NEEDS-OWNER-VERIFY` line, or a `NEEDS-VULCAN:` follow-up if he wants it checked on the laptop).
+
+## 5. Risks
+
+* **R1 — non-reproducible builds.** A compile timestamp makes each build's binary differ. Inherent
+  to the feature; nothing in this tree depends on reproducible outputs.
+* **R2 — stamp goes stale after a relink-only rebuild** (§2.1). Accepted and documented in the
+  module docs; it is the correct reading of "when the crate was compiled".
+* **R3 — `env!` / `expect` fails if `build.rs` is removed** or a non-cargo build is attempted.
+  Loud failure is the point; a test pins that the const parses.
+* **R4 — new `Action` variant.** Only `input.rs:352` matches exhaustively today; the compiler is the
+  safety net. If a `match` elsewhere needs an arm, add the arm — do not restructure the enum.
+* **R5 — row width.** `summary()` is ~48 chars at `0.1.3`. If a future version or a longer stamp
+  overflows the 600 px modal, let the title fill the row (`Length::Fill`) rather than shortening the
+  string: the owner asked for the information.
+* **R6 — the prefix rule overlaps the fuzzy fallback** (`abo` matches both the rule and the
+  inventory row). The rule returns first, so exactly one row is shown, and the `palette` test pins
+  `len == 1`.
+* **R7 — the date is UTC only.** Deliberate: one unambiguous stamp, no locale/timezone dependency.
+  The row says `UTC`.
+
+## 6. NOT doing (explicit)
+
+* No CLI `--version` / `-V` flag for the `ghostwave` binary (a separate, small card if wanted).
+* No git commit hash, branch name, or dirty-worktree marker in the string.
+* No About dialog/window, no status-bar, tab-bar or title-bar version, no new keybind.
+* No change to `ghostd`, the ssh upload path, or the `ghostd <ver>` handshake.
+* No reproduction/build-id work (R1).
+* No README/PROGRESS rewrite beyond one short `PROGRESS.md` entry if the repo's log style asks for
+  it (previous cards did add one; keep it to the behaviour, not to this plan).
+
+## 7. Ordered work items for stage 3 (CODE)
+
+1. Work in a worktree whose HEAD is `origin/master` (`f607c5b`) or later; confirm
+   `git merge-base --is-ancestor f607c5b HEAD`. Record the real baseline test count first (§4).
+2. `build.rs` (§2.1) + `src/build_info.rs` (§2.2) + the `lib.rs` line; then the five `build_info`
+   tests (§3) and `cargo test --lib build_info::` green. Then the `strings` check (§4) — C1's
+   end-to-end evidence, taken **before** the palette work so a wiring failure cannot hide behind it.
+3. `keymap.rs` `About` + `input.rs` arm (§2.3, §2.4) + the `input.rs` toast test.
+4. `palette.rs`: const, `about_item`, the query branch, the inventory row, the hint string
+   (§2.5) + the three palette tests.
+5. Full suite, clippy, `strings` (all §4) — paste the real output.
+6. Commit on the job branch, `fleet_push.sh dev "$PWD" origin <branch>`, open the PR against
+   `master` and read it back (state, head sha, base). `ghostwave` is a **public** repo, so the merge
+   is the owner's — state that in the PR body.
+7. On the card: `NEEDS-OWNER-VERIFY` for the on-screen row (headless box), then hand stage 4 to
+   `review`.
+
+## 8. What stage 2 (PLAN REVIEW) must judge
+
+1. **Is C1 the right source for "when the binary was built"** — compile clock via `build.rs` — given
+   the rejected alternatives in §1, and is the no-`rerun-if-changed` choice (§2.1) correct rather
+   than a fresh way to freeze the stamp?
+2. **Is the grammar right:** `about`/`version` plus ≥3-char prefixes return exactly one row, while
+   `a`/`v` and any longer word fall through (§2.5.3, §3 R6)?
+3. **Does the plan separate what it can prove from what it cannot?** The row's text/action and the
+   stamp inside the binary are testable headless (§4); the pixels are not, and §4 says so.
+4. **Are the file list and the test count complete** (6 touched files, +9 tests, one exhaustive
+   `Action` match at `input.rs:352`), and is anything in §6 silently in scope?
+
+---
+
 # PLAN — libghostty-vt 0.2.2 now; ghostty 1.4's library gains are a separate card; and the 761 lines of hand-rolled selection the library already replaced
 
 Card: `t_df08b599` · repo `/home/death916/code/ghostwave` · worktree `.worktrees/t_df08b599` · branch `wt/t_df08b599` off `master` `a91a1a8`
