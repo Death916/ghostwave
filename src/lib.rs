@@ -1,5 +1,6 @@
 //! ghostwave library exports for testing and integration.
 
+pub mod build_info;
 pub mod clipboard;
 pub mod config;
 pub mod font_query;

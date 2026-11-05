@@ -1515,3 +1515,36 @@ and `~/.ssh/authorized_keys` does not exist (`~/.ssh` holds `hermes_ed25519`, `h
 assumption that `ssh -t … sh -c` returns the remote status as the pane's exit code is unchanged code
 (`remote.rs`'s `last_exit_code`) and unverified here. To make the hop verifiable on orac: append
 `~/.ssh/hermes_ed25519.pub` to `~/.ssh/authorized_keys`.
+
+### Version and build date when you type `about`/`version` in the palette (card `t_f275a01b`, 2026-10-31)
+
+relay: job=t_f275a01b
+
+Typing `about` or `version` — or any prefix from three letters up (`abo`, `ver`, `vers`) — in the
+command palette (`Ctrl+Shift+P`) now returns one row reading `ghostwave 0.1.3 — built 2026-10-31
+03:34 UTC`; submitting it toasts the same string. Its category is `About`, the inventory also gained
+a browsable `About ghostwave` row under `App`, and the empty-state hint lists `about`.
+
+The date comes from `build.rs`, which stamps the compile clock into `GHOSTWAVE_BUILD_EPOCH` as unix
+seconds; `src/build_info.rs` parses it with `.expect(..)` and formats `YYYY-MM-DD HH:MM UTC` by
+civil-from-days (no dependency), so a build without a stamp fails loudly instead of claiming 1970.
+No `rerun-if-changed` is emitted, so the stamp follows cargo's default and moves on every recompile
+of the package. The rejected sources: the binary's mtime answers "when was this file copied", and
+`SOURCE_DATE_EPOCH` is not exported by this repo's shell. One- and two-letter queries (`a`, `v`)
+keep the ordinary fuzzy list, so typing another command is never hijacked.
+
+- **Suite**: base measured on this worktree through the gate — **270 passed / 0 failed** (82 lib +
+  181 bin + 1 + 6); after the change **279** (`+9`: 5 in `build_info`, 3 in `palette`, 1 in
+  `input`). Per-filter: `--lib build_info::` → 5, `--bin ghostwave palette::tests::about` → 3,
+  `executing_about` → 1. The `palette::tests::` segment matters: a bare `palette::about` filter
+  reports `ok / 0 passed` because the tests live in `mod tests`.
+- **No `strings` check exists, and none would work**: `summary()` assembles the line at runtime and
+  the em dash is multi-byte, so the joined text is never a printable `strings` run. The
+  `build.rs → env! → summary()` chain is pinned instead by
+  `build_info::tests::the_build_stamp_is_wired` (the stamped const parses as a real epoch) and
+  `summary_names_the_version_and_the_date` (the line's shape).
+- **clippy**: rc 0, warning sites identical to the base by file (93 before / 93 after, none in the
+  new files). `rustfmt --edition 2024 --check build.rs src/build_info.rs` is clean; repo-wide
+  `cargo fmt --check` is already 5033 lines dirty at the base and was not run.
+- **NEEDS-OWNER-VERIFY**: this box is headless, so nobody looked at the row. The tests pin its
+  text, category, action and the toast; the pixels are the owner's.
