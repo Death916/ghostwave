@@ -1202,15 +1202,17 @@ The honest statement stays, and is repeated in §5's `NEEDS-OWNER-VERIFY` and in
 `surface: files=7 lines=~240 new_deps=no` (config.rs, keymap.rs, app.rs, palette.rs, input.rs,
 README.md, plus this PLAN.md section; PLAN.md is plan-only and not part of the code diff)
 
-Job `t_2b6d9c03`, relay stage 1. Base: `master` `a91a1a8`, branch `wt/durable-ssh-in-pane`.
-The design below is fixed by the manager's job card; this section does not redesign it, it fills in
+Job `t_2b6d9c03`, relay stage 1. Base: the dispatcher cut the branch at local `master` `a91a1a8`, which was 30 commits behind
+`origin/master`; the pre-push gate refuses a branch behind master, so the branch was merged
+forward before this section was pushed and **every line cite below is re-verified at
+`5fba514`** (`origin/master` at the time of writing). The design below is fixed by the manager's job card; this section does not redesign it, it fills in
 the exact edits, the exact assertions and the split.
 
 ### 1. What changes
 
 **(a) `src/config.rs` — the type, the parser, the field.**
 
-Next to `RemoteConfig` (today `src/config.rs:45-57`):
+Next to `RemoteConfig` (today `src/config.rs:46-55`):
 
 ```rust
 /// Where a durable `ds <host>` connection opens.
@@ -1267,7 +1269,7 @@ the enum and not a parse error: a failing `toml::from_str` drops the *whole* con
 
 **(b) `src/keymap.rs` — the action carries the resolved placement.**
 
-`src/keymap.rs:129` `ConnectDurableSsh(String)` becomes
+`src/keymap.rs:131` `ConnectDurableSsh(String)` becomes
 `ConnectDurableSsh(String, DurablePlacement)`, with `use crate::config::DurablePlacement;` beside the
 existing `use crate::layout::Dir;` (`src/keymap.rs:6`). Both are lib modules and `config` does not
 depend on `keymap`, so there is no cycle.
@@ -1279,7 +1281,7 @@ the value to build the item text, so resolving once means the text and the behav
 **(c) `src/app.rs` — `connect_durable_ssh(host, placement)`, one shared attach tail.**
 
 `pub fn connect_durable_ssh(&mut self, host: &str, placement: DurablePlacement)`
-(today `src/app.rs:1136-1173`). The host-validity guard and the whole "already bound here? focus /
+(today `src/app.rs:1156-1196`). The host-validity guard and the whole "already bound here? focus /
 reconnect / else create the pane" tail move verbatim into a private helper, so `OwnSession` cannot
 drift from today:
 
@@ -1313,41 +1315,42 @@ window change. The unit of "pane" here is one tab holding the attach pane, which
 pane is opened in this front-end (`push_remote_tab`); this is deliberate, not a limitation to fix
 here.
 
-`remote_pane_of_host` (`src/app.rs:1365-1380`) stays session-local in this sitting — the cross-session
+`remote_pane_of_host` (`src/app.rs:1385-1400`) stays session-local in this sitting — the cross-session
 rule is sitting 2 (§6).
 
 **(d) `src/palette.rs` — the placement is a palette field, three prefixes, honest titles.**
 
-- `PaletteState` (`~src/palette.rs:70-84`) gains `pub default_placement: DurablePlacement`.
+- `PaletteState` (`src/palette.rs:81-93`) gains `pub default_placement: DurablePlacement`.
 - `with_durables(items, durables)` → `with_durables(items, durables, placement)`; `new(items)` keeps
   its signature and passes `DurablePlacement::OwnSession`; `Default` follows `new`. Four construction
-  sites update: `PaletteState::new`'s own call (`src/palette.rs:88`), `input.rs:514`, and the three
-  palette tests at `src/palette.rs:946/959/978`.
-- `durable_item(host, session)` (`src/palette.rs:55-66`) → `durable_item(host, session, placement)` and
+  sites update: `PaletteState::new`'s own call (`src/palette.rs:103`), `input.rs:515`, and the three
+  palette tests at `src/palette.rs:966/979/998`.
+- `durable_item(host, session)` (`src/palette.rs:70-79`) → `durable_item(host, session, placement)` and
   titles `Durable session: {host} — {session} ({placement.palette_label()})`.
-- `filtered_items` (`src/palette.rs:119` onwards): `ds <host>` uses `self.default_placement`; new
+- `filtered_items` (`src/palette.rs:131` onwards): `ds <host>` uses `self.default_placement`; new
   `dsp <host>` forces `Pane`; new `dss <host>` forces `OwnSession`. Both new prefixes are matched
   before the generic fallback and cannot collide with `"ds "` (the strings differ at index 2). Titles:
   `Durable SSH (ghostd, {label}): {host}` — so `ds orac` reads `Durable SSH (ghostd, new pane): orac`
   under a `pane` config and `… (own session): orac` by default.
 - `durable <text>` and bare `durable`: inventory items carry the default placement, and the
-  "new durable" item (`src/palette.rs:145-156`) reads
+  "new durable" item (`src/palette.rs:156-171`) reads
   `New durable SSH (ghostd, {label}): {text}`.
-- The no-match hint (`src/palette.rs:~542`) becomes
-  `open <path> | ssh <host> | ds <host> | dsp <host> | dss <host> | durable | theme <name>`.
+- The no-match hint (`src/palette.rs:561`) becomes
+  `open <path> | ssh <host> | ds <host> | dsp <host> | dss <host> | durable | theme <name> | about`
+  (the trailing `about` is new on this base — keep it).
 - The `ds`/`dsp`/`dss` bare-query behaviour is unchanged: a prefix with no host still offers nothing.
 
 **(e) `src/input.rs` — dispatch and palette construction.**
 
-`src/input.rs:540` → `Action::ConnectDurableSsh(host, placement) => state.connect_durable_ssh(&host, placement)`.
-`src/input.rs:514` (palette open) passes `state.config.remote.durable_ssh_placement` as the third
-`with_durables` argument. No other change: `durable_targets` (`src/input.rs:335-346`) needs **nothing**
+`src/input.rs:541` → `Action::ConnectDurableSsh(host, placement) => state.connect_durable_ssh(&host, placement)`.
+`src/input.rs:515` (palette open) passes `state.config.remote.durable_ssh_placement` as the third
+`with_durables` argument. No other change: `durable_targets` (`src/input.rs:340-351`) needs **nothing**
 — a durable pane opened in the current session is already in `live_remote_specs(&state.tabs)`, and
 the saved sessions are already swept by `all_remote_specs()`.
 
-**(f) `README.md` — the config key, and the stale bullet.**
+**(f) `README.md` — the config key, and a dangling reference the base already left behind.**
 
-The Configuration block (`README.md:69-95`) has no `[remote]` section at all today, so add one,
+The Configuration block (`README.md:69-95`) has no `[remote]` section today, so add one after `[ai]`,
 listing the three keys that already exist plus the new one, each with the accepted values and the
 default marked:
 
@@ -1359,11 +1362,12 @@ reconnect_delay_secs = 3
 durable_ssh_placement = "own-session"  # "own-session" (default) or "pane"
 ```
 
-Then fix the stale `## Not in this build` bullet (`README.md:103-105`): remote/durable panes *are*
-ported in the iced front-end (`ds`, `dsp`, `dss`, attach, replay, reconnect, kill), so the bullet is
-deleted and the `ghostd/` crate line is reworded to say it is the remote side, built by
-`scripts/build-ghostd.sh`. Leave the other three bullets and `README.md:141`'s layout note alone
-beyond the wording.
+The `## Not in this build` section itself was **removed on `5fba514`** (PR #23), so the job card's
+"fix the stale bullet" item is already done — do not re-add that section, and do not claim credit
+for removing it. What the base did leave behind is a dangling reference: `README.md:128` still
+reads ``- `ghostd/` — the remote session daemon (standalone crate; see "Not in this build")``.
+Reword that one line to name the daemon for what it is — the remote side of the durable panes,
+built by `scripts/build-ghostd.sh` — and drop the dead pointer. Nothing else in the README moves.
 
 ### 2. How it is verified
 
@@ -1403,7 +1407,7 @@ New/updated tests (all assertable without a display):
 | `src/input.rs` | `the_durable_ssh_action_opens_its_own_session_and_binds_the_pane` | **unchanged assertions**, action now `(host, OwnSession)` — the byte-for-byte proof |
 | `src/input.rs` | `the_pane_placement_stays_in_the_current_session` | `current_session` before == after; current tab named `ds <host>`; `remote_spec_of` bound to `ghostwave-<host>`; toast `durable ssh: <host>`; pane program is the ssh stand-in |
 
-The pane test must **not** read `Config::load()`: the input tests' `state()` (`src/input.rs:785-789`)
+The pane test must **not** read `Config::load()`: the input tests' `state()` (`src/input.rs:786-790`)
 does, so it would inherit the owner's real `~/.config/ghostwave/config.toml` and go flaky on his
 machine. It passes the placement in the `Action` and asserts the config default through `parse_toml`
 instead.
@@ -1424,7 +1428,7 @@ Manual window check (named here; stage 3 does it only if it has a Wayland displa
 ### 3. Scope edges
 
 **In:** placement as a parameter with a config default, `dsp`/`dss` overrides, item text that states
-the placement, the README config block and the stale bullet.
+the placement, the README `[remote]` block and the dangling `ghostd/` layout reference.
 
 **Out:** the cross-session one-attach refusal and the mixed-session purity test (sitting 2, §6); the
 ghostd daemon; the reconnect loop; plain `ssh <host>` (still always its own `ssh-<host>` session);
@@ -1441,9 +1445,9 @@ switch; writing anything into the owner's config.toml; `ghostd/`.
   the app re-reads its own config. *Check:* the action carries the resolved `DurablePlacement`, and
   `the_configured_default_is_what_ds_does_and_says` asserts text **and** action together.
 - **R3 — `sessions_overlay` classification of a mixed session.** `session::remote_kind`
-  (`src/session.rs:160-181`) already returns `Durable` when *any* pane is remote, so a mixed session
+  (`src/session.rs:165-186`) already returns `Durable` when *any* pane is remote, so a mixed session
   shows the `ds` badge — correct and unchanged. What must stay true is the other half:
-  `is_pure_remote` (`src/session.rs:222-229`) returns false for a mixed pane list, which is what stops
+  `is_pure_remote` (`src/session.rs:222-228`) returns false for a mixed pane list, which is what stops
   `k` deleting local work. Sitting 2's test pins it; until then this sitting changes nothing there
   (`k`'s path is untouched).
 - **R4 — duplicate attach.** With sitting 1 alone, `dsp <host>` into session B while the daemon is
@@ -1454,7 +1458,7 @@ switch; writing anything into the owner's config.toml; `ghostd/`.
   `durable_item`, the `ds` item, the `durable <host>` item; 8 test assertions) and `src/input.rs` 5
   (1 dispatch, 4 tests). The compiler finds every one, so no wildcard can hide a missed site.
   *Check:* the build is the check.
-- **R6 — `durable_targets` (`src/input.rs:335`) needs no change** (see §1(e)). *Check:* the palette's
+- **R6 — `durable_targets` (`src/input.rs:340`) needs no change** (see §1(e)). *Check:* the palette's
   `dsp` test uses an explicitly-constructed state; if a live pane in the current session were missing
   from the inventory, `ssh <host>` beside a durable twin would already be broken today — it is not.
 
@@ -1503,7 +1507,7 @@ bullet rides with sitting 1 (same file, same edit).
 ### 7. What stage 2 should judge this plan on
 
 1. Is the `OwnSession` arm in §1(c) really byte-for-byte today's code path — the switch/create first,
-   the focus check only afterwards, as `src/app.rs:1136-1173` does it today?
+   the focus check only afterwards, as `src/app.rs:1156-1196` does it today?
 2. Is a hand-written `Deserialize` on the enum plus the struct-level `#[serde(default)]` — with **no**
    attribute on the new field — sufficient for "missing key behaves as today **and** unknown value never
    fails `Config::load()`", given `RemoteConfig`'s `#[serde(default)]` at `src/config.rs:46`?
