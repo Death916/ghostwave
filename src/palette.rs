@@ -2,7 +2,7 @@
 //!
 //! Provides an interactive, fuzzy-searchable modal overlay displaying available actions,
 //! keybinding shortcuts, dynamic prefix commands (`open <path>`, `ssh <host>`,
-//! `ds <host>`), and theme selection.
+//! `ds <host>`, `dsp <host>`, `dss <host>`), and theme selection.
 
 use ghostwave::config::DurablePlacement;
 use ghostwave::keymap::Action;
@@ -70,11 +70,17 @@ fn about_item() -> PaletteItem {
 /// host's daemon session, opening where `placement` says.
 fn durable_item(host: &str, session: &str, placement: DurablePlacement) -> PaletteItem {
     PaletteItem::new(
-        format!("Durable session: {host} — {session}"),
+        format!("Durable session: {host} — {session} ({})", placement.palette_label()),
         DURABLE_CATEGORY,
         None,
         Action::ConnectDurableSsh(host.to_string(), placement),
     )
+}
+
+/// The palette title for a `ds`-family command: it states where the attach will
+/// open, so the text and the action cannot disagree.
+fn durable_ssh_title(host: &str, placement: DurablePlacement) -> String {
+    format!("Durable SSH (ghostd, {}): {host}", placement.palette_label())
 }
 
 /// State for the command palette overlay widget.
@@ -89,6 +95,10 @@ pub struct PaletteState {
     /// The durable sessions the palette can offer: `(host, daemon session)`,
     /// handed in by the caller (the palette never reads the disk).
     pub durables: Vec<(String, String)>,
+    /// Where a durable attach opens unless the query overrides it: the caller
+    /// passes `[remote] durable_ssh_placement` in, and `ds`/`durable` obey it
+    /// while `dsp`/`dss` force their own.
+    pub default_placement: DurablePlacement,
 }
 
 impl Default for PaletteState {
@@ -99,30 +109,37 @@ impl Default for PaletteState {
 
 impl PaletteState {
     /// Creates a new [`PaletteState`] with the specified items, knowing no
-    /// durable sessions.
+    /// durable sessions and opening them in the host's own session.
     pub fn new(items: Vec<PaletteItem>) -> Self {
-        Self::with_durables(items, Vec::new())
+        Self::with_durables(items, Vec::new(), DurablePlacement::OwnSession)
     }
 
     /// Creates a new [`PaletteState`] that can list the given durable sessions,
-    /// each a `(host, daemon session)` pair.
-    pub fn with_durables(items: Vec<PaletteItem>, durables: Vec<(String, String)>) -> Self {
+    /// each a `(host, daemon session)` pair, and that opens `ds <host>` where
+    /// `default_placement` says.
+    pub fn with_durables(
+        items: Vec<PaletteItem>,
+        durables: Vec<(String, String)>,
+        default_placement: DurablePlacement,
+    ) -> Self {
         Self {
             query: String::new(),
             selected: 0,
             items,
             durables,
+            default_placement,
         }
     }
 
     /// Returns filtered action items matching the current search query.
     ///
-    /// Supports dynamic command prefixes (`open `, `ssh `, `ds `, `durable`),
-    /// theme filtering, and fuzzy/substring matching across title, category,
-    /// and keybinding shortcuts. `ds <host>` and `ssh <host>` also offer the
-    /// durable session of a host the palette was told about, and `durable` lists
-    /// those sessions, so the difference between the two connections is visible
-    /// before one is made.
+    /// Supports dynamic command prefixes (`open `, `ssh `, `ds `, `dsp `, `dss `,
+    /// `durable`), theme filtering, and fuzzy/substring matching across title,
+    /// category, and keybinding shortcuts. `ds <host>` opens where the caller's
+    /// `default_placement` says and `dsp`/`dss` force it; their titles state the
+    /// choice. `ds <host>` and `ssh <host>` also offer the durable session of a
+    /// host the palette was told about, and `durable` lists those sessions, so
+    /// the difference between the two connections is visible before one is made.
     pub fn filtered_items(&self) -> Vec<PaletteItem> {
         let trimmed = self.query.trim();
         if trimmed.is_empty() {
@@ -142,14 +159,36 @@ impl PaletteState {
             }
         }
 
+        // `dsp <host>` / `dss <host>` are `ds <host>` with the placement forced.
+        // They are matched before it because the strings differ at index 2, so
+        // the `ds ` arm can never see them.
+        let forced = if lower.starts_with("dsp ") {
+            Some((trimmed["dsp ".len()..].trim(), DurablePlacement::Pane))
+        } else if lower.starts_with("dss ") {
+            Some((trimmed["dss ".len()..].trim(), DurablePlacement::OwnSession))
+        } else {
+            None
+        };
+        if let Some((host, placement)) = forced {
+            if !host.is_empty() {
+                return vec![PaletteItem::new(
+                    durable_ssh_title(host, placement),
+                    DURABLE_CATEGORY,
+                    None,
+                    Action::ConnectDurableSsh(host.to_string(), placement),
+                )];
+            }
+        }
+
         if lower.starts_with("ds ") {
             let host = trimmed["ds ".len()..].trim();
             if !host.is_empty() {
+                let placement = self.default_placement;
                 return vec![PaletteItem::new(
-                    format!("Durable SSH (ghostd): {host}"),
+                    durable_ssh_title(host, placement),
                     DURABLE_CATEGORY,
                     None,
-                    Action::ConnectDurableSsh(host.to_string(), DurablePlacement::OwnSession),
+                    Action::ConnectDurableSsh(host.to_string(), placement),
                 )];
             }
         }
@@ -162,11 +201,12 @@ impl PaletteState {
             let text = trimmed["durable ".len()..].trim();
             let mut items = self.durable_items(text);
             if !text.is_empty() {
+                let placement = self.default_placement;
                 items.push(PaletteItem::new(
-                    format!("New durable SSH (ghostd): {text}"),
+                    format!("New durable SSH (ghostd, {}): {text}", placement.palette_label()),
                     DURABLE_CATEGORY,
                     None,
-                    Action::ConnectDurableSsh(text.to_string(), DurablePlacement::OwnSession),
+                    Action::ConnectDurableSsh(text.to_string(), placement),
                 ));
             }
             return items;
@@ -183,7 +223,7 @@ impl PaletteState {
                 )];
                 for (target, session) in &self.durables {
                     if target == host {
-                        items.push(durable_item(target, session, DurablePlacement::OwnSession));
+                        items.push(durable_item(target, session, self.default_placement));
                     }
                 }
                 return items;
@@ -225,7 +265,7 @@ impl PaletteState {
                     || host.to_lowercase().contains(&needle)
                     || session.to_lowercase().contains(&needle)
             })
-            .map(|(host, session)| durable_item(host, session, DurablePlacement::OwnSession))
+            .map(|(host, session)| durable_item(host, session, self.default_placement))
             .collect()
     }
 
@@ -559,7 +599,7 @@ pub fn view<'a>(state: &'a PaletteState, theme: &GhostTheme) -> Element<'a, Pale
 
     let list_content = if filtered.is_empty() {
         column![container(
-            text("No matching commands (try: open <path> | ssh <host> | ds <host> | durable | theme <name> | about)")
+            text("No matching commands (try: open <path> | ssh <host> | ds <host> | dsp <host> | dss <host> | durable | theme <name> | about)")
                 .size(14.0)
                 .font(crate::ui_fonts::primary())
                 .color(rgb(theme.tab_inactive_text))
@@ -947,12 +987,74 @@ mod tests {
         p.set_query("ds durable-host");
         let out = p.filtered_items();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].title, "Durable SSH (ghostd): durable-host");
+        assert_eq!(out[0].title, "Durable SSH (ghostd, own session): durable-host");
         assert!(matches!(&out[0].action, Action::ConnectDurableSsh(h, _) if h == "durable-host"));
 
         p.set_query("ds ");
         let bare = p.filtered_items();
         assert!(bare.iter().all(|i| !matches!(i.action, Action::ConnectDurableSsh(_, _))));
+    }
+
+    #[test]
+    fn dsp_forces_a_new_pane_and_dss_forces_its_own_session() {
+        let mut p = PaletteState::with_durables(
+            test_palette(&["Unrelated"]).items,
+            Vec::new(),
+            DurablePlacement::OwnSession,
+        );
+
+        p.set_query("dsp orac");
+        let out = p.filtered_items();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Durable SSH (ghostd, new pane): orac");
+        assert_eq!(
+            out[0].action,
+            Action::ConnectDurableSsh("orac".to_string(), DurablePlacement::Pane),
+            "the title says new pane and the action opens one"
+        );
+
+        p.set_query("dss orac");
+        let out = p.filtered_items();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Durable SSH (ghostd, own session): orac");
+        assert_eq!(
+            out[0].action,
+            Action::ConnectDurableSsh("orac".to_string(), DurablePlacement::OwnSession),
+            "dss forces its own session even when the config says pane"
+        );
+
+        p.set_query("dsp ");
+        let bare = p.filtered_items();
+        assert!(
+            bare.iter().all(|i| !matches!(i.action, Action::ConnectDurableSsh(_, _))),
+            "a prefix with no host still offers nothing"
+        );
+    }
+
+    #[test]
+    fn the_configured_default_is_what_ds_does_and_says() {
+        let mut p = PaletteState::with_durables(
+            test_palette(&["Unrelated"]).items,
+            Vec::new(),
+            DurablePlacement::Pane,
+        );
+        p.set_query("ds orac");
+        let out = p.filtered_items();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Durable SSH (ghostd, new pane): orac");
+        assert_eq!(
+            out[0].action,
+            Action::ConnectDurableSsh("orac".to_string(), DurablePlacement::Pane),
+            "what the title promises is what the action does"
+        );
+
+        let mut defaulted = test_palette(&["Unrelated"]);
+        defaulted.set_query("ds orac");
+        assert_eq!(
+            defaulted.filtered_items()[0].title,
+            "Durable SSH (ghostd, own session): orac",
+            "an untouched palette still opens its own session"
+        );
     }
 
     fn durable_hosts() -> Vec<(String, String)> {
@@ -964,46 +1066,58 @@ mod tests {
 
     #[test]
     fn typing_durable_lists_the_known_durable_sessions() {
-        let mut p = PaletteState::with_durables(test_palette(&["Unrelated"]).items, durable_hosts());
+        let mut p = PaletteState::with_durables(
+            test_palette(&["Unrelated"]).items,
+            durable_hosts(),
+            DurablePlacement::OwnSession,
+        );
         p.set_query("durable");
         let out = p.filtered_items();
         assert_eq!(out.len(), 2, "one item per known durable session");
-        assert_eq!(out[0].title, "Durable session: orac — ghostwave-orac");
+        assert_eq!(out[0].title, "Durable session: orac — ghostwave-orac (own session)");
         assert_eq!(out[0].category, DURABLE_CATEGORY);
         assert!(matches!(&out[0].action, Action::ConnectDurableSsh(h, _) if h == "orac"));
-        assert_eq!(out[1].title, "Durable session: prod — ghostwave-prod");
+        assert_eq!(out[1].title, "Durable session: prod — ghostwave-prod (own session)");
         assert!(matches!(&out[1].action, Action::ConnectDurableSsh(h, _) if h == "prod"));
     }
 
     #[test]
     fn durable_with_a_host_offers_the_new_session_below_the_known_ones() {
-        let mut p = PaletteState::with_durables(test_palette(&["Unrelated"]).items, durable_hosts());
+        let mut p = PaletteState::with_durables(
+            test_palette(&["Unrelated"]).items,
+            durable_hosts(),
+            DurablePlacement::OwnSession,
+        );
         p.set_query("durable ora");
         let out = p.filtered_items();
         assert_eq!(out.len(), 2, "the known match, then the new session");
-        assert_eq!(out[0].title, "Durable session: orac — ghostwave-orac");
-        assert_eq!(out[1].title, "New durable SSH (ghostd): ora");
+        assert_eq!(out[0].title, "Durable session: orac — ghostwave-orac (own session)");
+        assert_eq!(out[1].title, "New durable SSH (ghostd, own session): ora");
         assert_eq!(out[1].category, DURABLE_CATEGORY);
         assert!(matches!(&out[1].action, Action::ConnectDurableSsh(h, _) if h == "ora"));
 
         p.set_query("durable ghostwave-prod");
         let by_session = p.filtered_items();
         assert!(
-            by_session.iter().any(|i| i.title == "Durable session: prod — ghostwave-prod"),
+            by_session.iter().any(|i| i.title == "Durable session: prod — ghostwave-prod (own session)"),
             "the daemon session name is searchable too"
         );
     }
 
     #[test]
     fn ssh_beside_a_known_durable_target_offers_the_durable_session() {
-        let mut p = PaletteState::with_durables(test_palette(&["Unrelated"]).items, durable_hosts());
+        let mut p = PaletteState::with_durables(
+            test_palette(&["Unrelated"]).items,
+            durable_hosts(),
+            DurablePlacement::OwnSession,
+        );
         p.set_query("ssh orac");
         let out = p.filtered_items();
         assert_eq!(out.len(), 2, "the plain connection, then its durable twin");
         assert_eq!(out[0].title, "Connect SSH: orac");
         assert_eq!(out[0].category, "Remote — not durable");
         assert!(matches!(&out[0].action, Action::ConnectSsh(h) if h == "orac"));
-        assert_eq!(out[1].title, "Durable session: orac — ghostwave-orac");
+        assert_eq!(out[1].title, "Durable session: orac — ghostwave-orac (own session)");
         assert!(matches!(&out[1].action, Action::ConnectDurableSsh(h, _) if h == "orac"));
 
         p.set_query("ssh unknown-host");

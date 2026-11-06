@@ -515,6 +515,7 @@ pub(crate) fn execute(state: &mut AppState, action: Action) {
             state.palette = Some(crate::palette::PaletteState::with_durables(
                 crate::palette::default_items(&ghostwave::theme::names()),
                 durable_targets(state),
+                state.config.remote.durable_ssh_placement,
             ));
         }
         Action::Ghostwave => new_content(state, ContentPane::visualizer()),
