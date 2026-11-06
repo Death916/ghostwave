@@ -50,6 +50,21 @@ impl PaletteItem {
 /// are readable in the palette at a glance.
 const DURABLE_CATEGORY: &str = "Remote — durable";
 
+/// Category of the `about`/`version` row, so the build stamp reads as information
+/// rather than an action in the palette.
+const ABOUT_CATEGORY: &str = "About";
+
+/// The single row shown for `about`/`version`: what this binary is and when it
+/// was built. The row and the toast print the same string, so they cannot disagree.
+fn about_item() -> PaletteItem {
+    PaletteItem::new(
+        ghostwave::build_info::summary(),
+        ABOUT_CATEGORY,
+        None,
+        Action::About,
+    )
+}
+
 /// The palette item for a known durable session: connecting to it reuses the
 /// host's daemon session.
 fn durable_item(host: &str, session: &str) -> PaletteItem {
@@ -172,6 +187,10 @@ impl PaletteState {
                 }
                 return items;
             }
+        }
+
+        if lower.len() >= 3 && ["about", "version"].iter().any(|w| w.starts_with(lower.as_str())) {
+            return vec![about_item()];
         }
 
         let is_theme_filter = self.query.starts_with("theme");
@@ -539,7 +558,7 @@ pub fn view<'a>(state: &'a PaletteState, theme: &GhostTheme) -> Element<'a, Pale
 
     let list_content = if filtered.is_empty() {
         column![container(
-            text("No matching commands (try: open <path> | ssh <host> | ds <host> | durable | theme <name>)")
+            text("No matching commands (try: open <path> | ssh <host> | ds <host> | durable | theme <name> | about)")
                 .size(14.0)
                 .font(crate::ui_fonts::primary())
                 .color(rgb(theme.tab_inactive_text))
@@ -784,6 +803,7 @@ pub fn default_items(themes: &[&str]) -> Vec<PaletteItem> {
         PaletteItem::new("New AI Chat", "View", None, NewAi),
         PaletteItem::new("Quit", "App", Some("Ctrl+Q"), Quit),
         PaletteItem::new("Lock Terminal", "App", Some("Ctrl+G"), Lock),
+        PaletteItem::new("About ghostwave", "App", None, About),
     ];
 
     for t in themes {
@@ -1232,5 +1252,53 @@ mod tests {
         let prefix_score = fuzzy_match("term", "terminal").unwrap();
         let middle_score = fuzzy_match("term", "my_terminal").unwrap();
         assert!(prefix_score > middle_score);
+    }
+
+    #[test]
+    fn about_and_version_show_the_build_info_row() {
+        let mut p = PaletteState::new(default_inventory());
+        for query in ["about", "version"] {
+            p.set_query(query);
+            let out = p.filtered_items();
+            assert_eq!(out.len(), 1, "{query} -> {out:?}");
+            assert_eq!(out[0].category, "About", "{query}");
+            assert_eq!(out[0].title, ghostwave::build_info::summary(), "{query}");
+            assert_eq!(out[0].action, Action::About, "{query}");
+        }
+    }
+
+    #[test]
+    fn about_prefixes_resolve_but_short_queries_do_not() {
+        let mut p = PaletteState::new(default_inventory());
+        for query in ["abo", "ver", "vers"] {
+            p.set_query(query);
+            let out = p.filtered_items();
+            assert_eq!(out.len(), 1, "{query} -> {out:?}");
+            assert_eq!(out[0].title, ghostwave::build_info::summary(), "{query}");
+            assert_eq!(out[0].action, Action::About, "{query}");
+        }
+
+        // one letter must keep the ordinary fuzzy list instead of hijacking it
+        p.set_query("a");
+        let out = p.filtered_items();
+        assert!(
+            out.len() > 1,
+            "a single letter still filters normally, got {out:?}"
+        );
+        assert!(
+            !out.iter().any(|i| i.title == ghostwave::build_info::summary()),
+            "the build-info row must not appear for 'a', got {out:?}"
+        );
+    }
+
+    #[test]
+    fn about_is_browsable_in_the_inventory() {
+        let items = default_inventory();
+        assert!(
+            items
+                .iter()
+                .any(|i| i.title == "About ghostwave" && i.action == Action::About),
+            "the inventory has no About row"
+        );
     }
 }

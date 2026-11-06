@@ -178,7 +178,20 @@ pub fn attach_argv(host: &str, session: &str) -> Vec<String> {
 }
 
 /// The remote shell command a durable pane runs: check the cached ghostd binary
-/// is present and current, then attach — creating the session when it is gone.
+/// is present and current, then attach — creating the session only when the
+/// daemon says there is none.
+///
+/// The exit statuses are `ghostd`'s contract: `1` is "no session" *and* "this
+/// session is busy elsewhere", `3` is "the daemon is wedged", so both are
+/// followed by `new` — whose own probe refuses a session that is merely in use,
+/// which is why busy needs no branch of its own here and gets none. `4` is "the
+/// session ended", reported to the pane as a clean exit: the reconnect pass only
+/// retries a non-zero status, so a killed session is not recreated, and `Enter`
+/// reconnects it by hand. No other status creates anything.
+///
+/// `exec` is deliberately absent: the second attach goes through the same
+/// translation, or a session that ends right after being created still reports 4
+/// and the pane loops.
 ///
 /// The version check compares the remote binary against this app's own version,
 /// so a rebuilt daemon is re-uploaded rather than reused. The session name is the
@@ -191,7 +204,11 @@ pub fn attach_cmd(session: &str) -> String {
         "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
          if [ ! -x \"$BIN\" ] || [ \"$($BIN --version 2>/dev/null)\" != \"ghostd {ver}\" ]; then \
          echo \"ghostd missing/stale — reconnect to upload\"; exit 1; fi; \
-         \"$BIN\" attach {session} 2>/dev/null || {{ \"$BIN\" new {session} >/dev/null 2>&1 && exec \"$BIN\" attach {session}; }}",
+         \"$BIN\" attach {session} 2>/dev/null; rc=$?; \
+         if [ $rc -eq 1 ] || [ $rc -eq 3 ]; then \
+         if \"$BIN\" new {session} >/dev/null 2>&1; then \"$BIN\" attach {session} 2>/dev/null; rc=$?; fi; fi; \
+         if [ $rc -eq 4 ]; then exit 0; fi; \
+         exit $rc",
         ver = env!("CARGO_PKG_VERSION")
     );
     format!("sh -c {}", sq(&script))
@@ -878,8 +895,17 @@ mod tests {
         assert!(cmd.contains("missing/stale"), "the pane reports a stale binary: {cmd}");
         assert!(cmd.contains("attach \"ghostwave-prod\""));
         assert!(
-            cmd.contains("new \"ghostwave-prod\"") && cmd.contains("exec"),
-            "a missing session is created before attaching: {cmd}"
+            cmd.contains("if [ $rc -eq 1 ] || [ $rc -eq 3 ]")
+                && cmd.contains("new \"ghostwave-prod\""),
+            "only a missing or wedged session is created: {cmd}"
+        );
+        assert!(
+            cmd.contains("if [ $rc -eq 4 ]; then exit 0; fi"),
+            "an ended session is a clean exit, so the pane does not recreate it: {cmd}"
+        );
+        assert!(
+            !cmd.contains("exec ") && !cmd.contains("|| {"),
+            "the second attach goes through the same translation: {cmd}"
         );
         assert!(cmd.ends_with("'"), "the sh -c wrapper is closed: {cmd}");
     }
@@ -1067,9 +1093,11 @@ mod tests {
     }
 
     impl StubRemote {
-        /// `version` is what the stub's `--version` prints; the stub records its
-        /// argv in `<home>/record` for `attach`, `<home>/record.new` for `new`.
-        fn new(version: &str) -> Option<Self> {
+        /// `version` is what the stub's `--version` prints; the stub exits
+        /// `attach_rc` from `attach` and `new_rc` from `new`, and records its argv
+        /// in `<home>/record` (`attach`), `<home>/record.new` (`new`) and one line
+        /// per `attach` in `<home>/attach.count`.
+        fn new(version: &str, attach_rc: i32, new_rc: i32) -> Option<Self> {
             use std::os::unix::fs::PermissionsExt;
 
             let home = std::env::temp_dir().join(format!("ghostwave-stub-{}", unique_token()));
@@ -1078,7 +1106,7 @@ mod tests {
             let arch = Command::new("uname").arg("-m").output().ok()?;
             let arch = String::from_utf8_lossy(&arch.stdout).trim().to_string();
             let stub = format!(
-                "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"{version}\"; exit 0;;\n  attach) echo \"$*\" > \"$HOME/record\"; exit 0;;\n  new) echo \"$*\" > \"$HOME/record.new\"; exit 0;;\nesac\nexit 1\n"
+                "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"{version}\"; exit 0;;\n  attach) echo \"$*\" >> \"$HOME/attach.count\"; echo \"$*\" > \"$HOME/record\"; exit {attach_rc};;\n  new) echo \"$*\" > \"$HOME/record.new\"; exit {new_rc};;\nesac\nexit 1\n"
             );
             let path = cache.join(format!("ghostd-{arch}"));
             std::fs::write(&path, stub).ok()?;
@@ -1099,6 +1127,13 @@ mod tests {
             std::fs::read_to_string(self.home.join(name)).ok()
         }
 
+        /// How many times the script ran the stub's `attach`.
+        fn attach_count(&self) -> usize {
+            self.record("attach.count")
+                .map(|lines| lines.lines().count())
+                .unwrap_or(0)
+        }
+
         fn close(&self) {
             let _ = std::fs::remove_dir_all(&self.home);
         }
@@ -1106,7 +1141,7 @@ mod tests {
 
     #[test]
     fn a_hostile_session_name_stays_one_argument_in_the_attach_script() {
-        let stub = StubRemote::new(&format!("ghostd {}", env!("CARGO_PKG_VERSION")))
+        let stub = StubRemote::new(&format!("ghostd {}", env!("CARGO_PKG_VERSION")), 0, 0)
             .expect("the stub remote is built");
         let hostile = "ghostwave-prod'; : > \"$HOME/injected\"; '";
 
@@ -1127,7 +1162,7 @@ mod tests {
 
     #[test]
     fn a_stale_binary_stops_the_pane_with_the_reconnect_hint() {
-        let stub = StubRemote::new("ghostd 0.0.0").expect("the stub remote is built");
+        let stub = StubRemote::new("ghostd 0.0.0", 0, 0).expect("the stub remote is built");
 
         let out = stub.run(&attach_cmd("ghostwave-prod"));
 
@@ -1135,6 +1170,71 @@ mod tests {
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.contains("ghostd missing/stale"), "got {text:?}");
         assert!(stub.record("record").is_none(), "no attach ran");
+        stub.close();
+    }
+
+    #[test]
+    fn a_pane_creates_the_session_only_when_attach_says_it_is_missing() {
+        let version = format!("ghostd {}", env!("CARGO_PKG_VERSION"));
+
+        // 1 and 3 both mean "no session you can attach to": create, then attach
+        // again — and report whatever that second attach says.
+        for rc in [1, 3] {
+            let stub = StubRemote::new(&version, rc, 0).expect("the stub remote is built");
+            let out = stub.run(&attach_cmd("ghostwave-prod"));
+
+            assert!(
+                stub.record("record.new").is_some(),
+                "rc {rc} creates the missing session: {out:?}"
+            );
+            assert_eq!(
+                stub.attach_count(),
+                2,
+                "rc {rc} attaches again after the create: {out:?}"
+            );
+            assert_eq!(
+                out.status.code(),
+                Some(rc),
+                "rc {rc} reports the second attach's status: {out:?}"
+            );
+            stub.close();
+        }
+
+        // 0 and 4 carry a session that exists: nothing is created, and 4 — the
+        // session ended — leaves the pane with a clean exit, which is what stops
+        // the reconnect pass from resurrecting it.
+        for rc in [0, 4] {
+            let stub = StubRemote::new(&version, rc, 0).expect("the stub remote is built");
+            let out = stub.run(&attach_cmd("ghostwave-prod"));
+
+            assert!(
+                stub.record("record.new").is_none(),
+                "rc {rc} creates nothing: {out:?}"
+            );
+            assert_eq!(stub.attach_count(), 1, "rc {rc} attaches once: {out:?}");
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "rc {rc} leaves the pane clean: {out:?}"
+            );
+            stub.close();
+        }
+
+        // The busy shape: attach says 1 (no session *and* attached elsewhere) and
+        // `new` refuses because its probe answered Healthy. The script must keep
+        // status 1 so the pane's auto-reconnect retries, and must never report a
+        // clean exit — that would leave a live session looking like a dead one.
+        let stub = StubRemote::new(&version, 1, 1).expect("the stub remote is built");
+        let out = stub.run(&attach_cmd("ghostwave-prod"));
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "a busy session stays a failure the pane retries: {out:?}"
+        );
+        assert!(
+            stub.record("record.new").is_some(),
+            "the create was attempted — and refused by `new`, not by the script: {out:?}"
+        );
         stub.close();
     }
 

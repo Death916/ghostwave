@@ -1513,3 +1513,1260 @@ bullet rides with sitting 1 (same file, same edit).
    stated as the cost — or is it so entangled with the `Pane` arm that it must be in this diff?
 5. Are the file/line estimates and the six palette-title updates complete, i.e. is there a test or
    call site in §1 that the plan does not name?
+---
+
+# PLAN — version + build date when `about` or `version` is typed in the palette
+
+relay: job=`t_f275a01b` · stage 1 (PLAN) · repo `ghostwave` · branch **`wt/palette-version-build-date`**
+cut from `origin/master` `f607c5b` (§0.1) · owner ask, verbatim:
+
+> "add version/build date info to the command pallet when about is typed or version. its hard to
+> see what version is running without checking when the running binary was built"
+
+Read literally: with the palette open (`Ctrl+Shift+P`), typing **`about`** or **`version`** must show
+which ghostwave is running *and when that binary was compiled*. Today neither exists anywhere in the
+UI, and the binary has no `--version` either.
+
+## 0. Measured starting point
+
+### 0.1 The worktree was cut from a stale local `master` — the plan is cut at `origin/master`
+
+```
+$ git log --oneline -1                     # worktree HEAD as the dispatcher left it
+a91a1a8 Merge pull request 'fix(panes): keep a pane's canvas inside its frame stroke' (#20) …
+$ git log --oneline -1 origin/master
+f607c5b Merge pull request 'libghostty-vt 0.2.2 + adopt three library features …' (#25)
+$ git -C /home/death916/code/ghostwave status -sb
+## master...origin/master [behind 25]
+$ git merge-base --is-ancestor origin/master a91a1a8 ; echo $?
+1                                          # the stale head is NOT on top of origin/master
+$ git checkout -b wt/palette-version-build-date origin/master
+Switched to a new branch 'wt/palette-version-build-date'
+```
+
+Every citation below was re-read **on `f607c5b`** after that switch (the 25 missing commits are the
+libghostty-vt 0.2.2 work; they do not move any line cited here, but the numbers were re-checked
+rather than carried over). The stale branch is not rewritten — no `reset --hard` on a worktree.
+
+### 0.2 There is no version surface anywhere in the app
+
+```
+$ grep -n '^version' Cargo.toml
+3:version = "0.1.3"
+$ grep -rn "CARGO_PKG_VERSION" --include=*.rs src/
+src/remote.rs:212,470,539,892,1144,1178      # the ghostd handshake / upload check: the *remote
+                                             # daemon's* version string, unrelated to this binary
+$ grep -rn "\-\-version" src/main.rs
+                                             # no output: the binary has no CLI version flag
+```
+
+So `0.1.3` exists only in `Cargo.toml`; nothing in the UI or on the command line reports it, and
+nothing anywhere records **when** the binary was built. That is exactly the owner's complaint.
+
+### 0.3 The palette's query grammar today (`src/palette.rs`)
+
+`PaletteState::filtered_items` (`palette.rs:110`) handles, in order:
+
+| query | result | where |
+|---|---|---|
+| empty | the whole inventory | `palette.rs:112` |
+| `open <path>` | one `Open file:` row | `palette.rs:117` |
+| `ds <host>` | one durable-SSH row | `palette.rs:129` |
+| `durable`, `durable <text>` | the known durable sessions | `palette.rs:141-157` |
+| `ssh <host>` | SSH row (+ its durable twin) | `palette.rs:159` |
+| anything else | `score_item` fuzzy over title/category/shortcut | `palette.rs:177-194` |
+
+`default_items` (`palette.rs:730`) builds the inventory — Pane/Tab/Terminal/Session/View/App rows
+plus one row per theme, ending with `Lock Terminal` (`palette.rs:786`). **No About or version row
+exists**, and no inventory title/category/shortcut contains "about" or "version", so both queries
+land in the fuzzy branch and return an empty list (the "No matching commands" hint,
+`palette.rs:542`).
+
+### 0.4 The four facts the design rests on (each checked, not assumed)
+
+1. **One dispatch site.** `Action` (`keymap.rs:65-146`) is matched **exhaustively** at
+   `input.rs:352` (`pub(crate) fn execute`). The other `match action` sites are their own enums:
+   `preview.rs:324` (`PreviewAction`) and `ui_session.rs:262` (`SessionsAction`). A new variant
+   therefore costs exactly one arm, and the compiler finds anything else.
+2. **Toasts are transient.** `AppState::toast` (`app.rs:662`) stores `(String, Instant)`
+   (`app.rs:371`) and the tick clears it after **2.5 s** (`app.rs:624`). So the toast can confirm,
+   but the **palette row is the durable display** of the text.
+3. **Row geometry.** A row is one title line at `size 14.0` plus a category badge and an optional
+   shortcut, inside a 600 px × 380 px modal (`palette.rs:555-668`, `:683-700`). A ~48-char title
+   (`48 × ~8.4 px ≈ 400 px`) fits with no wrap and no truncation.
+4. **The palette is rebuilt on every open**, so nothing needs invalidating:
+   `Action::OpenCommandBar` (`input.rs:513`) constructs
+   `PaletteState::with_durables(default_items(&theme::names()), durable_targets(state))`.
+
+### 0.5 Baseline (measured on this branch at `f607c5b`, this worktree)
+
+```
+$ BUILD_GATE_WAIT=600 BUILD_JOBS=3 bash ~/.hermes/scripts/build_gate.sh \
+    env CARGO_TARGET_DIR=/var/build/ghostwave-t_f275a01b nix-shell --run 'cargo test'
+running 82 tests    test result: ok. 82 passed; 0 failed …   (lib)
+running 181 tests   test result: ok. 181 passed; 0 failed …  (bin "ghostwave")
+running 1 test      test result: ok. 1 passed; 0 failed …    (tests/flood_throughput.rs)
+running 6 tests     test result: ok. 6 passed; 0 failed …    (tests/term_core.rs)
+running 0 tests     test result: ok. 0 passed …              (doc-tests)
+                                     → 270 passed / 0 failed / 0 ignored
+
+$ … nix-shell --run 'cargo clippy --all-targets'
+exit 0, and 64 unique warnings are ALREADY on the base
+  ("ghostwave (bin) generated 38 warnings", "(lib) generated 26 warnings");
+  per file: term.rs 19, app.rs 12, search.rs 10, scratchpad.rs 9, input.rs 7, clipboard.rs 7,
+  main.rs 4, palette.rs 3, … , keymap.rs 0, lib.rs 0.
+  → `cargo clippy -- -D warnings` is NOT achievable on this tree; §4 does not ask for it.
+
+$ … nix-shell --run 'cargo fmt --check'
+exit 1 at the base: 5033 diff lines, the first in src/clipboard.rs (import order).
+  → repo-wide rustfmt is already dirty; this diff must not "fix" it (§4).
+```
+
+The first compile of a fresh target dir is the long pole: `libghostty-vt-sys` runs a `zig build` of
+the vendored ghostty (measured here: ~10 min wall on this 4-core box, ~2.6 GB of target dir before
+the Rust crates finish). Budget for it rather than assuming a fast first `cargo test`.
+
+## 1. Candidates, and why the chosen one wins
+
+| # | Where the "when was it built" number could come from | Evidence | Verdict |
+|---|---|---|---|
+| C1 | `build.rs` stamps the compile clock into an env var (`GHOSTWAVE_BUILD_EPOCH`) | no dependency, no external `date`, no file written; rebuilds move it | **chosen** — it is literally the compile instant, and it is testable |
+| C2 | `std::fs::metadata(std::env::current_exe()).modified()` at runtime | reports the **file's** mtime — every `cp`/`rsync`/install of the binary resets it, and `cargo run` after a relink reports link time, not compile time | rejected: a different question ("when was this file copied") with a wrong-feeling answer |
+| C3 | `option_env!("SOURCE_DATE_EPOCH")` / nix-provided timestamp | nothing in this repo's `shell.nix`/`devenv.nix` exports one; would report the *nix build* time only when built through nix, which `cargo test`/`cargo run` are not | rejected: silently absent in the normal dev flow |
+| C4 | Version only, no date (`env!("CARGO_PKG_VERSION")`) | never goes stale, but it is precisely what the owner says is not enough — `0.1.3` does not distinguish today's build from last week's | rejected by the ask |
+| C5 | Version in the status bar / title bar instead of the palette | the owner named the palette (`about` / `version`); the status bar is a different product decision | not this card (§6) |
+
+## 2. Design (binding — stage 3 does not re-litigate)
+
+Pipeline: **compile clock → one env const → lib formatter → palette row**, and the same string as a
+toast when the row is submitted.
+
+### 2.1 `build.rs` (new, package root, ~10 lines)
+
+```rust
+fn main() {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("cargo:rustc-env=GHOSTWAVE_BUILD_EPOCH={secs}");
+}
+```
+
+* One env var, **unix seconds** — the script does no date formatting, so the date math lives in the
+  lib where it can be unit-tested (§2.2, §3). No dependency, no external `date`, nothing written.
+* **It deliberately emits no `rerun-if-changed`.** Cargo's default then applies: rerun when *any*
+  file in the package changes, i.e. the stamp moves whenever the crate is genuinely recompiled. (A
+  `rerun-if-changed=build.rs` alone would freeze the stamp across source edits — the exact failure
+  that would make the feature useless.)
+* Consequence, documented in `build_info`'s docs rather than hidden: a build that only *relinks* an
+  unchanged crate keeps the previous stamp. That is the honest answer — the crate was compiled then.
+
+### 2.2 `src/build_info.rs` (new, in the lib) + `pub mod build_info;` in `src/lib.rs`
+
+`src/lib.rs` is an alphabetical list (`clipboard`, `config`, `font_query`, …), so the new line goes
+**before** `pub mod clipboard;` (`lib.rs:3`).
+
+```rust
+//! What the running binary is: its crate version and the instant it was compiled.
+
+/// The crate version from `Cargo.toml` (`0.1.3`).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Unix seconds of the compile, written by `build.rs`.
+pub const BUILD_EPOCH: &str = env!("GHOSTWAVE_BUILD_EPOCH");
+
+/// Formats a unix timestamp as `YYYY-MM-DD HH:MM UTC` (civil-from-days, no dependency).
+pub fn format_utc(epoch_secs: u64) -> String;
+
+/// When this crate was compiled, `YYYY-MM-DD HH:MM UTC`.
+pub fn build_date() -> String;
+
+/// `ghostwave 0.1.3 — built 2026-10-30 05:12 UTC` — the one line both surfaces show.
+pub fn summary() -> String;
+```
+
+`build_date` parses `BUILD_EPOCH` with
+`.parse().expect("build.rs sets GHOSTWAVE_BUILD_EPOCH to unix seconds")` — **loud**, not
+`unwrap_or(0)`: a build with no stamp must fail rather than claim 1970. Every cargo build sets it,
+and §3 pins that it parses.
+
+### 2.3 `src/keymap.rs` — one variant
+
+`About,` in the `// global` group of `Action`, immediately after `Lock,` (`keymap.rs:120`).
+
+### 2.4 `src/input.rs` — one arm
+
+In `execute`, in the `// global` region next to `Action::Quit`/`Action::OpenCommandBar`
+(`input.rs:484`, `:513`):
+
+```rust
+Action::About => state.toast(ghostwave::build_info::summary()),
+```
+
+### 2.5 `src/palette.rs` — the row
+
+1. `const ABOUT_CATEGORY: &str = "About";` beside `DURABLE_CATEGORY` (`palette.rs:51`).
+2. ```rust
+   /// The single row shown for `about`/`version`: what this binary is and when it was built.
+   fn about_item() -> PaletteItem {
+       PaletteItem::new(ghostwave::build_info::summary(), ABOUT_CATEGORY, None, Action::About)
+   }
+   ```
+3. In `filtered_items`, **after** the `ssh ` branch (`palette.rs:175`) and **before**
+   `let is_theme_filter = …` (`palette.rs:177`):
+
+   ```rust
+   if lower.len() >= 3 && ["about", "version"].iter().any(|w| w.starts_with(&lower)) {
+       return vec![about_item()];
+   }
+   ```
+
+   Grammar: `about`, `abo`, `version`, `vers`, `ver` → exactly the one info row. A 1–2 char query
+   (`a`, `v`) keeps the normal fuzzy list, so nothing is hijacked while the user is typing some
+   other command. Anything longer than the word (`aboutx`) falls through to fuzzy.
+4. Inventory (`default_items`, after `Lock Terminal`, `palette.rs:786`):
+   `PaletteItem::new("About ghostwave", "App", None, About),` — browsable, and findable by fuzzy
+   (`abo`) and by substring; also the anchor for a future keybind.
+5. Empty-state hint (`palette.rs:542`) gains `| about`:
+   `"No matching commands (try: open <path> | ssh <host> | ds <host> | durable | theme <name> | about)"`.
+
+The row and the toast print the **identical** string (`build_info::summary()`), so the two can never
+disagree.
+
+## 3. Tests (all headless)
+
+`src/build_info.rs`, `#[cfg(test)]`:
+
+| test | asserts |
+|---|---|
+| `formats_the_epoch` | `format_utc(0) == "1970-01-01 00:00 UTC"` |
+| `formats_a_known_modern_instant` | `format_utc(1_700_000_000) == "2023-11-14 22:13 UTC"` |
+| `formats_a_leap_day` | `format_utc(951_782_400) == "2000-02-29 00:00 UTC"` |
+| `the_build_stamp_is_wired` | `BUILD_EPOCH.parse::<u64>()` is `Ok(n)` with `n > 1_600_000_000` (proves `build.rs` ran) |
+| `summary_names_the_version_and_the_date` | `summary()` starts with `"ghostwave "`, contains `env!("CARGO_PKG_VERSION")`, contains `" — built "`, ends with `" UTC"` |
+
+`src/palette.rs`, in the existing `mod tests`:
+
+| test | asserts |
+|---|---|
+| `about_and_version_show_the_build_info_row` | for `about` and `version`: `filtered_items().len() == 1`, `category == "About"`, `title == ghostwave::build_info::summary()`, `action == Action::About` |
+| `about_prefixes_resolve_but_short_queries_do_not` | `abo`, `ver`, `vers` → the same single row; `a` → the info row is **absent** (normal filtering applies) |
+| `about_is_browsable_in_the_inventory` | `default_inventory()` contains an item titled `"About ghostwave"` with `Action::About` |
+
+`src/input.rs`, in the existing `mod tests` (helper `fn state() -> AppState`, `input.rs:785`):
+
+| test | asserts |
+|---|---|
+| `executing_about_toasts_the_version_and_build_date` | after `execute(&mut s, Action::About)`, `s.toast` message == `ghostwave::build_info::summary()` |
+
+No test needs a display, a pty child, or the network; `state()` already spawns the first pane the way
+every neighbouring test does.
+
+## 4. Verification — exact commands, expected results
+
+Per-card target dir, every compile through the gate:
+
+```sh
+cd /home/death916/code/ghostwave/.worktrees/<stage-3 workspace>
+export CARGO_TARGET_DIR=/var/build/ghostwave-<stage-3 card id>
+BUILD_GATE_WAIT=600 BUILD_JOBS=3 bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell --run 'cargo test'
+```
+
+* Expected: `0 failed`, `0 ignored`, and the pass count is **279** — the §0.5 baseline **270 + 9**
+  (5 in `build_info` → lib 82→87, 3 in `palette` + 1 in `input` → bin 181→185, the two integration
+  targets unchanged). Stage 3 must **re-measure the baseline on its own workspace** and paste both
+  numbers; a quoted constant from here is not evidence.
+* Gate exit 3 = another heavy build holds the lock → `kanban_comment` + block `kind=transient`,
+  never compile around it. Exit 4 = < 5000 MB available → retry later. Never share a target dir
+  between worktrees (stale rlibs).
+
+```sh
+# the new tests, individually (build_info is a lib module; palette/input are bin modules)
+CARGO_TARGET_DIR=/var/build/ghostwave-<id> bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell --run 'cargo test --lib build_info:: && \
+                   cargo test --bin ghostwave palette::tests::about && \
+                   cargo test --bin ghostwave executing_about'
+```
+→ 5 tests in the lib target, **3** in the bin target named `palette::tests::about_…`, 1 in the bin
+target from `input::tests` — all listed by name and passing. The `palette::tests::` segment is
+required: the three tests live in the existing `mod tests` of `src/palette.rs`, so their full paths
+are `palette::tests::about_…`, and a filter of `palette::about` matches **nothing** while still
+reporting `test result: ok. 0 passed` (§9 D2).
+
+```sh
+CARGO_TARGET_DIR=/var/build/ghostwave-<id> bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell --run 'cargo clippy --all-targets'
+```
+→ exit 0, and **no warning that is not already on the base**. This tree carries 64 pre-existing
+clippy warnings (§0.5), so `-D warnings` is not the bar and must not be added — the bar is that the
+warning set is unchanged. The four pre-existing sites in the files this diff touches are
+`palette.rs:193` (`sort_by_key`), `palette.rs:325` and `palette.rs:443` (collapsible `if`),
+`input.rs:170`, `:560`, `:1046`, `:1073`, `:1353`, `:1435`, `:2281`; `keymap.rs` and `lib.rs` are
+clean. New code must not add a warning, and those ten must be left alone.
+
+```sh
+# formatting: the two NEW files only — repo-wide `cargo fmt --check` already fails at the base
+rustfmt --edition 2024 --check build.rs src/build_info.rs    # (inside the dev shell)
+```
+→ exit 0 for the new files. In the four existing files, match the surrounding style by hand; do
+**not** run repo-wide `cargo fmt` (5033 lines of pre-existing drift, §0.5).
+
+```sh
+# the end-to-end wire (build.rs -> env! -> summary()) — two tests, not a strings grep
+CARGO_TARGET_DIR=/var/build/ghostwave-<id> bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell --run 'cargo test --lib build_info::'
+```
+→ `the_build_stamp_is_wired` passes: it parses `BUILD_EPOCH` (`env!("GHOSTWAVE_BUILD_EPOCH")`, written
+by `build.rs`) as a `u64` and asserts it is a real epoch `> 1_600_000_000` — so a missing
+`build.rs`/stamp fails loudly instead of printing `1970-01-01`. `summary_names_the_version_and_the_date` passes:
+`summary()` starts with `ghostwave `, carries `env!("CARGO_PKG_VERSION")`, contains ` — built `, and
+ends with ` UTC`. Together these are the whole chain; there is no third assertion to make.
+
+**There is deliberately no `strings` gate, because one cannot work.** `summary()` assembles the line
+at runtime (`format!` over `format_utc(BUILD_EPOCH)`), so the joined text never exists as a
+contiguous literal in the binary, and `strings` (default ASCII charset) additionally breaks any run
+at the multi-byte em dash `—`. Measured on this box with rustc 1.95.0 in the repo's own dev shell, on
+a same-shape minimal program (`const VERSION`/`const BUILD_EPOCH` + runtime `format_utc` +
+`format!("ghostwave {VERSION} — built {}", …)`, §9 D1):
+
+| probe (`≈ /var/build/ghostwave-<id>/debug/ghostwave`) | result |
+|---|---|
+| `./repro_bin` (runtime) | `ghostwave 0.1.3 — built 2026-10-31 03:10 UTC` |
+| `strings repro_bin \| grep -aF '<that exact line>'` | **exit 1, no match** |
+| `strings repro_bin \| grep -aE 'ghostwave 0\.1\.3 — built [0-9]{4}'` | **exit 1, no match** (also unoptimized) |
+| `strings repro_bin \| grep 'ghostwave'` | one line, exactly `ghostwave ` — the fragment, not the line |
+| `strings repro_bin \| grep -x ' built '` | one line, ` built ` |
+| `grep -c 1793416227 repro_bin_debug` (unoptimized) | `1` — the epoch literal is there |
+| `grep -c 1793416227 repro_bin` (`-O`) | `0` — const-folded away; do **not** grep for it in an optimised build |
+
+So: do not add a `strings` check, do not grep for the epoch in a release/`-O` artefact, and do not
+"fix" the code if such a grep fails — it fails on correct code. The `0.1.3` string is present in the
+binary but proves nothing (it is already there from `CARGO_PKG_VERSION` in `src/remote.rs`, §0.2).
+
+**Not verifiable on orac, and stage 3 must say so instead of implying a visual check:** the box is
+headless, so nobody can open the palette and *look*. The tests pin the wiring, the row's
+text/category/action and the toast; the pixels are the owner's (`NEEDS-OWNER-VERIFY` line, or a
+`NEEDS-VULCAN:` follow-up if he wants it checked on the laptop).
+
+## 5. Risks
+
+* **R1 — non-reproducible builds.** A compile timestamp makes each build's binary differ. Inherent
+  to the feature; nothing in this tree depends on reproducible outputs.
+* **R2 — stamp goes stale after a relink-only rebuild** (§2.1). Accepted and documented in the
+  module docs; it is the correct reading of "when the crate was compiled".
+* **R3 — `env!` / `expect` fails if `build.rs` is removed** or a non-cargo build is attempted.
+  Loud failure is the point; a test pins that the const parses.
+* **R4 — new `Action` variant.** Only `input.rs:352` matches exhaustively today; the compiler is the
+  safety net. If a `match` elsewhere needs an arm, add the arm — do not restructure the enum.
+* **R5 — row width.** `summary()` is ~48 chars at `0.1.3`. If a future version or a longer stamp
+  overflows the 600 px modal, let the title fill the row (`Length::Fill`) rather than shortening the
+  string: the owner asked for the information.
+* **R6 — the prefix rule overlaps the fuzzy fallback** (`abo` matches both the rule and the
+  inventory row). The rule returns first, so exactly one row is shown, and the `palette` test pins
+  `len == 1`.
+* **R7 — the date is UTC only.** Deliberate: one unambiguous stamp, no locale/timezone dependency.
+  The row says `UTC`.
+
+## 6. NOT doing (explicit)
+
+* No CLI `--version` / `-V` flag for the `ghostwave` binary (a separate, small card if wanted).
+* No git commit hash, branch name, or dirty-worktree marker in the string.
+* No About dialog/window, no status-bar, tab-bar or title-bar version, no new keybind.
+* No change to `ghostd`, the ssh upload path, or the `ghostd <ver>` handshake.
+* No reproduction/build-id work (R1).
+* No README/PROGRESS rewrite beyond one short `PROGRESS.md` entry if the repo's log style asks for
+  it (previous cards did add one; keep it to the behaviour, not to this plan).
+
+## 7. Ordered work items for stage 3 (CODE)
+
+1. Work in a worktree whose HEAD is `origin/master` (`f607c5b`) or later; confirm
+   `git merge-base --is-ancestor f607c5b HEAD`. Record the real baseline test count first (§4).
+2. `build.rs` (§2.1) + `src/build_info.rs` (§2.2) + the `lib.rs` line; then the five `build_info`
+   tests (§3) and `cargo test --lib build_info::` green — that is C1's end-to-end evidence
+   (`the_build_stamp_is_wired` + `summary_names_the_version_and_the_date`), taken **before** the
+   palette work so a wiring failure cannot hide behind it. Do **not** add a `strings` check (§4).
+3. `keymap.rs` `About` + `input.rs` arm (§2.3, §2.4) + the `input.rs` toast test.
+4. `palette.rs`: const, `about_item`, the query branch, the inventory row, the hint string
+   (§2.5) + the three palette tests.
+5. Full suite, clippy, per-test filters (all §4) — paste the real output. No `strings` command.
+6. Commit on the job branch, `fleet_push.sh dev "$PWD" origin <branch>`, open the PR against
+   `master` and read it back (state, head sha, base). `ghostwave` is a **public** repo, so the merge
+   is the owner's — state that in the PR body.
+7. On the card: `NEEDS-OWNER-VERIFY` for the on-screen row (headless box), then hand stage 4 to
+   `review`.
+
+## 8. What stage 2 (PLAN REVIEW) must judge
+
+1. **Is C1 the right source for "when the binary was built"** — compile clock via `build.rs` — given
+   the rejected alternatives in §1, and is the no-`rerun-if-changed` choice (§2.1) correct rather
+   than a fresh way to freeze the stamp?
+2. **Is the grammar right:** `about`/`version` plus ≥3-char prefixes return exactly one row, while
+   `a`/`v` and any longer word fall through (§2.5.3, §3 R6)?
+3. **Does the plan separate what it can prove from what it cannot?** The row's text/action, the toast
+   and the `build.rs → env! → summary()` wiring are testable headless (§4); the pixels are not, and
+   §4 says so — and §9 removed the one §4 check that was not actually verifiable.
+4. **Are the file list and the test count complete** (6 touched files, +9 tests, one exhaustive
+   `Action` match at `input.rs:352`), and is anything in §6 silently in scope?
+
+## 9. Errata — round-1 plan review (`t_9ddaca09`), fixed 2026-10-30
+
+Round 1 returned **changes-required** on two §4 verification defects only. The design (§1, §2, §3,
+§5, §6) is unchanged and was explicitly verified sound — C1 (`build.rs` stamp), the ≥3-prefix
+grammar, the 6-file/9-test surface and every line citation are **not** re-opened here. Both defects
+below were reproduced independently by me on orac, in this repo's own dev shell
+(`nix-shell shell.nix`, rustc 1.95.0), before editing §4.
+
+### D1 — the §4 `strings | grep` "end-to-end evidence" could never match (removed)
+
+`summary()` builds its line with `format!` over a **runtime** date (`build_date()` → `format_utc()`),
+so the joined text is never one contiguous literal. Repro: a same-shape minimal program
+(`const VERSION: &str = "0.1.3"`, `const BUILD_EPOCH: &str = "1793416227"`, runtime `format_utc`,
+`format!("ghostwave {VERSION} — built {}", …)`), compiled with `rustc -O` **and** unoptimized:
+
+```
+$ ./repro_bin
+ghostwave 0.1.3 — built 2026-10-31 03:10 UTC
+
+$ strings repro_bin | grep -aF "ghostwave 0.1.3 — built 2026-10-31 03:10 UTC"
+grep exit=1                       # no match, on correct code — optimized and unoptimized both
+
+$ strings repro_bin | grep -aE 'ghostwave 0\.1\.3 — built [0-9]{4}'
+grep exit=1
+
+$ strings repro_bin | grep 'ghostwave'
+ghostwave                          # the fragment only (line ends there)
+$ strings repro_bin | grep -x ' built '
+ built
+```
+
+Two independent causes: the line is runtime-assembled, and `strings`' default ASCII charset breaks a
+run at the multi-byte em dash `—` (the em dash bytes *are* in the binary — `grep -c $'\xe2\x80\x94'`
+→ 1 — just not in a printable run).
+
+Extra measured trap for stage 3: the **epoch literal** is only a raw byte string in an unoptimized
+build — `grep -c 1793416227 repro_bin_debug` → `1`, but `grep -c 1793416227 repro_bin` (`-O`) → `0`
+(`.parse::<u64>()` on a const is folded and the literal is dropped). So an epoch grep is not a
+release-safe check either.
+
+**Fix:** the `strings` command is **deleted** from §4 and from §7 steps 2 and 5; no verification step
+gates on it. The honest end-to-end evidence is the pair of tests the plan already specified —
+`the_build_stamp_is_wired` (parses `BUILD_EPOCH` = `env!("GHOSTWAVE_BUILD_EPOCH")` as a real epoch
+`> 1_600_000_000`) and `summary_names_the_version_and_the_date` (the `summary()` shape) — both run by
+`cargo test --lib build_info::`. §4 now states plainly why the joined line is not in the binary, and
+warns against "fixing" code when such a grep fails. The `0.1.3` string *is* present, but proves
+nothing: `CARGO_PKG_VERSION` is already in the binary via `src/remote.rs` (§0.2).
+
+### D2 — `cargo test --bin ghostwave palette::about` matched 0 tests (filter fixed)
+
+The three palette tests live in the existing `mod tests` of `src/palette.rs`, so their full paths are
+`palette::tests::about_…`; `cargo test` filters by **substring of the full path**, and the `::tests`
+infix breaks `palette::about`. `src/palette.rs:802` is `mod tests {` inside `pub mod palette`, and the
+three test names are `about_and_version_show_the_build_info_row`,
+`about_prefixes_resolve_but_short_queries_do_not`, `about_is_browsable_in_the_inventory` (§3).
+
+Probe crate with the identical layout and the identical three test names:
+
+```
+$ cargo test --bin probe palette::about
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; ...
+        # ^ "ok / 0 passed" — the trap: stage 3 could read this as success
+
+$ cargo test --bin probe palette::tests::about
+running 3 tests
+test palette::tests::about_is_browsable_in_the_inventory ... ok
+test palette::tests::about_and_version_show_the_build_info_row ... ok
+test palette::tests::about_prefixes_resolve_but_short_queries_do_not ... ok
+test result: ok. 3 passed; 0 failed; ...; 1 filtered out
+```
+
+**Fix:** §4's filter is now `palette::tests::about`, expected result restated as **3** tests named
+`palette::tests::about_…`, with a note that a bare `palette::about` matches nothing yet still prints
+`ok`. The other two filters were re-checked and are correct as written: `--lib build_info::` matches
+`build_info::tests::…`, and bare `executing_about` matches `input::tests::executing_about_…`
+(substring, and no other test in `input.rs` carries that infix).
+
+Nothing else in §0–§8 changed; §7 step 2 keeps the same ordered position for the wiring evidence
+(it is now the `build_info` test run, not a grep), so the palette work stays blocked behind a
+failure it cannot hide.
+
+---
+
+# PLAN — libghostty-vt 0.2.2 now; ghostty 1.4's library gains are a separate card; and the 761 lines of hand-rolled selection the library already replaced
+
+Card: `t_df08b599` · repo `/home/death916/code/ghostwave` · worktree `.worktrees/t_df08b599` · branch `wt/t_df08b599` off `master` `a91a1a8`
+Owner's ask (verbatim): *"ghostty has released version 1.4 and i think libghostty was been updated. see if our depencies can be updated for it and also see if any of the featurees it brings weve already implemented and use the library ones instead. check for other things from lib we could use instead of handroll also to save on our own code complexity and ge tthe full benefits of libghostty"*
+
+## 0. The answers, before the evidence
+
+1. **"Can our dependencies be updated for 1.4?"** Not by bumping what we depend on — but a 1.4 binding *does* exist, and it is not the crate we use. **`ghostty-vt` / `ghostty-vt-sys` `0.8.0+ghostty.1.4.0-main.83fb956`** were published **2026-10-28T07:23Z** (§1), a fork of our own dependency ("Adapted from libghostty-vt 0.2.2", `ghostty-vt src/lib.rs:37`) re-pinned to ghostty `83fb956` = `1.4.0-main`. Adopting it is a **migration, not a bump**: it replaces our 9 `on_*` callbacks with an `Event` drain, drops allocators, and needs rustc 1.96 + Zig 0.17 (§4). The crate we actually depend on — **`libghostty-vt` 0.2.2** (2026-09-28) — vendors **the same ghostty commit as 0.2.1**: `a887df42c56f6de86c0fe6da9c4eeca37931e083`, `1.3.2-dev`, dated 2026-07-11, so *our* dependency carries no 1.4 API at all. What we do in this card is **0.2.1 → 0.2.2**, an API-identical soundness release (§2), and the fork goes to its own card (§4 Routing).
+2. **"Features 1.4 brings that we already implemented — use the library ones."** None of the 1.4-only APIs is implemented by us. The two hand-rolled subsystems 1.4 *would* replace are find-in-rows (`src/search.rs`) and session replay (`src/session.rs` pane logs); both are un-swappable inside this card — our pin has no 1.4 API, and the only 1.4 candidate here that is a crate-level safe binding over a ghostty source it vendors and pins itself is the migration of §4 — so they are a follow-up card, not stage 3.
+3. **"Other things from the library we could use instead of hand-rolling."** Yes, three, all available in the pin we already link: a **dead 761-line hand-rolled selection module** (`src/selection.rs`), **scrollback compression** (`Terminal::compress`, never called — and it is 1.4's headline memory feature), and **OSC 8 hyperlinks** (`GridRef::hyperlink_uri`, while we re-scrape row text in `link_at_cell`).
+
+## 1. Measurement log (every claim below is reproducible)
+
+Registry/API, 2026-10-28:
+
+```sh
+curl -sS -H 'User-Agent: ghostwave-dev-plan' https://crates.io/api/v1/crates/libghostty-vt
+#   {"max_stable_version":"0.2.2","newest_version":"0.2.2", ... "created_at":"2026-09-28T12:46:33Z"}
+curl -sS -H 'User-Agent: ghostwave-dev-plan' \
+  https://crates.io/api/v1/crates/libghostty-vt-sys/0.2.2   # features: vendored (default), kitty-graphics, link-dynamic, pkg-config, bindgen-tool
+```
+
+The registry landscape, from a search (this is the command that reproduces §0.1 and §4 — the two per-crate lookups above cannot see a crate that is not `libghostty-vt`):
+
+```sh
+curl -sS -H 'User-Agent: ghostwave-dev-plan' 'https://crates.io/api/v1/crates?q=libghostty&per_page=50'
+#   libghostty · libghostty-vt · libghostty-vt-sys · ghostty-vt · ghostty-vt-sys ·
+#   ghostty-vt-rs-sys · mnml-libghostty-vt(-sys) · khostty-vt · spyc-vt-sys ·
+#   zgx-ghostty-sys · embers-ghostty-sys · betamax-core · qwertty-term-vt · …
+```
+
+Five crates from four projects are the candidates for a 1.4 binding — three published 2026-10-27/28, two 2026-09 — and ours is in the same table only for comparison (per-crate `GET /api/v1/crates/<name>` and `/api/v1/crates/<name>/<version>`, 2026-10-28T13:2xZ):
+
+| crate | version | published | `rust-version` | downloads (crate / that version) |
+|---|---|---|---|---|
+| `ghostty-vt` | `0.8.0+ghostty.1.4.0-main.83fb956` | 2026-10-28T07:23:15Z | 1.96 | 362 / 15 |
+| `ghostty-vt-sys` | `0.8.0+ghostty.1.4.0-main.83fb956` | 2026-10-28T07:23:13Z | 1.96 | 459 / 21 |
+| `ghostty-vt-rs-sys` | `0.2.0` | 2026-10-27T18:59:19Z | 1.90 | 565 / 50 |
+| `libghostty-vt` (ours) | `0.2.2` | 2026-09-28T12:46:33Z | 1.90 | 182 706 / 8 485 |
+| `khostty-vt` | `0.1.0` | 2026-09-20T09:00:03Z | 1.75 | 20 / 20 |
+| `gpui-libghostty` | `0.3.1` | 2026-09-25T14:51:45Z | 1.95 | 836 / 371 |
+
+Round 2's table listed four of these and never evaluated the last two. Both are rejected on a fact read out of their own tarballs, not on a hunch:
+
+| crate | the measured fact that decides it |
+|---|---|
+| `khostty-vt` `0.1.0` | It *is* a safe 1.4 wrapper — `Search` (`src/search/mod.rs:60`), `SnapshotDecoder` (`src/snapshot/mod.rs:89`) over `ghostty_search_new` / `ghostty_snapshot_encode` (`src/ffi.rs:1838`, `:1870`) — but it vendors and pins **no** ghostty source: `build.rs:18-20`, `:59`, `:73` look for an already-built `libghostty-vt` through `GHOSTTY_VT_LIB` / `GHOSTTY_VT_LIB_DIR`, and `build.rs:161-165` warns *"Build it with `zig build -Dlibghostty-vt=true`"*. It is a route only if we build and ship the C library ourselves — strictly more than §4's migration. |
+| `gpui-libghostty` `0.3.1` | It is a GPUI terminal *component*, not a binding for our term core: `src/lib.rs:1-9` renders through Ghostty's Metal / Wayland-OpenGL surface and binds `Terminal` to the host application's GPUI via `bind_gpui!(gpui)`. It does vendor 1.4 source — `vendor/ghostty/VENDOR.md:4` (commit `9f0e1719`), with `ghostty_snapshot_encode` in `vendor/ghostty/include/ghostty/vt/snapshot.h:284` — but exposes nothing `src/term.rs` could call. |
+
+`ghostty-vt` is the only 1.4 candidate here that is a crate-level safe binding over a ghostty source it vendors and pins itself, and it is what §4 evaluates. Measured from the downloaded tarball:
+
+```sh
+# ghostty-vt-0.8.0+ghostty.1.4.0-main.83fb956
+grep -n 'Adapted from' src/lib.rs                      # 37://! Adapted from libghostty-vt 0.2.2 (MIT OR Apache-2.0).
+grep -n 'rust-version' Cargo.toml                      # 14:rust-version = "1.96"
+# ghostty-vt-sys-0.8.0+…/GHOSTTY.lock:
+#   commit = 83fb95624b0439ee660c2679b43b38c8b63769cd
+#   version = 1.4.0-main+83fb956
+grep -n 'pub fn ' ghostty-vt-…/src/search.rs           # Search::new/tick/run/feed/matches/viewport_matches/select_next/select_prev/…
+grep -n 'pub fn \|pub struct ' ghostty-vt-…/src/snapshot.rs   # encode, encode_to, Decoder::{new,decode,ready,next_page}
+for s in ghostty_search_new ghostty_snapshot_encode ghostty_terminal_paste \
+         ghostty_terminal_continuation_alloc ghostty_terminal_mode_get; do
+  printf '%-40s %s\n' "$s" "$(grep -c "$s" ghostty-vt-sys-…/src/bindings.rs)"; done
+#   ghostty_search_new 1 · ghostty_snapshot_encode 3 · ghostty_terminal_paste 6
+#   ghostty_terminal_continuation_alloc 1 · ghostty_terminal_mode_get 0
+```
+
+So the 1.4 API surface §3 needs **is published and wrapped** — by a fork, not by our crate. `ghostty_terminal_mode_get` is gone, but the safe crate keeps `Terminal::mode()` (`src/terminal.rs:409`, now returning `Result`), so the loss is at the C level, not at the API level we use (`term.rs:840`).
+
+`ghostty-vt-rs-sys` 0.2.0 is **raw FFI only** — there is no `ghostty-vt-rs` safe crate on crates.io (`GET /api/v1/crates/ghostty-vt-rs` → 404) — but it is the interesting second lead: it ships **prebuilt static libraries** for eight targets including `aarch64-unknown-linux-gnu` (`prebuilt.rs:9`) and `wasm32-unknown-unknown` (`prebuilt.rs:10`), so it needs **no Zig at all**, and its pinned commit `4a4fc017…` is dated 2026-10-27T16:34Z with the message `up to 1.4.1-dev`. It carries the same 1.4 symbol set (`ghostty_search_new`, `ghostty_snapshot_encode`, no `ghostty_terminal_mode_get`). Writing our own safe wrappers over it is strictly more work than §4's migration, so it is recorded as an alternative, not a route.
+
+
+Crate source diff, `0.2.1` vs `0.2.2` (both tarballs downloaded and unpacked side by side):
+
+```sh
+diff -ru src-0.2.1 src-0.2.2     # 237 diff lines, exactly 4 touched files
+```
+
+| file | change |
+|---|---|
+| `Cargo.toml`, `Cargo.lock`, `.cargo_vcs_info.json` | version bump, `libghostty-vt-sys` 0.2.2 |
+| `src/terminal.rs` | the only source change: clipboard soundness (below) |
+
+**No module added, no public signature changed, no new safe wrapper.** The 0.2.2 change is upstream issue #74: `ClipboardWrite::contents()` no longer calls `slice::from_raw_parts` on `NULL` (the "clear clipboard" shape: OSC 52 with an empty payload), and `ClipboardContent { mime, data }` no longer turns non-UTF-8 bytes into an invalid `&str` (`data` degrades to `""`; `mime` falls back to `application/octet-stream`). Both hunks are in `src/terminal.rs` at the `contents()`/`ClipboardContent::from_raw` sites; the tests added are `#[cfg(miri)]`.
+
+Vendored engine, both versions:
+
+```sh
+grep -n GHOSTTY_COMMIT libghostty-vt-sys-0.2.{1,2}/build.rs
+#   const GHOSTTY_COMMIT: &str = "a887df42c56f6de86c0fe6da9c4eeca37931e083";   ← identical, both
+diff -u libghostty-vt-sys-0.2.1/src/bindings.rs libghostty-vt-sys-0.2.2/src/bindings.rs
+#   (empty) — the FFI surface is byte-identical
+git -C <ghostty checkout> log -1   # a887df4 2026-07-11, build.zig.zon: .version = "1.3.2-dev"
+```
+
+Ghostty 1.4.0 was released **2026-10-27** (ghostty.org release notes), i.e. one day before this card, and three weeks *after* the newest `libghostty-vt` crate. It requires **Zig 0.17** to build ("Changes for Package Maintainers"); our `shell.nix` pins `zig_0_15` (0.15.2, `shell.nix:27`) with the comment that the pinned ghostty needs it (`shell.nix:8-9`).
+
+Toolchain on this box, measured (every number is a command in §4.2):
+
+```sh
+nix-shell ./shell.nix --run 'rustc --version; zig version'
+#   rustc 1.95.0 (59807616e 2026-04-14) · 0.15.2   (/nix/store/d01f6ax…-zig-0.15.2/bin/zig)
+nix-instantiate --eval -E '(import <nixpkgs> {}).lib.version'          # "26.05pre-git"
+nix-instantiate --eval -E '(import <nixpkgs> {}).zig_0_17.version'
+#   error: undefined variable — "Did you mean one of zig_0_12 … zig_0_16?"   ← no 0.17 in nixpkgs
+nix-instantiate --eval -E '(import <nixpkgs> {}).rustPackages_1_97.rustc.version'   # "1.97.1"
+nix-instantiate --eval -E '(import <nixpkgs> {}).rustPackages_1_98.rustc.version'   # "1.98.1"
+curl -sS https://ziglang.org/download/index.json | grep -c '0.17.0'    # 0.17.0, 2026-10-01
+```
+
+C API delta, our pin vs `v1.4.0` (headers fetched from the tag, symbol sets diffed):
+
+```sh
+grep -rho 'ghostty_[a-z_0-9]*' <pin>/include/ghostty/vt/ <pin>/include/ghostty/vt.h | sort -u   # 190
+grep -rho 'ghostty_[a-z_0-9]*' h14/include/ghostty/vt/ h14/include/ghostty/vt.h | sort -u      # 215
+```
+
+New in 1.4 (38 symbols): `ghostty_search_{new,set,get,get_multi,run,feed,tick,free}`, `ghostty_snapshot_{encode,encode_alloc,encode_buf}`, `ghostty_snapshot_decoder_{new,new_buf,decode,next,ready,set,get,get_multi,free}`, `ghostty_terminal_continuation_{alloc,buf,write}` + `ghostty_terminal_vt_write_until`, `ghostty_terminal_paste`, `ghostty_kitty_graphics_animation_tick`, `ghostty_render_state_image_{get,get_multi,iterator_new,iterator_next,iterator_free}`, `ghostty_render_state_{clean,row_iterator_next_dirty}`, `ghostty_formatter_format`, `ghostty_osc_set`, `ghostty_wasm_*` rework.
+Removed/renamed in 1.4 (breaking): `ghostty_terminal_mode_get/set` → the `GHOSTTY_TERMINAL_OPT_MODE` terminal option (`ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_MODE, &cfg)`, `terminal.h:2050`), `ghostty_render_state_colors_get`, `ghostty_vt_osc_free` → `ghostty_osc_free`, and the per-type `ghostty_wasm_alloc_*` helpers collapse to `ghostty_wasm_alloc/free`.
+
+## 2. Why 0.2.2 is not cosmetic for us
+
+Our clipboard path takes the shape the fix is about. `src/term.rs:349`:
+
+```rust
+.on_clipboard_write(|_term, clip| {
+    for content in clip.contents() { ... }
+```
+
+Any program can send OSC 52 with an empty payload ("clear the clipboard"); libghostty then passes `contents = NULL, contents_len = 0`, and 0.2.1's `contents()` runs `std::slice::from_raw_parts(null, 0)` — UB that the rustbindings' own regression test documents (upstream #74, "`from_raw_parts` requires a non-null pointer even at length zero"). That is reachable from ordinary terminal content, so the bump is a soundness fix on a live code path, not housekeeping.
+
+**Honesty constraint for stage 3:** no test we can write *proves* the UB is gone — the upstream tests are Miri-gated and Miri is not part of our toolchain. Stage 3 must say exactly that: the evidence is (a) the version bump, (b) the upstream diff, (c) a regression test that the empty-payload OSC 52 shape is handled without a panic and without a clipboard write, which pins the behaviour but cannot demonstrate the absence of UB.
+
+## 3. What 1.4 would give us, and what it would replace here
+
+| 1.4 C API | what we have today | size it would delete |
+|---|---|---|
+| `ghostty_search_*` (`search.h`) | `src/search.rs` — re-scans every row through `RowIteration` on each tick (`run_on_rows`), plus the match model in `src/search_overlay.rs` | 322 lines + the match/highlight bookkeeping; lib matches are `Selection`s that survive alt-screen switches, resize/reflow and scrollback pruning — ours do not |
+| `ghostty_snapshot_encode/decode` (`snapshot.h`) | `src/session.rs` — tee raw pty bytes to a per-pane log, front-truncate at `max_log_mb`, replay with `vt_write` on restore | the log/truncate/replay machinery (`AsyncPaneLog`, `truncate_log_front`, `replay_pane_log`) |
+| `ghostty_terminal_paste` | `TermPane::paste_text` (`src/term.rs:836`) already uses `paste::encode` + `mode(BRACKETED_PASTE)` | nothing — the lib call only folds the mode check in; low value |
+| kitty graphics animation / relative placements + `render_state_image_*` | we render **no** kitty images at all; we only install a PNG decoder so the core accepts them (`term.rs:1138`) | n/a — a feature we do not have |
+| OSC 7501 program-status, OSC 99 notifications, OSC 72 drag&drop parsing | none | n/a — new capabilities |
+| `terminal_continuation_*` | we `vt_write` whole reads | n/a — we do not chunk |
+
+## 4. Why none of §3 can be in stage 3
+
+Three independent blockers, each measured:
+
+1. **Our dependency carries no 1.4 API, and the only 1.4 candidate here that is a crate-level safe binding over a ghostty source it vendors and pins itself is a migration, not a bump.** `libghostty-vt` 0.2.2 vendors ghostty `a887df42` (`1.3.2-dev`); `search`/`snapshot`/`image` wrappers do not exist in it (§1). The alternative — `ghostty-vt` `0.8.0+ghostty.1.4.0-main.83fb956` (§1) — does wrap them, and this is what adopting it costs in *our* tree, measured:
+   - terminal effects become an **`Event` drain** (`Terminal::events`, `ghostty-vt src/terminal.rs:271`; `Event` enum at `:1223`, `ClipboardWrite` included) where we register **9 callbacks** — `on_pty_write`, `on_size`, `on_device_attributes`, `on_xtversion`, `on_color_scheme`, `on_title_changed`, `on_pwd_changed`, `on_bell`, `on_clipboard_write` at `term.rs:290,299,311,329,330,331,337,343,349`;
+   - it has **no custom allocators and no `'alloc` lifetime**, so `format_selection_alloc(None, opts)` (`term.rs:698`, `:825`) becomes `fmt::Formatter` + `FormatterOptions::with_selection` (`ghostty-vt src/fmt.rs:20,71`), and `Bytes::new_with_alloc` (`term.rs:1163`) goes away;
+   - every getter returns `Result` (its `README.md`), and the crate is Apache-2.0-only where ours is `MIT OR Apache-2.0`.
+   That is **12 call sites rewritten in `src/term.rs`** — the same file stage 3 edits for the 0.2.2 bump. Doing both in one card would bury an API-identical soundness fix inside a pane/effects rewrite and make stage 4 review nothing useful.
+2. **Toolchain: real, but a Nix rebuild is *not* what unblocks it.** Measured in §1, argued here:
+   - **Zig** — `ghostty-vt-sys` 0.8.0 hard-checks `0.17.x` (`build.rs:437`) but *resolves* zig as `ZIG` first (`build.rs:397`), then `PATH` if it reports 0.17 (`:404`), then `mise which zig` (`:409`), panicking with "set ZIG to the Zig 0.17 binary" (`:424-429`) otherwise. So **`ZIG=/path/to/zig-0.17.0/zig` is sufficient and no `shell.nix` edit is required to point at a 0.17 binary.** Our pinned nixpkgs *has no* `zig_0_17` (highest is `zig_0_16` = 0.16.0) and `/nix/store` holds only `zig-0.15.2`, so the 0.17 binary has to come from ziglang.org — `0.17.0`, 2026-10-01, `zig-aarch64-linux-0.17.0.tar.xz` exists — or from `mise`. **A Nix rebuild cannot produce one from this channel.**
+   - **rustc** — `ghostty-vt` needs `>= 1.96` (`Cargo.toml:14`); the dev shell measures **1.95.0**. nixpkgs carries `rustPackages_1_97.rustc` = 1.97.1 and `rustPackages_1_98.rustc` = 1.98.1, usable ad hoc (`nix-shell -p …`), again with no rebuild.
+   - **Opposite toolchains** — these conflict *only while both sys crates are in one build graph*: `libghostty-vt-sys` 0.2.2 builds ghostty 1.3.2-dev, which requires zig **0.15.2** (`shell.nix:8-9`, `:27`), while `ghostty-vt-sys` 0.8.0 requires **0.17.x**. A straight swap has one sys crate and therefore one toolchain; a side-by-side evaluation cannot have both.
+3. **Moving the pin is a source-level decision.** `libghostty-vt-sys` can be pointed at a checkout with `GHOSTTY_SOURCE_DIR`, but then the checked-in `bindings.rs` must match that checkout (it is generated, not built), and every removed symbol (§1) breaks the safe crate. That is a dedicated branch with its own review — which is exactly what Routing below is.
+
+**Routing:** the 1.4 work is a *separate card*, title **`libghostty 1.4: evaluate ghostty-vt 0.8.0 (the published 1.4 binding) against our src/search.rs and src/session.rs`**. Its blocker is **not** "owner builds a devenv with Zig 0.17" — nothing external blocks it: `ZIG=` covers Zig 0.17 and `nix-shell -p` covers rustc 1.96+, both without a Nix edit. It is a *scoped migration* with three measured costs to weigh (12 call sites, day-old fork with 15 downloads of that version, Apache-2.0-only vendor) against the measured prize (the `search`/`snapshot` wrappers that would delete `src/search.rs` and the pane-log replay), and the second lead `ghostty-vt-rs-sys` 0.2.0 (prebuilt static libs for `aarch64-unknown-linux-gnu`, no Zig at all) is the fallback if the 0.17 toolchain proves painful. It is not carved out of this plan as stage 3 scope, and this plan does not schedule it.
+
+## 5. What we can adopt today, measured against the code
+
+**a. Dead hand-rolled selection — delete `src/selection.rs` (761 lines, 10 `#[test]`s).**
+Every symbol in the file (`SelectionModel`, `GridCell`, `SelectionMode`, `expand_word_range`, `extract_selection_*`, `pixel_to_cell`, …) is unreferenced outside the file:
+
+```sh
+grep -rn 'SelectionModel\|GridCell\|SelectionMode\|pixel_to_cell\|cell_to_pixel' src/ tests/ | grep -v '^src/selection.rs'
+#   (no output)
+grep -n 'mod selection' src/main.rs          # 34:pub mod selection;   — the only reference
+```
+
+The live path already **is** the library: `src/term.rs:1005` `SelectionState` drives `selection::gesture::{Gesture, PressEvent, DragEvent, ReleaseEvent}`, `Selection::adjust`, `Terminal::set_selection`, and `copy_selection` copies through `FormatOptions::new().with_trim(true).with_unwrap(true)` (`term.rs:823`). Its four clipboard wrappers (`selection.rs:484-500`) just call `ghostwave::clipboard::{write_text,write_primary_text,read_text,read_primary_text}`, which `term.rs` calls directly. The 10 tests in the file test the dead model, so they leave with it.
+
+**b. Scrollback compression — `Terminal::compress`, present since before 0.2.1, never called.**
+
+```sh
+grep -rn 'compress\|CompressionMode' src/       # (no output)
+grep -n 'pub fn compress' <registry>/libghostty-vt-0.2.1/src/terminal.rs   # 482
+```
+
+`CompressionMode::{Incremental,Full}` + `CompressionResult::{Unsupported,Pending,Complete}` + `compression_activity()` are all in the API we already link (the 0.2.1→0.2.2 diff does not touch them). This is 1.4's memory headline ("70% to 90% less physical memory for typical text") available to us **today**, and it is caller-driven: incremental steps on idle, restart when `compression_activity()` changes. It changes storage only — "never its logical contents or scrollback limit; accessing compressed history restores it transparently".
+
+**c. OSC 8 hyperlinks — `GridRef::hyperlink_uri` (in 0.2.1's `screen.rs:116`; the 0.2.2 diff leaves `screen.rs` untouched).**
+`TermPane::link_at_cell` (`term.rs:888`) reconstructs the row as a string, strips variation selectors, and scans for `http(s)://` / path-shaped tokens. Consequence: an OSC 8 link whose display text is not its URL (the common case — `ls --hyperlink`, `git`'s docs links, systemd, many CLIs) is not clickable, and a long URI is truncated by the row scan. Fix: ask the cell for `hyperlink_uri` first (authoritative, and it survives wide chars / grapheme clusters), fall back to the text scan for bare URLs so the existing clickable-URL feature keeps working.
+
+**d. `png` 0.17 vs 0.18 — one dependency too many.**
+`Cargo.toml:30` says `png = "0.17"` for our kitty `DecodePng` impl; `libghostty-vt`'s `png` feature already pulls `png 0.18.1` (`Cargo.lock` contains both). The crate's own `RustPngDecoder` is still unusable — `graphics.rs:904` is a public struct with a private `buf` field and **no constructor** — so our impl stays, on 0.18. API delta measured against the vendored `png-0.18.1` source: identical except `output_buffer_size()` now returns `Option<usize>` (`decoder/mod.rs:668`), so the call at `term.rs:1160` needs one `?`/`unwrap_or(0)`.
+
+**e. Considered and deliberately not in stage 3**
+
+| candidate | why not |
+|---|---|
+| `paste::is_safe` | available, unused; only meaningful with an "unsafe paste?" confirm prompt — UI scope, deserves its own card |
+| `focus::Event::encode` (mode 1004 in/out reporting) | we implement no focus reporting at all; adding it changes what every program receives — separate card |
+| `log::set_logger` | debugging aid, not code reduction |
+| `osc::Parser` for `src/font_query.rs` | the pin's `GHOSTTY_OSC_COMMAND_*` enum has **no OSC 50** (`osc.h:43-66`), so the hand-written scanner in that 339-line module is the only way to answer font queries — keep it |
+| `sgr::Parser`, `unicode::grapheme_width` | nothing in our tree hand-parses SGR or computes widths; no saving |
+| `fmt::Formatter` | we already copy through the lib's `FormatOptions`; the full-VT dump has no caller |
+| a pty layer | libghostty-vt has none by design; `src/pty.rs` (forkpty via `nix`) stays ours |
+
+## 6. Scope of stage 3 — the smallest honest set
+
+**In:**
+1. `libghostty-vt` `0.2.1` → `0.2.2` (`Cargo.toml:18`, lock refreshed for the crate + `libghostty-vt-sys`).
+2. Unify `png` on 0.18 (`Cargo.toml:30`, one line in `term.rs`'s decoder).
+3. Delete `src/selection.rs` and `src/main.rs:34` (`pub mod selection;`) — 761 lines, 10 tests.
+4. Idle scrollback compression: `TermPane::compress_idle_step()` + one bounded step per pane from a dedicated low-rate ticker (§8.2 — **not** `AppState::tick`, which in the `Off` config never runs at all).
+5. OSC 8 first in `link_at_cell`, text-scan fallback preserved.
+6. Six new tests (§7).
+
+**Out, with reasons recorded:** everything in §3/§4 (needs the §4 migration — a fork of our own crate, rustc 1.96, Zig 0.17 outside nixpkgs — not a dependency bump), §5e (each has its own reason), and any UI change beyond what 4 and 5 require.
+
+## 7. Verification — commands and expected results
+
+Baseline is measured, not quoted. On `a91a1a8`, in the dev shell, with this card's own target dir:
+
+```sh
+cd /home/death916/code/ghostwave/.worktrees/t_df08b599
+export CARGO_TARGET_DIR=/var/build/ghostwave/t_df08b599
+BUILD_GATE_WAIT=900 bash ~/.hermes/scripts/build_gate.sh \
+  nix-shell ./shell.nix --run 'cargo test --locked'
+```
+
+> **Baseline, measured on the merged base `75da9ce` (`origin/master` brought forward on 2026-10-28, exit 0):**
+>
+> | target | result |
+> |---|---|
+> | `unittests src/lib.rs` (`ghostwave` lib) | **76 passed, 0 failed** |
+> | `unittests src/main.rs` (`ghostwave` bin) | **191 passed, 0 failed** |
+> | `tests/flood_throughput.rs` | 1 passed |
+> | `tests/term_core.rs` | 6 passed |
+> | **total** | **274 passed, 0 failed**, exit 0 |
+>
+> Pre-existing warnings at the base: 3, all in the bin test target (`src/main.rs:376` unused `VecDeque`, two "does not need to be mutable"); the lib target is warning-free. Stage 3 records these, fixes none of them, and adds none.
+>
+> (Measured twice: `273` on the pre-rebase `a91a1a8`, `274` after `origin/master` added one `src/remote.rs` test. Stage 3 starts from the merged base, so **274** is the number it must hold to.)
+
+The 10 tests that leave with `src/selection.rs` are in the **bin** target (`selection::tests::*`, seen in the bin run above), and the six new tests land in `src/term.rs`, i.e. the **lib** target.
+
+
+Per-module after the change (same gate, same target dir):
+
+```sh
+bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --locked term::'
+bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --locked app::'
+bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo test --locked'
+bash ~/.hermes/scripts/build_gate.sh nix-shell ./shell.nix --run 'cargo clippy --locked --all-targets'
+```
+
+Expected after the change: **lib 82** (76 + the six new `term::` tests), **bin 181** (191 − the ten `selection::tests::`), integration **7** unchanged, i.e. **270 passed / 0 failed** total and exit 0. These are the arithmetic of measured numbers — stage 3 still asserts them by running, and if a target disagrees it reports the real line rather than adjusting it. Clippy: no new warnings (the base's three bin-target warnings are recorded, not fixed).
+
+Dependency proof:
+
+```sh
+cargo tree -i png --locked        # exactly one png, 0.18.x
+cargo tree -i libghostty-vt --locked   # 0.2.2; sys 0.2.2
+```
+
+Deletion proof:
+
+```sh
+git grep -n 'mod selection' -- src/ tests/    # no match after the change
+test ! -e src/selection.rs && echo gone
+```
+
+The six tests (all in `src/term.rs`'s `#[cfg(test)] mod tests`, no display, no pty):
+
+1. `paste_of_empty_osc52_payload_does_not_panic` — `on_clipboard_write` installed with a `Vec` sink; `vt_write(b"\x1b]52;c;\x07")`; asserts no panic **and** no write recorded. This is the 0.2.2 shape (§2) — a behaviour pin, not a UB proof; the summary must say so.
+2. `osc52_text_write_still_reaches_the_sink` — a normal `\x1b]52;c;` + base64 + BEL still writes text (no regression in the callback path).
+3. `compression_returns_complete_and_keeps_scrollback` — fill 2× scrollback, then `compress(Full)`; assert `CompressionResult::Complete` (fails loudly if the target reports `Unsupported`), then assert the oldest and newest lines are still readable through the render iterator. **This is the test that proves compression actually works on this build rather than being silently unsupported.**
+4. `compression_activity_is_a_token` — `compression_activity()` changes after new output and is stable when idle (the scheduling contract §5b relies on). The token is documented as **opaque, comparable only by equality, and may wrap** (`libghostty-vt-0.2.2/src/terminal.rs:493-496`: "The value may wrap and changes in either direction have the same meaning"), so the assertion is `token != previous`, never an ordering — and fill scrollback first (write enough lines to leave the primary screen) so the activity is guaranteed to move rather than depending on where a short write lands in the compression window.
+5. `link_at_cell_prefers_the_osc8_uri` — write a row whose display text is `docs` and whose OSC 8 target is `https://example.com/x`; `link_at_cell(row, col_of_docs)` returns the URI, not `docs`.
+6. `link_at_cell_still_finds_a_bare_url` — a plain `https://example.com/plain` row still resolves (the fallback).
+
+## 8. Risks and how stage 3 handles them
+
+1. **Compression must be serialized with every other terminal operation** (lib doc: "not thread-safe with other operations on the same terminal… serialize it with writes, rendering, searches", `libghostty-vt-0.2.2/src/terminal.rs:479-481`). The pane handle is `SharedPane = Arc<Mutex<Pane>>` (`src/pane.rs:26`), reached as `PaneEntry::Term(SharedPane)` (`pane.rs:602-604`) out of `Tab.panes: Vec<Option<PaneEntry>>` (`src/app.rs:86`) — there is no `Arc<Mutex<PaneEntry>>` in the tree. The stepper takes one pane's `Mutex<Pane>` and holds it across exactly one `compress` call, then releases it before touching the next pane: never two locks at once, never a lock held while sending messages.
+2. **`AppState::tick` runs at 16 ms (Fast) / 125 ms (Slow) — and in `Off` it does not run at all, so compression must not hang off `tick_rate()`.** `tick_rate()` (`app.rs:643-658`) returns `Off` when there is no toast, no wave energy, `visual_wave == false`, no visualizer, `dynamic_title == Off`, no AI reply pending and no remote activity; `visual_wave` defaults to `true` (`config.rs:167`). Critically, `main.rs:658-661` does `match self.state.tick_rate() { app::TickRate::Off => {} … }` — **no ticker subscription is created**, so `AppState::tick` is never called and `TickSlot::period()`'s `Off → 3600 s` (`tick.rs:26`) is unreachable from the subscription path. A user with `visual_wave = false` and `dynamic_title = "off"` would therefore get **no compression at all** (not one step an hour) in exactly the idle-terminal scenario the feature exists for. **Decision — chosen trigger:** compression runs off a dedicated low-rate ticker, not the animation tick. Concretely: a `Message::CompressTick` delivered by a 4 s stream (modelled on `tick::stream` / `autosave::stream`) subscribed whenever any tab holds a `PaneEntry::Term`, *independent of `tick_rate()`*; its handler `AppState::compress_idle_step()` walks the panes and, per pane, reads `compression_activity()`, keeps the token cached, and calls `compress(Incremental)` **exactly once** when the token is unchanged from the cached one and the pane has been idle for ≥ 2 s since the token last changed. This is the crate's own contract ("cache it and restart its compression idle delay whenever the value changes", `terminal.rs:493-496`), it costs one token read per pane per 4 s, and it is what makes the `Off` config work. When a step returns `Complete` for the current token, nothing more is done until the token changes again. Explicitly rejected: promoting `tick_rate()` to `Slow` while work is pending (that subscribes the app's 125 ms tick-and-repaint loop — wave, toasts, visualizer — for housekeeping) and changing `tick.rs:26`'s `Off → 3600 s` (recorded here as dead code on the `main.rs:660` path so stage 3 does not "fix" it or depend on it).
+3. **`CompressionResult::Unsupported` is a legitimate answer** on some targets; the code must treat it as "do nothing, remember it, stop asking", and test 3 must fail rather than skip if it appears here (x86_64/aarch64 Linux are supported per the release notes — so on orac it must be `Complete`/`Pending`).
+4. **Deleting `src/selection.rs`** is safe today (grep-verified, §5a) but it is a removal of a public `mod` from the binary; a stale local branch could conflict. Stage 3 does the deletion in its own commit so it can be reverted alone.
+5. **`png` 0.18 rename surface** is limited to `output_buffer_size() -> Option<usize>`; if `cargo build` disagrees with that claim the honest move is to keep 0.17 and record it, not to rewrite the decoder.
+6. **`clip.at_cell` reordering (OSC 8 first)** must not change click-through for text that merely *contains* a URL with a hyperlink attached elsewhere; test 6 is the guard.
+
+## 9. Work items for stage 3, in order
+
+| # | change | files |
+|---|---|---|
+| C1 | bump `libghostty-vt` to 0.2.2, refresh lock | `Cargo.toml:18`, `Cargo.lock` |
+| C2 | unify `png` on 0.18 (+ `output_buffer_size` Option) | `Cargo.toml:30`, `src/term.rs:1145-1170` |
+| C3 | delete the dead selection module | `src/selection.rs` (−761), `src/main.rs:34` |
+| C4 | `TermPane::compress_idle_step()` + `AppState::compress_idle_step()` + `Message::CompressTick` on its own 4 s stream (§8.2 — independent of `tick_rate()`) | `src/term.rs`, `src/app.rs`, `src/main.rs` (`Message`, update handler, `subscription()`) |
+| C5 | OSC 8 first in `link_at_cell` | `src/term.rs:888` |
+| C6 | the six tests of §7 | `src/term.rs` `#[cfg(test)]` |
+
+Each item is its own commit, so stage 4 can review and revert them independently.
+
+## 10. What stage 2 has to judge
+
+1. **B1** Is §1's central claim right — that the crate *we* depend on cannot carry 1.4 because its `build.rs` pins `a887df42…` and its `bindings.rs` is byte-identical 0.2.1→0.2.2 — and does §1/§4 keep that separate from the **fork** that does carry 1.4 (`ghostty-vt` 0.8.0), each with a command that reproduces it rather than an assertion?
+2. **B2** Is §4's cost list complete for *this* repo — the fork's 12 call sites (9 callbacks, 2 `format_selection_alloc`, 1 `Bytes::new_with_alloc`), Zig 0.17 vs a nixpkgs that has no `zig_0_17`, rustc 1.95 vs the fork's 1.96 floor, and the generated `bindings.rs`? §4 now says a Nix rebuild is **not** the blocker (`ZIG=`, `nix-shell -p rustPackages_1_97`) — is that right, and does the Routing card overstate what is already possible?
+3. **B3** Is §2's reachability claim right — does `on_clipboard_write` really take the empty-payload shape — and does the plan refuse to claim a test proves the UB is gone?
+4. **B4** Is §5a's "dead" claim true under the whole tree (`src/`, `tests/`, and the `ghostwave` lib target), and is the 10-test subtraction the only test-count effect?
+5. **B5** Is §8.1–8.3's compression design (one pane lock at a time, one `Incremental` step per pane per 4 s ticker, idle-delay gated on `compression_activity()`, `Unsupported` is terminal-but-not-a-skip) sufficient, and is test 3 the right pin?
+6. **B6** Is the scope in §6 actually the smallest honest set for the owner's ask — i.e. does it leave out something the ask plainly wanted, or include something it did not?
+
+### Round-2 changelog (what this revision changed, and why)
+
+| defect | what changed | evidence now in the plan |
+|---|---|---|
+| **D1** "only published binding" was false | §0.1, §0.2, §1 (registry landscape block + candidate table + tarball measurements), §4.1, §4 Routing | `curl …'?q=libghostty&per_page=50'`; `crates.io` per-crate versions/dates/`rust-version`/downloads; `ghostty-vt` `src/lib.rs:37`, `Cargo.toml:14`, `src/search.rs`, `src/snapshot.rs`; `ghostty-vt-sys` `GHOSTTY.lock` and `src/bindings.rs` symbol counts |
+| **D2** follow-up card's blocker misstated | §1 (toolchain block), §4.2, §4 Routing (new title + no-Nix blocker) | `build.rs:397/404/409/437` (Zig resolution via `ZIG`), `shell.nix:8-9,27`, dev-shell `rustc 1.95.0 / zig 0.15.2`, nixpkgs has **no** `zig_0_17` (max `zig_0_16`), `rustPackages_1_97.rustc` = 1.97.1, ziglang.org `0.17.0` aarch64-linux tarball |
+| **D3** tick-`Off` had no stated behaviour | §6 item 4, §8.2 (new decision paragraph), §9-C4, §10-B5 | `app.rs:643-658`, `config.rs:167`, `main.rs:658-661`, `tick.rs:26` |
+| note: wrong pane type | §8.1, §9-C4 | `pane.rs:26`, `pane.rs:602-604`, `app.rs:86` |
+| note: test 4 could be flaky | §7 test 4 | `libghostty-vt-0.2.2/src/terminal.rs:493-496` (token is opaque and may wrap; fill scrollback first) |
+| note: `term.rs:1156` | §5d | the call is at `term.rs:1160` |
+
+**One correction to the D3 brief itself.** The card says the `Off` config makes compression "advance ~once/hour". Measured, it is worse: `main.rs:658-661` never subscribes a ticker when `tick_rate()` is `Off`, so `AppState::tick` is not called at all and `tick.rs:26`'s `Off → 3600 s` is unreachable from that path. The `Off` config gets **no** compression, not a slow one — which is why §8.2 now takes the trigger off `tick_rate()` entirely instead of budgeting within the tick.
+
+### Round-3 changelog (round 2's standing defect: false universals about the 1.4 binding)
+
+| defect | what changed | evidence now in the plan |
+|---|---|---|
+| **U1** the plan called `ghostty-vt` uniquely safe and the sole published 1.4 binding — false, `khostty-vt` 0.1.0 is a published safe 1.4 wrapper | §0.2 (`PLAN.md:1210`), §1 (`:1251`), §4.1 (`:1350`) now carry **one identical** qualifier — *the only 1.4 candidate here that is a crate-level safe binding over a ghostty source it vendors and pins itself* | §1 rejection table below the registry table: `khostty-vt` `build.rs:18-20,59,73,161-165` (needs an externally built `libghostty-vt`), `gpui-libghostty` `src/lib.rs:1-9` + `vendor/ghostty/VENDOR.md:4` (GPUI component that vendors source) |
+| **U2** the two candidates were in the plan's own registry output but never evaluated | §1 registry table gains both rows (version/published/`rust-version`/downloads) and a per-crate "fact that decides it" row naming the file it was read from | `GET /api/v1/crates/khostty-vt[/0.1.0]`, `…/gpui-libghostty[/0.3.1]` (2026-10-28T13:2xZ); the `.crate` tarballs unpacked in `~/.hermes/profiles/dev/cache/scratch/lgvt-r3/` |
+| **U3** target count was one short | §1 now says **eight** prebuilt targets and names the missing one, `wasm32-unknown-unknown` | `ghostty-vt-rs-sys-0.2.0/prebuilt.rs:5-13` — the `PREBUILT` slice has eight entries, `wasm32-unknown-unknown` at `:10` |
+
+---
+
+# PLAN — a killed durable session must not come back (`t_6abf6154`)
+
+Card: `t_6abf6154` · repo `/home/death916/code/ghostwave` · branch `wt/t_6abf6154` off `master` `a91a1a8`.
+Base suite, measured on this tree: **273** test functions (`grep -rh '^\s*#\[test\]' src/ | wc -l` = 266,
+`tests/` = 7, `#[ignore]` = 0). The `ghostd` crate has **0** tests.
+This is a stage-1 card: the only file it changes is `PLAN.md`.
+
+## 0. The report, and how it was reproduced
+
+> "starting a new durable session to a host that had a previously killed one still tries to re attacth
+> and replay old session. kill remote session doesnt work properly and spawning a new one jsut goes to
+> the old stuck one"
+
+All three sentences reproduce **locally, with no ssh and no remote host**: the shipped static daemon
+(`assets/ghostd-aarch64`, `ghostd 0.1.3`) driven directly, with `GHOSTWAVE_STATE_DIR` pointed at a
+throwaway directory. The scripts are `repro2.sh`, `repro3.sh`, `repro5.sh`, `repro6.sh`, `repro8.sh` in
+`~/.hermes/profiles/dev/cache/scratch/ghostd-repro/` — evidence for this plan, not part of the diff.
+
+The shipped asset **is** built from this tree (`grep -c -a "wedged daemon" assets/ghostd-aarch64` = 1,
+same for `busy: another client is attached`), so what is measured here is the code in `ghostd/src`.
+
+Seven findings. Each is a mechanism read out of the code *and* an output block from a run.
+
+### F1 — a new session replays the dead session's output
+
+`main.rs:52` opens the log `create(true).append(true)`; `main.rs:205-219` replays the whole file to every
+new client; nothing truncates it on `new`, and `cmd_kill` (`main.rs:525-564`) never removes it.
+
+```
+=== 1. fresh session s1, one command, then detach
+--- log size: 370        --- marker in the log? 2
+=== 2. ghostd kill s1  → ghostd: killed 's1'
+--- state dir: s1.log                     ← the log outlives the daemon
+=== 3. ghostd new s1 (a NEW session) then attach
+--- bytes the brand-new session showed its first client: 528
+--- does it contain the killed session's marker? 2
+```
+
+### F2 — `recover_session` never kills the wedged daemon
+
+`lib.rs:112-127`: `read_to_string(pid_file)` then `pid_str.trim().parse::<i32>()`. The pidfile has been
+**two lines** since the child pid was added (`main.rs:48-51`), so `trim()` yields `"2182633\n2182635"`,
+the parse always fails, and the whole body is skipped — no SIGTERM, no SIGKILL. All it does is unlink the
+socket and pidfile, i.e. it forgets a live daemon instead of killing it.
+
+```
+=== D3.2 new s2 over the wedged daemon
+[ghostd:probe] s2: no response in 2s -> Unresponsive
+[ghostd:new] s2: wedged daemon — recovering
+--- old daemon after the recovery: alive          ← it was never signalled
+--- new pidfile daemon=2182774                    ← a second daemon now owns the name
+--- after killing s2, is the old daemon STILL alive? alive
+```
+
+### F3 — state files are removed by *name*, not by owner
+
+`main.rs:133-134` (accept-loop cleanup), `main.rs:561-562` (`cmd_kill`) and `lib.rs:128-129`
+(`recover_session`) all `remove_file(socket_path(name))` / `pid_path(name)` unconditionally — any of them
+deletes whichever daemon currently owns that name, not the one that wrote the files.
+
+```
+=== attach exited rc=1
+=== new exited rc=0            ← the pane re-created the session (F4)
+=== state dir: s7.log          ← the dying old daemon unlinked its successor's sock+pid
+--- orphan daemon 2185083: alive
+--- ghostd kill s7 → ghostd: no session 's7'   exit=1
+--- orphan daemon after ghostd kill: alive     ← unreachable and unkillable by the CLI
+```
+
+### F4 — the pane's script cannot tell "no session" from "session ended"
+
+`remote.rs:191-194` builds `"$BIN" attach {s} 2>/dev/null || { "$BIN" new {s} >/dev/null 2>&1 && exec
+"$BIN" attach {s}; }`, and `cmd_attach` exits **1** for every failure (`main.rs:375`, `:426`, `:433`,
+`:481`). So a session that just *ended* — killed, or its shell exited — is re-created by the pane itself.
+Measured twice: on `ghostd kill` (above) and by typing `exit`:
+
+```
+=== F4b.1 daemon=2187979; log before: 186 bytes   (typed: echo MARKER-BEFORE-EXIT, then exit)
+=== F4b.2 s8 is BACK: old daemon 2187979 (dead), new daemon 2188104 (alive)
+          log now: 633 bytes, MARKER-BEFORE-EXIT x2
+```
+
+A durable remote shell cannot be exited, and a killed session is immediately re-created.
+
+### F5 — a liveness probe counts as an attach (found, not a symptom of this card)
+
+`main.rs:77-84` sets `ever_attached = true` on `accept()`, before the SIZE handshake, so any probe
+defeats the first-attach safeguard: `new s5 --first-attach-secs 3`, one probe, `sleep 5` →
+`--- s5 daemon after the deadline (must be dead): alive`. Fixing it needs a protocol verb; see §9.
+
+### F6 — a stale socket file makes the name permanently uncreatable, silently
+
+`main.rs:358-364` calls `daemonize()` and then `UnixListener::bind(&sock)` — never
+`ghostd::bind_listener` (`lib.rs:416-432`), the function that exists to clear a socket which refuses
+connections. `bind_listener` is called from nowhere (`grep -rn bind_listener` → its definition only). And
+because the parent has already exited 0, the child's bind failure is printed to `/dev/null` and lost.
+
+```
+=== SIGKILL the daemon; state left: s10.log s10.pid s10.sock
+--- new s10 exit=0  (no output)
+--- daemons named s10: 0 process(es)      ← new said "ok", no daemon exists
+--- a client attaching: exit=1  ghostd: no session 's10'
+```
+
+### F7 — `kill` reports success it never verified
+
+`main.rs:545-563` SIGKILLs and removes the state files without re-checking that the daemon died; the
+shell side (`remote.rs:236-241`) ends with `|| true; true`, so the ssh child exits 0 even when nothing
+was killed; `spawn_kill` (`remote.rs:418-437`) discards the outcome and the toast is unconditional
+(`app.rs:1220`, `:1236`). The mechanism is fixed below (F2/F3 make a surviving daemon detectable); the
+truthful toast is §9.
+
+## 1. One root cause
+
+A durable session's identity is a **name**, and its state (`<name>.sock`, `<name>.pid`, `<name>.log`) is
+treated as belonging to the name rather than to the daemon instance that owns it. Nothing records "which
+daemon wrote this", so (a) a new daemon inherits a dead one's log, (b) a wedged daemon cannot be killed
+because the function that should kill it cannot parse the file that names it, (c) any daemon can delete
+any other's state files, (d) a stale socket blocks the name forever, and (e) the pane cannot distinguish
+"create the session" from "the session ended". Fix them as one idea — *state belongs to the daemon that
+wrote it, and the daemon says why a connection failed* — not as seven patches.
+
+## 2. The change set (stage 3 executes these; order = commit order)
+
+### C1 — the log belongs to its daemon (`ghostd`, F1)
+* `cmd_new`: **after** the probe (so a healthy session is never touched) and **before** binding, truncate
+  the log: `let _ = fs::write(log_path(name), b"");` — with one `eprintln!` line when it discarded a
+  non-empty log. A `new` session starts with no history.
+* `cmd_kill`: after the daemon is confirmed dead, `let _ = fs::remove_file(log_path(name));`.
+* Doc on both: replay is only ever the history of the daemon that is attached to; a session no daemon
+  holds has nothing to replay.
+
+### C2 — `recover_session` parses, kills and verifies (`ghostd`, F2)
+Replace `lib.rs:110-130` with a `-> bool` ("the old daemon is gone"):
+* read the pidfile through the new `read_pidfile` (below); no pidfile → `false` (nothing that names a
+  victim — the caller reports it, it does not guess);
+* `SIGTERM`, 1 s poll, `SIGKILL`, then `!pid_alive(daemon)` as the verdict;
+* kill the recorded child's process group (`kill_child_group`, 2 s) — a killed daemon must not orphan the
+  session's program (this is what `cmd_kill` already does at `main.rs:558-560`);
+* remove the state only if the daemon is confirmed dead **and** the pidfile still names it (C3).
+* `cmd_new` calls it and **dies** when it returns `false`:
+  `die("'{name}' is held by a wedged daemon that will not die — kill it by hand")`. Never bind a second
+  daemon over a live one.
+
+### C3 — state files are removed only by their owner (`ghostd`, F3)
+New in `lib.rs`, all `pub` and doc'd:
+* `read_pidfile(name) -> Option<(Pid, Option<Pid>)>` — first line is the daemon, second (optional) the
+  child; a file that does not parse is `None`.
+* `pidfile_names(name, daemon) -> bool` — the ownership test.
+* `remove_state_if_owned(name, daemon)` — removes `<name>.sock`/`<name>.pid` **only** when
+  `pidfile_names` is true.
+* `write_pidfile(name, daemon, child)` — write `<name>.pid.tmp`, then `rename` (a reader must never see a
+  half file; today `main.rs:48-51` writes 15 bytes non-atomically).
+* Call sites: accept-loop cleanup (`main.rs:133-134`) → `remove_state_if_owned(name, getpid())`;
+  `cmd_kill` and `recover_session` → remove only after a confirmed death, only if the file still names
+  that pid.
+* `cmd_kill` with no pidfile must **not** delete a socket that still accepts a connection (that daemon is
+  alive, it is just not named): try `UnixStream::connect`; connects → `eprintln!("'{name}' has no pidfile
+  but its daemon answers — kill it by hand")` + exit 1; refused → the socket is stale, remove it.
+
+### C4 — `new` binds before it daemonizes, through `bind_listener` (`ghostd`, F6)
+`main.rs:358-364` becomes: `let listener = bind_listener(name).unwrap_or_else(|e| die(&format!(...)));`
+**before** `daemonize()`, and the daemon then runs `accept_loop(listener, ...)` on the inherited fd
+(`daemonize` only forks — no exec — so the fd survives; the socket is `CLOEXEC` but nothing execs).
+Effects: a stale socket is cleared (that is what `bind_listener` is for), a live one is refused, and a
+bind failure reaches the caller with a real exit status instead of vanishing into `/dev/null`.
+
+### C5 — the daemon says *why* a connection failed (`ghostd`, F4)
+New constants in `lib.rs`, doc'd as the contract with `src/remote.rs`:
+
+| code | meaning | who returns it |
+|---|---|---|
+| `1` | there is no session (unchanged meaning — old app keeps working), **and, unchanged, a live session that is attached elsewhere (busy)** | `cmd_attach`: connect failed; busy: the refusal text as the handshake's first chunk (`main.rs:81`, `:441`) with **no `OK\n` seen**, so the relay's `Ok(0)` (`main.rs:481`) exits 1 |
+| `3` | the daemon holds the session but never answered (wedged) | `cmd_attach`, the 8 s handshake deadline (`main.rs:423`, exit at `:426-427`) |
+| `4` | the session exists but ended | `cmd_attach`: `Ok(0)` at the handshake (`main.rs:432-434`, the daemon accepted and closed before acking), and `Ok(0)` in the relay (`main.rs:481`) **after `OK\n` was seen** |
+
+**Busy stays on exit 1 — decided here, not later** (stage-2 D1; the codes are asset-locked, §6).
+Measured on this tree: the accept loop writes `busy: another client is attached\n` and returns, dropping
+the stream (`main.rs:78-82`, the write at `:81`); `cmd_attach`'s handshake takes that text as its first
+chunk and puts it in `out_buf` (`main.rs:438-441`, no `OK\n`), so the relay's first read is `Ok(0)` →
+`exit(1)` (`main.rs:481`) before any flush — the text reaches nobody. The pane's script then falls into its
+`|| { new … }`, which probes: `Probe::Healthy` → `die("…already exists")` (`main.rs:351`) → script exits 1 →
+`remote.rs:601` (`auto_reconnect && code != 0`) retries, bounded by `reconnect_attempts = 5`
+(`config.rs:84`, reset on success at `app.rs:1189`). So a transient overlap — a second app instance, or a
+manual `ghostd attach` held during a reconnect — self-heals, and busy **cannot** create a session or
+truncate the log, because C1's truncation sits *after* the probe. Mapping busy to 4 instead would hand a
+*live* session the fate of a dead one (clean exit → `Manual`, zero retries); 4 must mean "it ended, stop
+reconnecting" and nothing else. No new `eprintln!` for busy either: the pane discards the attach's stderr
+(`2>/dev/null`), and detecting the string in Rust would couple the client to the daemon's English text
+(§7.2).
+
+The discriminator for 4 is the handshake, and busy cannot fake it: on success the daemon sends `OK\n`
+(`main.rs:201`); on busy it *writes the refusal before dropping the stream* (`main.rs:81-82`), so a busy
+client's first handshake read yields that text, never `Ok(0)`. Implementation: record whether `OK\n` was
+seen. The relay's `Ok(0)` (`main.rs:481`) exits **4** only when it was (the session ended while we were
+attached — the reported symptom) and **1** when it was not (busy: retry, never create). The handshake's own
+`Ok(0)` (`main.rs:432-434`) stays **4** as planned: there the daemon accepted and closed before any ack, so
+the connection carried a session that is over; it is not the busy shape, which always delivers bytes first.
+
+### C6 — the pane creates only when the session is *missing* (`app`, F4)
+`remote.rs:188-198` becomes (same `sq`/`dquoted` shape, same version check first):
+
+```
+"$BIN" attach {session} 2>/dev/null; rc=$?; \
+if [ $rc -eq 1 ] || [ $rc -eq 3 ]; then \
+  if "$BIN" new {session} >/dev/null 2>&1; then "$BIN" attach {session} 2>/dev/null; rc=$?; fi; fi; \
+if [ $rc -eq 4 ]; then exit 0; fi; \
+exit $rc
+```
+
+* `exec` is dropped so the *second* attach gets the same translation — otherwise a session that ends
+  right after being created still reports 4 and the pane loops.
+* **4 → exit 0 is the app-side signal**: `remote.rs:601` reads `auto = auto_reconnect && code != 0`, so a
+  pane whose session ended is left disconnected (`Enter` reconnects). That is the whole reason a killed
+  session stays killed — no `app.rs` change is needed, and none is made.
+* **busy never enters this script as 4** (C5): it arrives as 1, the create branch runs, `new`'s probe
+  answers `Healthy` and `new` dies without binding or truncating, so the script's status stays 1 and the
+  pane's existing auto-reconnect retries it — the one path this card deliberately leaves as it is.
+* A dropped ssh still exits 255 → auto-reconnect is untouched.
+
+Doc comment on `attach_cmd` must state the contract: 1/3 create, 4 is an ending, nothing else creates,
+busy is 1 on purpose (probe-guarded, retried), and no `exec`.
+
+### C7 — journal
+`PROGRESS.md`: one entry, the seven findings in two or three sentences, the measured numbers, and the
+explicit "the daemon fixes reach no host until the assets are rebuilt" from §6.
+
+## 3. Wire compatibility (what this does to the owner's hosts *today*)
+
+| app | daemon | result |
+|---|---|---|
+| old (0.1.3) | old (0.1.3) | today's behaviour — the baseline the other rows are compared to |
+| new | new (0.1.4, §6) | the fix |
+| new | old (0.1.3, cached on every host) | **exactly today's behaviour** (no session → 1 → create; ended → 1 → create) |
+| old | new | the old app **downgrades the asset back to 0.1.3** before its first pane, so it lands in the "new app / old daemon" row above — today's behaviour |
+
+**How the `old | new` cell actually executes** (stage-2 D3). Not "the old script treats 4 as failure and
+creates" — that path cannot run. The old app's `ensure_remote_binary` (`app.rs:1453-1470`, skipped once
+`binary_ready` holds the host, `:1458`) calls `upload_ghostd` (`remote.rs:478-521`), whose `version_check`
+(`remote.rs:450-455`) fails against a 0.1.4 binary, so it re-uploads its **own embedded 0.1.3 asset** over
+it — a downgrade — and verifies it. From then on the old tab is talking to a 0.1.3 daemon and behaves like
+`old | old`. Where that upload does not happen (it failed, or the host was already marked ready), the old
+script's first act is still the version gate (`remote.rs:191-194`): `$($BIN --version)` ≠ the *app's*
+version → prints "ghostd missing/stale —
+reconnect to upload", **exit 1 before any attach** — which the pane reads as a failure and retries, never
+as a 4. So the cell's outcome ("today's behaviour") stands; the mechanism is the asset version, not the
+exit code. Two app versions alternating on one host therefore flip the cached binary's version back and
+forth under the running panes — pre-existing (both sides key on the same string, by design), not
+introduced here, and the reason the version must move in lockstep with the assets (§6).
+
+The version check at the top of `attach_cmd` (`$BIN --version` vs `ghostd {CARGO_PKG_VERSION}`) is what
+keeps the two sides in lockstep, and it is why **the version must not be bumped before the assets are
+rebuilt** — a bump with a stale asset would make every durable pane refuse to attach
+("ghostd missing/stale — reconnect to upload" forever).
+
+## 4. Tests
+
+`ghostd/tests/lifecycle.rs` (new file, 5 tests). Each test takes its own `GHOSTWAVE_STATE_DIR` under
+`std::env::temp_dir()` and holds a **process-wide `Mutex`** while it does — the env var is global and
+`set_var` is `unsafe` in edition 2024, so the safety comment goes on the lock. A `Drop` guard SIGKILLs
+the pids it recorded and removes its directory. Binaries come from `env!("CARGO_BIN_EXE_ghostd")`.
+
+| test | RED on `a91a1a8` | GREEN after |
+|---|---|---|
+| `a_new_session_does_not_replay_a_killed_ones_output` — new, attach-driver writes `echo MARKER`, kill, new, read `<state>/s.log` and one attaching client | log keeps the marker, client sees it (F1 measurement above) | log empty, client output has no marker |
+| `new_recovers_a_wedged_daemon_and_leaves_one_daemon` — new, `SIGSTOP` the daemon, `new` again | old pid alive, second daemon binding | `new` exit 0, old pid dead, pidfile line 1 is the new pid |
+| `a_session_that_ended_is_not_reported_as_missing` — attach a client, `ghostd kill` while attached | attach exits 1 | attach exits 4; `attach <no such name>` still exits 1 |
+| `a_kill_leaves_no_state_behind` — new, kill | `<name>.log` survives | no `.sock`/`.pid`/`.log`; a later `new` works with an empty log |
+| `a_busy_attach_is_not_reported_as_ended` — new; client A is a child `attach` whose stdin stays open (that is what makes the `client_tx` test at `main.rs:78` true), client B attaches | passes today (B exits 1) — a **pin, not a RED**: it exists so the exit-code refactor cannot quietly move busy onto 4 | B exits **1**, never 4; `<name>.pid` and `<name>.log` are byte-identical before and after, and A is still relaying (write a line to A's stdin, read it from its stdout) |
+
+`ghostd/src/lib.rs` unit tests (2): `pidfile_names_reads_the_two_line_file` (two lines, one line,
+garbage) and `state_files_are_removed_only_by_their_owner` (pidfile names 100; removal as 200 leaves both
+files, as 100 removes both).
+
+`src/remote.rs`: `StubRemote` (`remote.rs:1069-1105`) gains `attach_rc` and `new_rc` (its `attach`/`new`
+arms currently `exit 0` unconditionally), and one new test
+`a_pane_creates_the_session_only_when_attach_says_it_is_missing` asserts, for rc ∈ {1, 3} with `new`
+succeeding: `record.new` exists and the final status is the second attach's; for rc ∈ {0, 4}: no create,
+and the script's own status is 0 for 4. Its **busy-shape case** is the pin D1 asks for: `attach_rc = 1`
+with `new_rc = 1` (exactly what `new` does when its probe answers `Healthy` — `main.rs:351`) must leave the
+script's status **1**, so `remote.rs:601` auto-reconnects, and must not produce a status of 0. Two existing
+textual assertions change: `remote.rs:880-883` (`exec` is gone; the create is now conditional on rc) and the
+hostile-name test at `:1107-1126` (the stub's attach must exit 0 there, unchanged, and `injected` must
+still not exist).
+
+## 5. Verification (stage 3 runs these and pastes the real output)
+
+```bash
+export CARGO_TARGET_DIR=/var/build/ghostwave-t_6abf6154      # per card, never shared
+# 1. baseline, measured on a91a1a8 BEFORE the diff, and pasted with the after-run:
+grep -rh '^\s*#\[test\]' src/ | wc -l        # 266
+grep -rh '^\s*#\[test\]' tests/ | wc -l      # 7   → 273 test functions
+grep -rh '^\s*#\[test\]' ghostd/ | wc -l     # 0
+# 2. app suite — expect base + 1 passed / 0 failed / 0 ignored (273 + the one new test);
+#    the base number itself is taken from the run on a91a1a8 and pasted beside it
+bash ~/.hermes/scripts/build_gate.sh nix-shell --run 'cargo test 2>&1 | tail -20'
+# 3. daemon suite — expect 7 passed / 0 failed (5 lifecycle + 2 lib), 0 before
+bash ~/.hermes/scripts/build_gate.sh nix-shell --run 'cd ghostd && cargo test 2>&1 | tail -20'
+# 4. no new warnings
+bash ~/.hermes/scripts/build_gate.sh nix-shell --run 'cargo clippy --all-targets 2>&1 | tail -20'
+#    and, for the daemon:  cd ghostd && cargo clippy --all-targets
+```
+
+End-to-end, against a **native** build (`cd ghostd && cargo build` → `ghostd/target/debug/ghostd`), with
+`GHOSTWAVE_STATE_DIR` in the scratch dir. Every assertion below is one of the measured blocks in §0,
+re-run against the fixed binary; paste the raw output of each:
+
+1. kill → `new` → an attaching client sees **nothing** of the dead session (F1).
+2. wedged (`SIGSTOP`) → `new` → old daemon dead, exactly one daemon, a client can attach (F2/F3).
+3. attached → `ghostd kill` → the attach process exits **4**, and the pane script (driven with a stub
+   HOME holding the built binary) exits **0** without creating a session (F4/F7).
+4. `exit` typed in the durable shell → no new daemon appears (F4b).
+5. `kill -9` the daemon → `new` binds a fresh daemon and a client attaches (F6).
+6. after 3–5: `ls $GHOSTWAVE_STATE_DIR` — no `.log`, no `.pid`, no `.sock` left behind.
+7. busy: `new`, an attach held open, a second `attach` → the second exits **1** (not 4), the first still
+   relays, and `<name>.pid`/`<name>.log` are unchanged; the C6 script run against that state exits **1**
+   (the `new` it falls into dies with "already exists") so the pane retries, and **no** daemon or session was
+   created.
+
+**Never run any of this without `GHOSTWAVE_STATE_DIR` set.** Two of the owner's live sessions are running
+on this host (`ghostwave-orac`, `ghostwave-death916orac` — visible in `ps`); a bare `ghostd kill-all`
+would destroy them.
+
+## 6. Delivery — what stage 3 does NOT deliver (and why that is a separate card)
+
+The daemon that runs on a host is the **embedded static asset** (`include_bytes!("../assets/ghostd-…")`,
+`remote.rs:46-49`), and the app only re-uploads when `$BIN --version` differs from its own
+(`remote.rs:191-194`, `:450-455`). So every fix in `ghostd/src` is **inert on every host** until:
+
+* both manifests go to `0.1.4` (`Cargo.toml:3`, `ghostd/Cargo.toml:3`), **in the same commit** as
+* `assets/ghostd-x86_64` and `assets/ghostd-aarch64` rebuilt by `scripts/build-ghostd.sh both`
+  (`scripts/build-ghostd.sh:1-30`), and the app rebuilt to embed them.
+
+That cannot be done on orac, and the closest-looking workaround is a trap worth naming (stage-2 D4). The
+script's NixOS path is a **hosted x86_64 1.86.0 toolchain**: `RUST_VERSION="1.86.0"`
+(`scripts/build-ghostd.sh:21`), `nixos_setup` fetches and patchelf's `rustc`/`cargo` for
+`x86_64-unknown-linux-gnu` (`:71-77`), and `nixos_build` copies `rust-std-1.86.0-<target>` into **that
+toolchain's own sysroot** — `SYSROOT="$tc/rustc-1.86.0-x86_64-unknown-linux-gnu/rustc"` (`:61`), the copy at
+`:98-101` — then links with `$SYSROOT/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld` (`:110`). None of
+it can execute on `uname -m` = `aarch64`. The nix `rustc` here is **1.95.0**, measured in this repo:
+`nix-shell --run 'rustc --version'` → `rustc 1.95.0 (59807616e 2026-04-14)`, sysroot
+`/nix/store/8865lxjk610n0n0sjsgf11599gq37i3g-rustc-1.95.0`, whose `lib/rustlib` holds only
+`aarch64-unknown-linux-gnu` and the wasm targets — **no** musl std. A `rust-std` is loadable only by the
+`rustc` of the *same version*, so 1.86.0's tarballs are valid only inside the 1.86.0 toolchain the script
+fetches itself; dropping them into the 1.95.0 nix sysroot cannot link. So stage 3 does **not** bump any
+version and does **not** touch `assets/`: a bump with a stale asset bricks every durable pane (§3).
+
+Stage 3 creates the follow-up card, `NEEDS-VULCAN:` rebuild the assets at 0.1.4 — one command on any
+x86_64 host with rustup. It also records two **unverified** alternatives (do not trust them until measured;
+each pairs a std with the rustc that loads it): for the **aarch64** asset on orac,
+`nix-shell -p pkgsMusl.rustc pkgsMusl.cargo --run 'cd ghostd && cargo build --release'`; for the **x86_64**
+asset, a `rust-std` matching the rustc it will load (as measured here that means
+`rust-std-1.95.0-x86_64-unknown-linux-musl` with a 1.95.0 x86_64 rustc — never the script's 1.86.0 std into a
+1.95.0 sysroot) plus `pkgsCross.musl64.stdenv.cc` as the linker.
+
+**Stage 3's summary must say this plainly**: source fixed and verified; no host behaves differently until
+that card lands.
+
+## 7. Risks / traps
+
+1. **Destroying the owner's live sessions.** `GHOSTWAVE_STATE_DIR` or nothing; `kill-all` only ever
+   inside a scratch state dir. (§5.)
+2. **Old daemon, new app** = today's behaviour, on purpose (§3). Do not "fix" that by message-grepping
+   `attach`'s stderr: it couples the script to an English string.
+3. **`bind` before `daemonize`** moves where the socket is created. It works because `daemonize` forks
+   only (no exec, so `CLOEXEC` never fires) — but the first lifecycle test must prove a client can attach
+   through it, not assume it.
+4. **Truncating the log on `new`** is a real behaviour change: history is now only replayable while its
+   daemon lives. That is the point of the card, but say it in PROGRESS.md — an `attach` to a *live*
+   session still replays everything.
+5. **The ssh hop is not verifiable here — for want of a key, not of a daemon** (stage-2 D2, re-measured by
+   this seat). The assumption: `ssh -t … sh -c` returns the remote command's status as the pane's exit code,
+   and `last_exit_code != 0` drives the reconnect pass (`remote.rs:600-601`). Measured on orac: sshd **does**
+   listen — `ss -tln` → `LISTEN 0.0.0.0:22` and `[::]:22`; `ps` → `sshd: …openssh-10.5p1… [listener]`
+   (root); `journalctl --follow -n 0 _SYSTEMD_UNIT=sshd.service` running. The blocker is authentication:
+   `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new localhost true` →
+   `death916@localhost: Permission denied (publickey).`, rc 255 — publickey only — and
+   `~/.ssh/authorized_keys` does not exist (`~/.ssh` holds only `hermes_ed25519`, `hermes_ed25519.pub`,
+   `known_hosts`, `agent/`). **Stage 3 runs that probe first.** If it still fails, stage 3 states the
+   assumption and marks the end-to-end claim `NEEDS-OWNER-VERIFY` with exactly this reason ("no authorized
+   key for localhost; sshd listens on :22, publickey-only"), plus the one-line owner action that would make
+   it verifiable here: append `~/.ssh/hermes_ed25519.pub` to `~/.ssh/authorized_keys`. The sentence "no sshd
+   listens on orac" is false and must not reach C7's journal or `PROGRESS.md`.
+6. **Parallel tests and the env var**: one `GHOSTWAVE_STATE_DIR` per test, a process-wide mutex around
+   it, `unsafe { env::set_var }` with a safety comment (edition 2024).
+7. **Two-line pidfile readers**: `read_pidfile` is the only reader; do not leave `cmd_kill`'s inline parse
+   (`main.rs:535-540`) duplicated after the refactor.
+8. **`busy` is exit 1 on purpose** (D1; the reasoning is in C5). Giving it 4 would hand a *live* session the
+   fate of an ended one — script exit 0 → `Manual`, zero retries — where today the pane probe-guards its way
+   into the existing retry loop (bounded by `reconnect_attempts` = 5). If "attached elsewhere" should ever be
+   visible, it needs a distinct code **and** a script branch that retries without creating: its own card, not
+   a quiet change here. Wire codes are asset-locked (§6), so this decision cannot be revisited cheaply after
+   the 0.1.4 rebuild. Held by the `a_busy_attach_is_not_reported_as_ended` lifecycle test and the busy-shape
+   case of the app test (§4).
+
+## 8. NOT doing (explicit)
+
+* **No version bump, no asset rebuild** on this card (§6) — the follow-up card owns them.
+* **F5** (a probe counts as an attach): needs a new protocol verb plus a version handshake to be
+  version-safe; a safeguard erosion, not one of the reported symptoms. Own card.
+* **The kill toast / exit status**: making "Killed remote session" truthful needs the ssh child's outcome
+  carried into the tick loop (`spawn_kill` is fire-and-forget, `kill_cmd` ends with `true`,
+  `remote.rs:236-241`). Own card.
+* **Naming sessions** (so two durable sessions can exist on one host). The name is derived from the host
+  on purpose (`term::remote_session`); this card makes *the* session on a host recoverable, it does not
+  add a second one.
+* **`pkill` sweeping a daemon that has no pidfile at all** from the CLI. After C3 a live daemon always
+  owns its pidfile, so this is only reachable for daemons started by the *old* binary; the app's kill path
+  already sweeps them (`kill_pattern`).
+* **A distinct "attached elsewhere" exit code for `busy`** (§2 C5, §7.8): busy keeps exit 1 and the pane's
+  existing retry, and no message is added for it. Making the overlap visible, or retrying explicitly on a
+  distinct code, is its own card.
+* No touch to the pty/term/search subsystems, no keymap or palette changes, no UI.
+
+## 9. Ordered work items for stage 3
+
+1. `ghostd/src/lib.rs`: `read_pidfile` / `pidfile_names` / `remove_state_if_owned` / `write_pidfile`, the
+   three exit-code constants, and the rewritten `recover_session` (C2, C3, C5) + the two unit tests.
+2. `ghostd/src/main.rs`: `cmd_new` (probe → recover-or-die → truncate log → `bind_listener` → daemonize),
+   accept-loop cleanup and pidfile write through the new helpers, `cmd_attach`'s exit codes (1/3/4 — the
+   relay distinguishes them by whether `OK\n` was seen, and busy stays **1** with no new message), `cmd_kill`
+   (verify death, owned removal, log removal, no-pidfile rule) (C1–C5).
+3. `ghostd/tests/lifecycle.rs` — the five tests (C2–C5 plus the busy pin); run `cd ghostd && cargo test`
+   through the gate.
+4. `src/remote.rs`: the new `attach_cmd` script + doc comment, `StubRemote`'s `attach_rc`/`new_rc`, the new
+   test (including its busy-shape case), and the two existing assertions (C6).
+5. `cargo test` + `cargo clippy --all-targets` for both crates through the build gate; paste the counts.
+6. The seven end-to-end checks of §5 against `ghostd/target/debug/ghostd`; paste the raw output.
+7. `PROGRESS.md` entry (C7), then commit, push the branch with `fleet_push.sh`, open the PR, create the
+   `NEEDS-VULCAN:` asset follow-up card, and hand stage 4 to `review`.
+
+## 10. What stage 2 has to judge
+
+1. **Is the root cause right?** F1/F2/F3/F4/F6 are reproduced in §0 with the code anchor beside each one.
+   The load-bearing claim is F3: *any* daemon deletes *any* daemon's state files, which is what leaves a
+   live daemon with no `.pid`/`.sock` (measured). Challenge it if C3 does not actually close it.
+2. **Is C4 safe?** binding before `daemonize` is the one structural change; the plan gives its reason
+   (F6's silent bind failure) and its only evidence requirement (a lifecycle test that attaches).
+3. **Is C5/C6's contract right** — 1 keeps its old meaning so an old daemon is not broken *and* stays the
+   code for `busy`, 4 maps to exit 0 in the script because `remote.rs:601` treats a clean exit as "do not
+   reconnect", and no `app.rs` change is needed? Is any path left where a killed session still gets
+   re-created, and is any path left where a *live* session stops retrying?
+4. **Is the scope split honest** — source now, assets by a `NEEDS-VULCAN:` card, and a summary that says
+   no host changes behaviour until then?
+5. **Are the numbers right** — 273 → 274 in the app, 0 → 7 in `ghostd` (5 lifecycle + 2 lib), and are the
+   RED expectations for all seven new tests actually red on `a91a1a8` (the busy pin is the one exception: it
+   guards a status that must *stay* 1, so it passes on `a91a1a8` too and is labelled as a pin)?

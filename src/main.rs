@@ -31,7 +31,6 @@ mod pty_bridge;
 mod remote;
 pub mod scratchpad;
 pub mod search_overlay;
-pub mod selection;
 mod ui_session;
 pub mod sessions_overlay;
 mod tick;
@@ -67,6 +66,10 @@ pub enum Message {
     Tick,
     /// Writes the session file; published by the background autosave thread.
     Autosave,
+    /// Offers every idle terminal one bounded scrollback-compression step;
+    /// published by its own ticker, which runs even when the animation tick is
+    /// `Off`.
+    CompressTick,
     /// The window manager asked the window to close.
     CloseRequested(iced::window::Id),
     /// Focuses the tab whose chip was clicked in the tab bar.
@@ -270,6 +273,7 @@ impl App {
                 self.state.tick()
             }
             Message::Autosave => ui_session::save(&self.state),
+            Message::CompressTick => self.state.compress_idle_step(),
             Message::CloseRequested(_) => self.state.quit = true,
             Message::FocusTab(index) => {
                 if index < self.state.tabs.len() {
@@ -663,6 +667,15 @@ impl App {
                 tick::TickSlot { rate },
                 tick::stream,
             )),
+        }
+        // Compression has its own low-rate ticker: the animation tick above is
+        // not subscribed at all when the rate is `Off`, and an idle terminal is
+        // exactly what needs its scrollback compressed.
+        if self.state.has_term_panes() {
+            subs.push(Subscription::run_with(
+                app::compression::CompressTick,
+                app::compression::stream,
+            ));
         }
         for tab in &self.state.tabs {
             for handle in tab.term_handles() {

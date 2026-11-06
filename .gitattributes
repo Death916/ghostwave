@@ -1,0 +1,13 @@
+# Append-only fleet docs: every relay job appends its own section at EOF, so two cards
+# dispatched on this repo from the same base collide there even when their sections have
+# nothing to do with each other (ghostwave PR #20: PLAN.md, 2026-10-21). The union driver
+# keeps BOTH sides and writes no conflict markers, which is exactly how these conflicts have
+# been resolved by hand — so it can never block a push, a PR, or a merge again.
+#
+# The fleet also fences this at the boundary: ~/.hermes/scripts/fleet_rebase.sh merges
+# origin/<default> into the card branch before push, and a pre-push hook refuses a branch
+# that does not already contain origin/<default>. This file makes the doc half of that
+# automatic. Real conflicts in source files are still real conflicts: resolve those, do not
+# widen this rule to them.
+PLAN.md     merge=union
+PROGRESS.md merge=union
