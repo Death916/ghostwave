@@ -2142,6 +2142,57 @@ mod tests {
         ghostwave::session::delete(&owner);
     }
 
+    /// A renamed session keeps its durable binding in the new file, while the
+    /// name `ds <host>` targets no longer exists on disk. The own-session
+    /// placement must read that file and refuse instead of starting a fresh
+    /// session and opening a second attach on a daemon that serves one client.
+    #[test]
+    fn a_renamed_binding_still_refuses_a_fresh_own_session_attach() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, ssh) = recorded_workspace();
+        let pid = std::process::id();
+        let host = format!("renamed-host-{pid}");
+        let literal = remote::ssh_session(&host);
+        let moved = format!("{literal}-moved-{pid}");
+
+        ghostwave::session::save(&literal, &bound_session(&host, &literal));
+        ghostwave::session::rename(&literal, &moved);
+        assert!(
+            ghostwave::session::load(&literal).is_none(),
+            "the literal name is free again: a fresh session would be started"
+        );
+        assert_eq!(
+            ghostwave::session::session_of_host(&host).as_deref(),
+            Some(moved.as_str()),
+            "the renamed file is the only record of the binding"
+        );
+
+        state.current_session = literal.clone();
+        let tabs_before = state.tabs.len();
+
+        state.connect_durable_ssh(&host, DurablePlacement::OwnSession);
+        assert_eq!(
+            state.toast.as_ref().map(|(message, _)| message.clone()),
+            Some(format!("bound in session {moved}")),
+            "the binding follows the rename, so the attach is refused"
+        );
+        assert_eq!(
+            state.current_session, literal,
+            "no fresh session is started in place of the renamed one"
+        );
+        assert_eq!(state.tabs.len(), tabs_before, "and no attach pane is opened");
+        assert!(
+            ssh.calls().is_empty(),
+            "no upload or ssh child for a refused own-session attach"
+        );
+        assert!(
+            ghostwave::session::load(&literal).is_none(),
+            "the refusal leaves no session file behind under the old name"
+        );
+
+        ghostwave::session::delete(&moved);
+    }
+
     #[test]
     fn killing_the_remotes_of_a_session_without_any_says_so() {
         let _guard = crate::ui_session::test_lock();
