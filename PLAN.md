@@ -1208,6 +1208,11 @@ forward before this section was pushed and **every line cite below is re-verifie
 `5fba514`** (`origin/master` at the time of writing). The design below is fixed by the manager's job card; this section does not redesign it, it fills in
 the exact edits, the exact assertions and the split.
 
+*Round-1 plan review (`t_a4504ec6`, changes-required) applied here: §2's targeted command now uses
+`cargo test --lib -- config:: durable` (D1); §1(e) names the four `input.rs` test sites and §2/§5/§7
+count **seven** palette title assertions plus the `input.rs:2472` assertion edit (D2); §6 states how a
+saved-but-dead binding is treated (D3). Nothing else in the design moved.*
+
 ### 1. What changes
 
 **(a) `src/config.rs` — the type, the parser, the field.**
@@ -1281,7 +1286,7 @@ the value to build the item text, so resolving once means the text and the behav
 **(c) `src/app.rs` — `connect_durable_ssh(host, placement)`, one shared attach tail.**
 
 `pub fn connect_durable_ssh(&mut self, host: &str, placement: DurablePlacement)`
-(today `src/app.rs:1156-1196`). The host-validity guard and the whole "already bound here? focus /
+(today `src/app.rs:1156-1190`). The host-validity guard and the whole "already bound here? focus /
 reconnect / else create the pane" tail move verbatim into a private helper, so `OwnSession` cannot
 drift from today:
 
@@ -1315,19 +1320,19 @@ window change. The unit of "pane" here is one tab holding the attach pane, which
 pane is opened in this front-end (`push_remote_tab`); this is deliberate, not a limitation to fix
 here.
 
-`remote_pane_of_host` (`src/app.rs:1385-1400`) stays session-local in this sitting — the cross-session
+`remote_pane_of_host` (`src/app.rs:1385-1397`) stays session-local in this sitting — the cross-session
 rule is sitting 2 (§6).
 
 **(d) `src/palette.rs` — the placement is a palette field, three prefixes, honest titles.**
 
 - `PaletteState` (`src/palette.rs:81-93`) gains `pub default_placement: DurablePlacement`.
 - `with_durables(items, durables)` → `with_durables(items, durables, placement)`; `new(items)` keeps
-  its signature and passes `DurablePlacement::OwnSession`; `Default` follows `new`. Four construction
+  its signature and passes `DurablePlacement::OwnSession`; `Default` follows `new`. Five construction
   sites update: `PaletteState::new`'s own call (`src/palette.rs:103`), `input.rs:515`, and the three
   palette tests at `src/palette.rs:966/979/998`.
-- `durable_item(host, session)` (`src/palette.rs:70-79`) → `durable_item(host, session, placement)` and
+- `durable_item(host, session)` (`src/palette.rs:70-77`) → `durable_item(host, session, placement)` and
   titles `Durable session: {host} — {session} ({placement.palette_label()})`.
-- `filtered_items` (`src/palette.rs:131` onwards): `ds <host>` uses `self.default_placement`; new
+- `filtered_items` (`src/palette.rs:125` onwards): `ds <host>` uses `self.default_placement`; new
   `dsp <host>` forces `Pane`; new `dss <host>` forces `OwnSession`. Both new prefixes are matched
   before the generic fallback and cannot collide with `"ds "` (the strings differ at index 2). Titles:
   `Durable SSH (ghostd, {label}): {host}` — so `ds orac` reads `Durable SSH (ghostd, new pane): orac`
@@ -1344,9 +1349,15 @@ rule is sitting 2 (§6).
 
 `src/input.rs:541` → `Action::ConnectDurableSsh(host, placement) => state.connect_durable_ssh(&host, placement)`.
 `src/input.rs:515` (palette open) passes `state.config.remote.durable_ssh_placement` as the third
-`with_durables` argument. No other change: `durable_targets` (`src/input.rs:340-351`) needs **nothing**
-— a durable pane opened in the current session is already in `live_remote_specs(&state.tabs)`, and
-the saved sessions are already swept by `all_remote_specs()`.
+`with_durables` argument.
+
+The four test sites in the same file must also move to the two-argument variant: `src/input.rs:2384`,
+`:2450` and `:2464` construct `Action::ConnectDurableSsh(…)` directly, and `:2472` is an existing
+assertion (`item.action == Action::ConnectDurableSsh(TEST_HOST.to_string())`) that gains
+`OwnSession`. That is R5's "input.rs 5 (1 dispatch, 4 tests)" and §5 step 6's work; the only other
+consumer is `durable_targets` (`src/input.rs:340-351`), which needs **nothing** — a durable pane
+opened in the current session is already in `live_remote_specs(&state.tabs)`, and the saved sessions
+are already swept by `all_remote_specs()`.
 
 **(f) `README.md` — the config key, and a dangling reference the base already left behind.**
 
@@ -1378,9 +1389,12 @@ export CARGO_TARGET_DIR=/var/build/ghostwave-t_51e62697
 nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo test"
 ```
 
-- **rc 0**, and the log ends with `test result: ok.` for every target (`lib` + the bin's `#[cfg(test)]`
-  modules). No pre-existing test may go red — the only edits to existing assertions are the six
-  palette titles in §1(d), which change by construction.
+- **rc 0**, and the log ends with `test result: ok.` for every target: `lib`, the bin's `#[cfg(test)]`
+  modules, and the two integration targets `tests/term_core.rs` and `tests/flood_throughput.rs`
+  (`cargo test` runs all of them; rc 0 means all of them green). No pre-existing test may go red —
+  the only edits to existing assertions are the seven palette title assertions in §1(d)
+  (`src/palette.rs:949, 970, 973, 983, 984, 991, 1005`) plus the one `Action` assertion at
+  `src/input.rs:2472`, plus the three `Action` constructor calls at `src/input.rs:2384/2450/2464`.
 - **rc 3** = another heavy build holds the lock: do not compile anyway; block the card `--kind transient`
   with that reason. **rc 4** = low RAM: retry later.
 - A cold `CARGO_TARGET_DIR` means libghostty-vt rebuilds via zig; it is minutes, not seconds. Reusing
@@ -1389,8 +1403,12 @@ nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo test"
 Targeted first pass, to iterate without the full suite:
 
 ```sh
-nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo test --lib config:: durable"
+nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo test --lib -- config:: durable"
 ```
+
+The `--` is required: `cargo test` takes exactly one positional TESTNAME filter, and a second bare
+argument is a clap error (`error: unexpected argument 'durable' found`, rc 1). Everything after `--`
+is a libtest filter, so the two patterns are OR-ed.
 
 Expect the new config tests and the existing durable ones green, then the full run above.
 
@@ -1403,8 +1421,8 @@ New/updated tests (all assertable without a display):
 | `src/config.rs` | `an_unknown_durable_ssh_placement_falls_back` | `"sideways"` parses **Ok** and yields `OwnSession` (never a failed start) |
 | `src/palette.rs` | `dsp_forces_a_new_pane_and_dss_forces_its_own_session` | both prefixes, title text and the placement in the action |
 | `src/palette.rs` | `the_configured_default_is_what_ds_does_and_says` | `PaletteState` built with `Pane` → `ds orac` title says `new pane` **and** the action carries `Pane` |
-| `src/palette.rs` | the six existing durable title assertions | updated to the `(… )` suffix |
-| `src/input.rs` | `the_durable_ssh_action_opens_its_own_session_and_binds_the_pane` | **unchanged assertions**, action now `(host, OwnSession)` — the byte-for-byte proof |
+| `src/palette.rs` | the seven existing durable title assertions (`:949, :970, :973, :983, :984, :991, :1005`) | updated to the `(… )` suffix; `:984` also gains the placement label in `New durable SSH (ghostd, own session): ora` |
+| `src/input.rs` | `the_durable_ssh_action_opens_its_own_session_and_binds_the_pane` | **unchanged assertions**, action now `(host, OwnSession)` — the byte-for-byte proof; the three constructor calls (`:2384/2450/2464`) become two-arg and `:2472`'s assertion carries `OwnSession` |
 | `src/input.rs` | `the_pane_placement_stays_in_the_current_session` | `current_session` before == after; current tab named `ds <host>`; `remote_spec_of` bound to `ghostwave-<host>`; toast `durable ssh: <host>`; pane program is the ssh stand-in |
 
 The pane test must **not** read `Config::load()`: the input tests' `state()` (`src/input.rs:786-790`)
@@ -1469,13 +1487,16 @@ switch; writing anything into the owner's config.toml; `ghostd/`.
 3. `src/keymap.rs`: the two-field variant.
 4. `src/app.rs`: split `connect_durable_ssh` into the router + `attach_durable_pane`.
 5. `src/palette.rs`: field, constructor, `ds`/`dsp`/`dss`/`durable` branches, `durable_item`, hint,
-   and the six title updates + two new tests.
-6. `src/input.rs`: dispatch, `with_durables` argument, move the durable test to the two-arg action,
-   add the pane-placement test.
+   and the seven title updates (`:949/970/973/983/984/991/1005`) + two new tests.
+6. `src/input.rs`: dispatch, `with_durables` argument, the three `Action` constructor sites
+   (`:2384/2450/2464`) and the `:2472` assertion moved to the two-arg action, add the
+   pane-placement test.
 7. `README.md`: the `[remote]` block and the stale bullet.
 8. Run §2's gate; paste the real tail. Then hand stage 4 to `review` — do **not** merge, do **not**
    push `master`.
-9. Create the sitting-2 card (§6) before completing, and list its id in `created_cards`.
+9. Create the sitting-2 card (§6) before completing, and list its id in `created_cards` — its body
+   must carry the §6 dead-pane sentence (toast `bound in session <name>`, refusal decided on
+   saved-session evidence, test pins the wording) verbatim, since sitting 2 is where it is implemented.
 
 ### 6. The bite-size split, and what this relay's CODE owns
 
@@ -1490,10 +1511,18 @@ Two sittings. **This relay's CODE stage (`t_51e62697`) owns sitting 1 only:**
 > binding across sessions, plus the mixed-session purity test.** Adds
 > `ghostwave::session::session_of_host(host) -> Option<String>` in `src/session.rs` (built on the
 > existing `list_sessions()` + `remote_specs()` — never a hand-rolled scan of the data directory),
-> makes the `Pane` arm refuse with `already attached to <host> in session ssh-<host>` when the binding
+> makes the `Pane` arm refuse with `bound in session <name>` when the binding
 > lives in another session (current-session focus keeps priority), and adds
 > `a_mixed_session_is_not_pure_remote` to `src/session.rs` proving a durable + local session is not
 > deletable by `k`. Files: session.rs, app.rs. One test run.
+
+**Dead-pane case (D3):** `session_of_host` rests on `session::remote_specs` (`src/session.rs:193-206`),
+which reads the *saved* session file via `load(name)`, so the refusal is decided on saved-session
+evidence — a parked or closed session still counts as bound, because there is no cross-window live
+pane registry (`live_remote_specs(&state.tabs)` sees only the current window; cf. the disk-vs-live
+split in `kill_session_remotes`, `src/app.rs:1268-1278`) — which is why the toast says
+`bound in session <name>` rather than "already attached", and sitting 2's test pins both the refusal
+and that wording against a session that is saved but not open.
 
 Why the split is honest: sitting 1 is a self-contained, owner-visible behaviour (`dsp` works, `ds` is
 unchanged) with its own test, and it already needs six files and ~200 lines of touched assertions.
@@ -1507,7 +1536,7 @@ bullet rides with sitting 1 (same file, same edit).
 ### 7. What stage 2 should judge this plan on
 
 1. Is the `OwnSession` arm in §1(c) really byte-for-byte today's code path — the switch/create first,
-   the focus check only afterwards, as `src/app.rs:1156-1196` does it today?
+   the focus check only afterwards, as `src/app.rs:1156-1190` does it today?
 2. Is a hand-written `Deserialize` on the enum plus the struct-level `#[serde(default)]` — with **no**
    attribute on the new field — sufficient for "missing key behaves as today **and** unknown value never
    fails `Config::load()`", given `RemoteConfig`'s `#[serde(default)]` at `src/config.rs:46`?
@@ -1515,7 +1544,7 @@ bullet rides with sitting 1 (same file, same edit).
    text/behaviour drift of R2, or is there a second reader left?
 4. Is splitting the cross-session refusal into sitting 2 defensible under the bite-size rule, with R4
    stated as the cost — or is it so entangled with the `Pane` arm that it must be in this diff?
-5. Are the file/line estimates and the six palette-title updates complete, i.e. is there a test or
+5. Are the file/line estimates and the seven palette-title updates complete, i.e. is there a test or
    call site in §1 that the plan does not name?
 ---
 
