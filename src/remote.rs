@@ -841,6 +841,19 @@ mod tests {
     }
 
     #[test]
+    fn an_option_shaped_destination_is_not_a_host() {
+        // ssh reads an argv element that starts with a dash as an option, so a
+        // palette entry like `dsp -F/etc/hosts` must be refused here rather than
+        // handed on as a flag.
+        for host in ["-F/etc/hosts", "-oProxyCommand=id", "-host", "-"] {
+            assert!(
+                !host_is_valid(host),
+                "{host:?} would reach ssh as an option, not a destination"
+            );
+        }
+    }
+
+    #[test]
     fn a_binding_that_did_not_come_from_a_host_is_refused() {
         assert!(binding_is_valid("prod", &remote_session("prod")));
         assert!(binding_is_valid("user@host:2222", &remote_session("user@host:2222")));

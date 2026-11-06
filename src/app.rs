@@ -1162,6 +1162,16 @@ impl AppState {
             self.toast(format!("not an ssh destination: {host}"));
             return;
         }
+        // One client per binding, whatever the placement: a binding a saved
+        // session owns refuses here, before any session is created or switched
+        // and before an ssh child is spawned. A live pane for the host in this
+        // session is not a second attach, so it is left to be focused instead.
+        if self.remote_pane_of_host(host).is_none() {
+            if let Some(name) = self.durable_bound_elsewhere(host) {
+                self.toast(format!("bound in session {name}"));
+                return;
+            }
+        }
         match placement {
             DurablePlacement::OwnSession => {
                 let target = remote::ssh_session(host);
@@ -1172,15 +1182,7 @@ impl AppState {
                 };
                 self.attach_durable_pane(host, fresh);
             }
-            DurablePlacement::Pane => {
-                if self.remote_pane_of_host(host).is_none() {
-                    if let Some(name) = self.durable_bound_elsewhere(host) {
-                        self.toast(format!("bound in session {name}"));
-                        return;
-                    }
-                }
-                self.attach_durable_pane(host, false)
-            }
+            DurablePlacement::Pane => self.attach_durable_pane(host, false),
         }
     }
 
@@ -2081,6 +2083,63 @@ mod tests {
             Some(format!("durable ssh: {host}"))
         );
         assert_eq!(state.tabs.len(), tabs_before + 1, "the attach pane opens in this session");
+    }
+
+    #[test]
+    fn an_option_shaped_host_never_reaches_ssh() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, ssh) = recorded_workspace();
+        let tabs_before = state.tabs.len();
+        for host in ["-F/etc/hosts", "-oProxyCommand=id"] {
+            state.connect_durable_ssh(host, DurablePlacement::Pane);
+            assert_eq!(
+                state.toast.as_ref().map(|(message, _)| message.clone()),
+                Some(format!("not an ssh destination: {host}")),
+                "an option-shaped destination is refused before ssh argv"
+            );
+        }
+        assert_eq!(state.tabs.len(), tabs_before, "no attach pane is opened");
+        assert!(ssh.calls().is_empty(), "no ssh child is started");
+    }
+
+    #[test]
+    fn an_own_session_placement_refuses_a_binding_saved_elsewhere() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, ssh) = recorded_workspace();
+        let pid = std::process::id();
+        let host = format!("own-host-{pid}");
+        let owner = format!("own-owner-{pid}");
+        state.current_session = format!("here-{pid}");
+        let tabs_before = state.tabs.len();
+        let session_before = state.current_session.clone();
+
+        // The owning session is saved and not open, so the refusal rests on
+        // session-file evidence; the own-session placement must obey it too.
+        ghostwave::session::save(&owner, &bound_session(&host, &owner));
+
+        state.connect_durable_ssh(&host, DurablePlacement::OwnSession);
+        assert_eq!(
+            state.toast.as_ref().map(|(message, _)| message.clone()),
+            Some(format!("bound in session {owner}")),
+            "the own-session placement is refused like any other"
+        );
+        assert_eq!(
+            state.current_session, session_before,
+            "a refused attach does not switch or create a session"
+        );
+        assert_eq!(state.tabs.len(), tabs_before, "and opens no attach pane");
+        assert!(
+            ssh.calls().is_empty(),
+            "no upload or ssh child for a refused own-session attach"
+        );
+
+        // A live binding in THIS session is focused rather than attached again.
+        state.replace_tabs(vec![remote_tab(&host, "/bin/sh", &["-c", "true"])]);
+        state.connect_durable_ssh(&host, DurablePlacement::OwnSession);
+        assert_eq!(state.tabs.len(), 1, "the live pane is focused, not doubled");
+        assert_eq!(state.remote_pane_of_host(&host), Some((0, 0)));
+
+        ghostwave::session::delete(&owner);
     }
 
     #[test]

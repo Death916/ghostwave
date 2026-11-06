@@ -76,8 +76,14 @@ pub const HOST_MAX_LEN: usize = 255;
 /// control characters, quotes and shell metacharacters are all refused at this
 /// boundary; the port (`%` for a zone id) is the only punctuation beyond the URI
 /// set.
+///
+/// A destination beginning with `-` is refused even though `-` is a legal host
+/// character: ssh reads an argv element that starts with a dash as an option, so
+/// `-F/etc/hosts` or `-oProxyCommand=...` would be interpreted as flags rather
+/// than as a host to connect to.
 pub fn host_is_valid(host: &str) -> bool {
     !host.is_empty()
+        && !host.starts_with('-')
         && host.len() <= HOST_MAX_LEN
         && host.chars().all(|c| {
             c.is_ascii_alphanumeric()
