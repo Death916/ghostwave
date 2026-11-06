@@ -1679,6 +1679,7 @@ mod tests {
                 auto_reconnect: true,
                 reconnect_attempts: 5,
                 reconnect_delay_secs: 3,
+                ..RemoteConfig::default()
             },
             ..Config::load()
         }
