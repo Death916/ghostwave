@@ -538,7 +538,7 @@ pub(crate) fn execute(state: &mut AppState, action: Action) {
             state.quit = true;
         }
         Action::ConnectSsh(host) => state.connect_ssh(&host),
-        Action::ConnectDurableSsh(host) => state.connect_durable_ssh(&host),
+        Action::ConnectDurableSsh(host, placement) => state.connect_durable_ssh(&host, placement),
         Action::KillRemoteSession => state.kill_active_remote_pane(),
 
         Action::Backspace => match state.mode {
@@ -774,7 +774,7 @@ mod tests {
     //! each test presses the keys a user would and asserts the resulting state.
 
     use super::*;
-    use ghostwave::config::Config;
+    use ghostwave::config::{Config, DurablePlacement};
     use ghostwave::keymap::Mode;
     use ghostwave::term::{ReconnectState, RemoteSpec};
     use iced::widget::pane_grid::{Axis, Node as GridNode};
@@ -2381,7 +2381,10 @@ mod tests {
         let mut s = state();
         let ssh = record_ssh(&mut s);
 
-        execute(&mut s, Action::ConnectDurableSsh(TEST_HOST.to_string()));
+        execute(
+            &mut s,
+            Action::ConnectDurableSsh(TEST_HOST.to_string(), DurablePlacement::OwnSession),
+        );
 
         assert_eq!(s.current_session, format!("ssh-{TEST_HOST}"));
         assert_eq!(s.current().name, format!("ds {TEST_HOST}"));
@@ -2393,6 +2396,45 @@ mod tests {
                 crate::remote::remote_session(TEST_HOST)
             )),
             "the pane is bound to the host's ghostd session"
+        );
+        assert_eq!(toast(&s), format!("durable ssh: {TEST_HOST}"));
+        assert_eq!(
+            pane_program(&s, tab, pane).as_deref(),
+            Some("/bin/sh"),
+            "the pane runs the ssh seam's stand-in, so no test dials a host"
+        );
+        let calls = ssh.wait_calls(1, std::time::Duration::from_secs(5));
+        assert_eq!(calls.len(), 1, "the upload checks the architecture once: {calls:?}");
+        assert_eq!(calls[0].1, "uname -m");
+    }
+
+    #[test]
+    fn the_pane_placement_stays_in_the_current_session() {
+        let _guard = crate::ui_session::test_lock();
+        let mut s = state();
+        let ssh = record_ssh(&mut s);
+        let session_before = s.current_session.clone();
+        let tabs_before = s.tabs.len();
+
+        execute(
+            &mut s,
+            Action::ConnectDurableSsh(TEST_HOST.to_string(), DurablePlacement::Pane),
+        );
+
+        assert_eq!(
+            s.current_session, session_before,
+            "the pane placement adds a tab to the workspace it was invoked from"
+        );
+        assert_eq!(s.tabs.len(), tabs_before + 1, "the attach tab is added beside the others");
+        assert_eq!(s.current().name, format!("ds {TEST_HOST}"));
+        let (tab, pane) = (s.active_tab, s.current().active);
+        assert_eq!(
+            s.remote_spec_of(tab, pane),
+            Some((
+                TEST_HOST.to_string(),
+                crate::remote::remote_session(TEST_HOST)
+            )),
+            "the pane is still bound to the host's ghostd session"
         );
         assert_eq!(toast(&s), format!("durable ssh: {TEST_HOST}"));
         assert_eq!(
@@ -2447,7 +2489,13 @@ mod tests {
         let before = live_panes(&s);
         let session_before = s.current_session.clone();
 
-        execute(&mut s, Action::ConnectDurableSsh("prod'; rm -rf ~; '".to_string()));
+        execute(
+            &mut s,
+            Action::ConnectDurableSsh(
+                "prod'; rm -rf ~; '".to_string(),
+                DurablePlacement::OwnSession,
+            ),
+        );
 
         assert_eq!(toast(&s), "not an ssh destination: prod'; rm -rf ~; '");
         assert_eq!(live_panes(&s), before, "no pane was opened for it");
@@ -2461,7 +2509,10 @@ mod tests {
         let mut s = state();
         let _ssh = record_ssh(&mut s);
 
-        execute(&mut s, Action::ConnectDurableSsh(TEST_HOST.to_string()));
+        execute(
+            &mut s,
+            Action::ConnectDurableSsh(TEST_HOST.to_string(), DurablePlacement::OwnSession),
+        );
         execute(&mut s, Action::OpenCommandBar);
 
         let palette = s.palette.as_mut().expect("the palette is open");
@@ -2469,7 +2520,8 @@ mod tests {
         let out = palette.filtered_items();
         assert!(
             out.iter()
-                .any(|item| item.action == Action::ConnectDurableSsh(TEST_HOST.to_string())),
+                .any(|item| item.action
+                    == Action::ConnectDurableSsh(TEST_HOST.to_string(), DurablePlacement::OwnSession)),
             "the live durable pane is offered back, got {:?}",
             out.iter().map(|item| item.title.as_str()).collect::<Vec<_>>()
         );

@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ghostwave::config::Config;
+use ghostwave::config::{Config, DurablePlacement};
 use ghostwave::layout::{Dir, SplitDir};
 use ghostwave::term::{CellDims, ReconnectState, RemoteSpec};
 use ghostwave::theme::{self, Theme};
@@ -1148,22 +1148,40 @@ impl AppState {
     /// attach command, bound to `ghostwave-<host>` so it can be restored and
     /// killed independently of the local pane.
     ///
+    /// `placement` decides which session the pane lands in: [`DurablePlacement::OwnSession`]
+    /// switches to (or creates) `ssh-<host>` first, [`DurablePlacement::Pane`] adds the
+    /// attach tab beside the current tabs and never switches session.
+    ///
     /// The ghostd binary is uploaded in the background on first use; until the
     /// upload lands the pane's ssh reports the missing binary and exits, and the
     /// auto-reconnect loop retries. Re-running the command focuses the existing
     /// attach pane (one daemon serves one client at a time) instead of stacking a
     /// duplicate.
-    pub fn connect_durable_ssh(&mut self, host: &str) {
+    pub fn connect_durable_ssh(&mut self, host: &str, placement: DurablePlacement) {
         if !remote::host_is_valid(host) {
             self.toast(format!("not an ssh destination: {host}"));
             return;
         }
-        let target = remote::ssh_session(host);
-        let fresh = if self.current_session != target {
-            self.open_remote_session(&target)
-        } else {
-            false
-        };
+        match placement {
+            DurablePlacement::OwnSession => {
+                let target = remote::ssh_session(host);
+                let fresh = if self.current_session != target {
+                    self.open_remote_session(&target)
+                } else {
+                    false
+                };
+                self.attach_durable_pane(host, fresh);
+            }
+            DurablePlacement::Pane => self.attach_durable_pane(host, false),
+        }
+    }
+
+    /// Focuses the live attach pane for `host` in this session, or opens one.
+    ///
+    /// `fresh_session` is passed straight to [`Self::push_remote_tab`]: only the
+    /// own-session placement ever sets it, because the new tab replaces the
+    /// placeholder tab of the session that placement just created.
+    fn attach_durable_pane(&mut self, host: &str, fresh_session: bool) {
         if let Some((tab, pane)) = self.remote_pane_of_host(host) {
             self.active_tab = tab;
             self.tabs[tab].active = pane;
@@ -1182,7 +1200,7 @@ impl AppState {
         self.ensure_remote_binary(host);
         match self.remote_pane(&argv, Some(spec)) {
             Ok(pane) => {
-                self.push_remote_tab(pane, &format!("ds {host}"), fresh);
+                self.push_remote_tab(pane, &format!("ds {host}"), fresh_session);
                 self.toast(format!("durable ssh: {host}"));
             }
             Err(e) => self.toast(format!("ssh failed: {e}")),

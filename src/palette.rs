@@ -4,6 +4,7 @@
 //! keybinding shortcuts, dynamic prefix commands (`open <path>`, `ssh <host>`,
 //! `ds <host>`), and theme selection.
 
+use ghostwave::config::DurablePlacement;
 use ghostwave::keymap::Action;
 use ghostwave::theme::Theme as GhostTheme;
 use iced::alignment::{Horizontal, Vertical};
@@ -66,13 +67,13 @@ fn about_item() -> PaletteItem {
 }
 
 /// The palette item for a known durable session: connecting to it reuses the
-/// host's daemon session.
-fn durable_item(host: &str, session: &str) -> PaletteItem {
+/// host's daemon session, opening where `placement` says.
+fn durable_item(host: &str, session: &str, placement: DurablePlacement) -> PaletteItem {
     PaletteItem::new(
         format!("Durable session: {host} — {session}"),
         DURABLE_CATEGORY,
         None,
-        Action::ConnectDurableSsh(host.to_string()),
+        Action::ConnectDurableSsh(host.to_string(), placement),
     )
 }
 
@@ -148,7 +149,7 @@ impl PaletteState {
                     format!("Durable SSH (ghostd): {host}"),
                     DURABLE_CATEGORY,
                     None,
-                    Action::ConnectDurableSsh(host.to_string()),
+                    Action::ConnectDurableSsh(host.to_string(), DurablePlacement::OwnSession),
                 )];
             }
         }
@@ -165,7 +166,7 @@ impl PaletteState {
                     format!("New durable SSH (ghostd): {text}"),
                     DURABLE_CATEGORY,
                     None,
-                    Action::ConnectDurableSsh(text.to_string()),
+                    Action::ConnectDurableSsh(text.to_string(), DurablePlacement::OwnSession),
                 ));
             }
             return items;
@@ -182,7 +183,7 @@ impl PaletteState {
                 )];
                 for (target, session) in &self.durables {
                     if target == host {
-                        items.push(durable_item(target, session));
+                        items.push(durable_item(target, session, DurablePlacement::OwnSession));
                     }
                 }
                 return items;
@@ -224,7 +225,7 @@ impl PaletteState {
                     || host.to_lowercase().contains(&needle)
                     || session.to_lowercase().contains(&needle)
             })
-            .map(|(host, session)| durable_item(host, session))
+            .map(|(host, session)| durable_item(host, session, DurablePlacement::OwnSession))
             .collect()
     }
 
@@ -947,11 +948,11 @@ mod tests {
         let out = p.filtered_items();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].title, "Durable SSH (ghostd): durable-host");
-        assert!(matches!(&out[0].action, Action::ConnectDurableSsh(h) if h == "durable-host"));
+        assert!(matches!(&out[0].action, Action::ConnectDurableSsh(h, _) if h == "durable-host"));
 
         p.set_query("ds ");
         let bare = p.filtered_items();
-        assert!(bare.iter().all(|i| !matches!(i.action, Action::ConnectDurableSsh(_))));
+        assert!(bare.iter().all(|i| !matches!(i.action, Action::ConnectDurableSsh(_, _))));
     }
 
     fn durable_hosts() -> Vec<(String, String)> {
@@ -969,9 +970,9 @@ mod tests {
         assert_eq!(out.len(), 2, "one item per known durable session");
         assert_eq!(out[0].title, "Durable session: orac — ghostwave-orac");
         assert_eq!(out[0].category, DURABLE_CATEGORY);
-        assert!(matches!(&out[0].action, Action::ConnectDurableSsh(h) if h == "orac"));
+        assert!(matches!(&out[0].action, Action::ConnectDurableSsh(h, _) if h == "orac"));
         assert_eq!(out[1].title, "Durable session: prod — ghostwave-prod");
-        assert!(matches!(&out[1].action, Action::ConnectDurableSsh(h) if h == "prod"));
+        assert!(matches!(&out[1].action, Action::ConnectDurableSsh(h, _) if h == "prod"));
     }
 
     #[test]
@@ -983,7 +984,7 @@ mod tests {
         assert_eq!(out[0].title, "Durable session: orac — ghostwave-orac");
         assert_eq!(out[1].title, "New durable SSH (ghostd): ora");
         assert_eq!(out[1].category, DURABLE_CATEGORY);
-        assert!(matches!(&out[1].action, Action::ConnectDurableSsh(h) if h == "ora"));
+        assert!(matches!(&out[1].action, Action::ConnectDurableSsh(h, _) if h == "ora"));
 
         p.set_query("durable ghostwave-prod");
         let by_session = p.filtered_items();
@@ -1003,7 +1004,7 @@ mod tests {
         assert_eq!(out[0].category, "Remote — not durable");
         assert!(matches!(&out[0].action, Action::ConnectSsh(h) if h == "orac"));
         assert_eq!(out[1].title, "Durable session: orac — ghostwave-orac");
-        assert!(matches!(&out[1].action, Action::ConnectDurableSsh(h) if h == "orac"));
+        assert!(matches!(&out[1].action, Action::ConnectDurableSsh(h, _) if h == "orac"));
 
         p.set_query("ssh unknown-host");
         let unknown = p.filtered_items();
@@ -1018,7 +1019,7 @@ mod tests {
         assert!(
             p.filtered_items()
                 .iter()
-                .all(|i| !matches!(i.action, Action::ConnectDurableSsh(_))),
+                .all(|i| !matches!(i.action, Action::ConnectDurableSsh(_, _))),
             "with nothing to list, the normal filtering answer stands"
         );
 
@@ -1026,7 +1027,7 @@ mod tests {
         assert!(
             p.filtered_items()
                 .iter()
-                .all(|i| !matches!(i.action, Action::ConnectDurableSsh(_))),
+                .all(|i| !matches!(i.action, Action::ConnectDurableSsh(_, _))),
             "a bare 'durable ' offers no create item either"
         );
     }
