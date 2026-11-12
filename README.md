@@ -91,6 +91,15 @@ base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 api_key_env = "OPENAI_API_KEY"
 
+[remote]                    # durable SSH (ghostd) panes
+auto_reconnect = true       # retry a dropped attach
+reconnect_attempts = 5
+reconnect_delay_secs = 3
+# Where `ds <host>` opens. "own-session" (default) switches to the host's
+# ssh-<host> session; "pane" adds the attach tab to the session you are in.
+# The palette's `dsp <host>` / `dss <host>` override it for one command.
+durable_ssh_placement = "own-session"
+
 
 Session data (pane logs + session state) lives in
 `~/.local/share/ghostwave/`.
@@ -125,7 +134,8 @@ beside it are the iced front-end.
 - `src/scratchpad.rs` — the F12 scratchpad and the float list
 - `src/visualizer.rs`, `src/ai.rs`, `src/preview.rs` — content panes
 - `src/ui_fonts.rs` — font stack with fallback discovery (fc-list)
-- `ghostd/` — the remote session daemon (standalone crate; see "Not in this build")
+- `ghostd/` — the remote side of the durable panes (standalone crate; built by
+  `scripts/build-ghostd.sh`)
 - `tests/term_core.rs` — terminal-core semantics (wrap/reflow)
 - `PROGRESS.md` — development journal
 

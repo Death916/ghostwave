@@ -216,6 +216,20 @@ pub fn all_remote_specs() -> Vec<(String, String)> {
     specs
 }
 
+/// The saved session whose pane list holds a durable binding for `host`, by
+/// session name.
+///
+/// Built on [`list_sessions`] + [`remote_specs`], so the evidence is the saved
+/// session file: a session that is parked or closed still counts as bound,
+/// because there is no cross-window live pane registry. When several saved
+/// sessions bind the same host, the first in name order wins — the same order
+/// [`all_remote_specs`] reports. `None` when no saved session binds `host`.
+pub fn session_of_host(host: &str) -> Option<String> {
+    list_sessions()
+        .into_iter()
+        .find(|name| remote_specs(name).iter().any(|(bound, _)| bound == host))
+}
+
 /// True when EVERY pane in the saved session is a durable remote pane —
 /// a pure `ds` session, safe to delete wholesale after killing its
 /// daemons (mixed sessions keep their local tabs).
@@ -612,5 +626,70 @@ mod tests {
             !all_remote_specs().contains(&("all-specs-host".to_string(), "ghostwave-all-specs-host".to_string())),
             "the binding is gone once the session is deleted"
         );
+    }
+
+    #[test]
+    fn a_saved_session_is_found_by_the_host_it_binds() {
+        let host = unique_sess("bound-host");
+        let name = unique_sess("test-session-of-host");
+        let unbound = unique_sess("test-unbound-host");
+        save_one_pane(&name, Some("ssh"), Some(durable_spec(&host)));
+        assert_eq!(
+            session_of_host(&host).as_deref(),
+            Some(name.as_str()),
+            "the session whose saved pane list binds the host is named"
+        );
+        assert_eq!(
+            session_of_host(&unbound),
+            None,
+            "a host no saved session binds belongs to nobody"
+        );
+        delete(&name);
+        assert_eq!(
+            session_of_host(&host),
+            None,
+            "a deleted session no longer holds its binding"
+        );
+    }
+
+    #[test]
+    fn a_mixed_session_is_not_pure_remote() {
+        let name = unique_sess("test-mixed-purity");
+        let host = unique_sess("mixed-host");
+        let pane = |remote: Option<crate::term::RemoteSpec>, program: Option<&str>, log: String| PaneState {
+            program: program.map(String::from),
+            args: vec![],
+            cwd: None,
+            remote,
+            log,
+        };
+        let state = SessionState {
+            tabs: vec![TabState {
+                name: "mixed".into(),
+                panes: vec![
+                    pane(Some(durable_spec(&host)), Some("ssh"), format!("{name}-0.log")),
+                    pane(None, None, format!("{name}-1.log")),
+                ],
+                root: None,
+                floating: vec![],
+            }],
+        };
+        save(&name, &state);
+        assert_eq!(
+            remote_kind(&name),
+            Some(RemoteKind::Durable),
+            "the durable pane still badges the session"
+        );
+        assert!(
+            !is_pure_remote(&name),
+            "a session holding a durable pane and a local pane is not pure-remote, so k cannot delete it"
+        );
+        assert_eq!(
+            remote_specs(&name),
+            vec![(host.clone(), format!("ghostwave-{host}"))],
+            "only the durable pane is a binding, and the kill path still sees it"
+        );
+        delete(&name);
+        assert!(!is_pure_remote(&name), "no file is neither pure nor deletable");
     }
 }

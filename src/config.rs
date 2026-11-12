@@ -51,6 +51,57 @@ pub struct RemoteConfig {
     pub reconnect_attempts: u32,
     /// Initial reconnect delay in seconds (backoff caps at 15s).
     pub reconnect_delay_secs: u64,
+    /// Where `ds <host>` opens: "own-session" (default) or "pane".
+    pub durable_ssh_placement: DurablePlacement,
+}
+
+/// Where a durable `ds <host>` connection opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DurablePlacement {
+    /// Today's behaviour: switch to (or create) the host's own `ssh-<host>` session.
+    #[default]
+    OwnSession,
+    /// Stay in the session the workspace is in and add the attach tab there.
+    Pane,
+}
+
+impl DurablePlacement {
+    /// Parses the config spelling; anything unrecognised is `OwnSession`, so a
+    /// typo in config.toml cannot stop the app from starting.
+    pub fn from_config(raw: &str) -> Self {
+        if raw == "pane" {
+            Self::Pane
+        } else {
+            Self::OwnSession
+        }
+    }
+
+    /// The config.toml / README spelling.
+    pub fn config_name(self) -> &'static str {
+        match self {
+            Self::Pane => "pane",
+            Self::OwnSession => "own-session",
+        }
+    }
+
+    /// The palette spelling, e.g. `Durable SSH (ghostd, new pane): orac`.
+    pub fn palette_label(self) -> &'static str {
+        match self {
+            Self::Pane => "new pane",
+            Self::OwnSession => "own session",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DurablePlacement {
+    /// Any string that is not exactly `"pane"` is `OwnSession`: the contract is
+    /// that a typo in config.toml costs the user their placement, never the start.
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(DurablePlacement::from_config(&String::deserialize(deserializer)?))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +134,7 @@ impl Default for RemoteConfig {
             auto_reconnect: true,
             reconnect_attempts: 5,
             reconnect_delay_secs: 3,
+            durable_ssh_placement: DurablePlacement::OwnSession,
         }
     }
 }
@@ -293,6 +345,36 @@ mod tests {
         assert_eq!(cfg.ai.model, "test-model");
         assert_eq!(cfg.ai.api_key_env, "TEST_KEY");
         assert_eq!(cfg.ai.system_prompt, "hello");
+    }
+
+    #[test]
+    fn durable_ssh_placement_defaults_to_own_session() {
+        let empty = parse_toml("");
+        assert_eq!(empty.remote.durable_ssh_placement, DurablePlacement::OwnSession);
+        assert_eq!(RemoteConfig::default().durable_ssh_placement, DurablePlacement::OwnSession);
+
+        let existing_block = parse_toml("[remote]\nauto_reconnect = false\n");
+        assert_eq!(
+            existing_block.remote.durable_ssh_placement,
+            DurablePlacement::OwnSession,
+            "a [remote] block written before the key existed keeps today's behaviour"
+        );
+        assert!(!existing_block.remote.auto_reconnect, "and its other keys still apply");
+    }
+
+    #[test]
+    fn durable_ssh_placement_parses_pane() {
+        let cfg = parse_toml("[remote]\ndurable_ssh_placement = \"pane\"\n");
+        assert_eq!(cfg.remote.durable_ssh_placement, DurablePlacement::Pane);
+        assert_eq!(DurablePlacement::Pane.config_name(), "pane");
+        assert_eq!(DurablePlacement::OwnSession.config_name(), "own-session");
+    }
+
+    #[test]
+    fn an_unknown_durable_ssh_placement_falls_back() {
+        let parsed: Result<Config, _> = toml::from_str("[remote]\ndurable_ssh_placement = \"sideways\"");
+        let cfg = parsed.expect("an unknown placement must not fail the whole config");
+        assert_eq!(cfg.remote.durable_ssh_placement, DurablePlacement::OwnSession);
     }
 
     #[test]

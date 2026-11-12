@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ghostwave::config::Config;
+use ghostwave::config::{Config, DurablePlacement};
 use ghostwave::layout::{Dir, SplitDir};
 use ghostwave::term::{CellDims, ReconnectState, RemoteSpec};
 use ghostwave::theme::{self, Theme};
@@ -1148,22 +1148,61 @@ impl AppState {
     /// attach command, bound to `ghostwave-<host>` so it can be restored and
     /// killed independently of the local pane.
     ///
+    /// `placement` decides which session the pane lands in: [`DurablePlacement::OwnSession`]
+    /// switches to (or creates) `ssh-<host>` first, [`DurablePlacement::Pane`] adds the
+    /// attach tab beside the current tabs and never switches session.
+    ///
     /// The ghostd binary is uploaded in the background on first use; until the
     /// upload lands the pane's ssh reports the missing binary and exits, and the
     /// auto-reconnect loop retries. Re-running the command focuses the existing
     /// attach pane (one daemon serves one client at a time) instead of stacking a
     /// duplicate.
-    pub fn connect_durable_ssh(&mut self, host: &str) {
+    pub fn connect_durable_ssh(&mut self, host: &str, placement: DurablePlacement) {
         if !remote::host_is_valid(host) {
             self.toast(format!("not an ssh destination: {host}"));
             return;
         }
-        let target = remote::ssh_session(host);
-        let fresh = if self.current_session != target {
-            self.open_remote_session(&target)
-        } else {
-            false
-        };
+        // One client per binding, whatever the placement: a binding a saved
+        // session owns refuses here, before any session is created or switched
+        // and before an ssh child is spawned. A live pane for the host in this
+        // session is not a second attach, so it is left to be focused instead.
+        if self.remote_pane_of_host(host).is_none() {
+            if let Some(name) = self.durable_bound_elsewhere(host) {
+                self.toast(format!("bound in session {name}"));
+                return;
+            }
+        }
+        match placement {
+            DurablePlacement::OwnSession => {
+                let target = remote::ssh_session(host);
+                let fresh = if self.current_session != target {
+                    self.open_remote_session(&target)
+                } else {
+                    false
+                };
+                self.attach_durable_pane(host, fresh);
+            }
+            DurablePlacement::Pane => self.attach_durable_pane(host, false),
+        }
+    }
+
+    /// The saved session that holds a durable binding for `host` when it is not
+    /// the session the workspace is in.
+    ///
+    /// The evidence is the saved session file ([`ghostwave::session::session_of_host`]),
+    /// so a binding whose session is parked or closed still counts — there is no
+    /// cross-window live pane registry. A live pane in this session is the
+    /// caller's first check, not this one.
+    fn durable_bound_elsewhere(&self, host: &str) -> Option<String> {
+        ghostwave::session::session_of_host(host).filter(|name| *name != self.current_session)
+    }
+
+    /// Focuses the live attach pane for `host` in this session, or opens one.
+    ///
+    /// `fresh_session` is passed straight to [`Self::push_remote_tab`]: only the
+    /// own-session placement ever sets it, because the new tab replaces the
+    /// placeholder tab of the session that placement just created.
+    fn attach_durable_pane(&mut self, host: &str, fresh_session: bool) {
         if let Some((tab, pane)) = self.remote_pane_of_host(host) {
             self.active_tab = tab;
             self.tabs[tab].active = pane;
@@ -1182,7 +1221,7 @@ impl AppState {
         self.ensure_remote_binary(host);
         match self.remote_pane(&argv, Some(spec)) {
             Ok(pane) => {
-                self.push_remote_tab(pane, &format!("ds {host}"), fresh);
+                self.push_remote_tab(pane, &format!("ds {host}"), fresh_session);
                 self.toast(format!("durable ssh: {host}"));
             }
             Err(e) => self.toast(format!("ssh failed: {e}")),
@@ -1679,6 +1718,7 @@ mod tests {
                 auto_reconnect: true,
                 reconnect_attempts: 5,
                 reconnect_delay_secs: 3,
+                ..RemoteConfig::default()
             },
             ..Config::load()
         }
@@ -1988,6 +2028,169 @@ mod tests {
             Some(("prod".to_string(), "ghostwave-prod".to_string()))
         );
         assert_eq!(state.remote_spec_of(0, 1), None, "there is no second pane");
+    }
+
+    /// A one-tab session whose only pane is a durable binding for `host`, as it
+    /// looks in the session file.
+    fn bound_session(host: &str, owner: &str) -> ghostwave::session::SessionState {
+        use ghostwave::session::{PaneState, SessionState, TabState};
+        SessionState {
+            tabs: vec![TabState {
+                name: format!("ds {host}"),
+                panes: vec![PaneState {
+                    program: Some("ssh".into()),
+                    args: vec![],
+                    cwd: None,
+                    remote: Some(RemoteSpec {
+                        host: host.to_string(),
+                        session: remote::remote_session(host),
+                    }),
+                    log: format!("{owner}.log"),
+                }],
+                root: None,
+                floating: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn a_binding_saved_in_another_session_is_not_attached_twice() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, ssh) = recorded_workspace();
+        let host = format!("saved-host-{}", std::process::id());
+        let owner = format!("saved-owner-{}", std::process::id());
+        state.current_session = format!("here-{}", std::process::id());
+        let tabs_before = state.tabs.len();
+
+        // A session that is saved but NOT open still owns the binding: the
+        // refusal is decided on session-file evidence, not on a live pane.
+        ghostwave::session::save(&owner, &bound_session(&host, &owner));
+
+        state.connect_durable_ssh(&host, DurablePlacement::Pane);
+        assert_eq!(
+            state.toast.as_ref().map(|(message, _)| message.clone()),
+            Some(format!("bound in session {owner}")),
+            "the toast names the session that owns the binding (saved, not open)"
+        );
+        assert_eq!(state.tabs.len(), tabs_before, "and no attach pane is opened");
+        assert!(ssh.calls().is_empty(), "no upload is started for a refused attach");
+
+        // Once the owning session is gone the same command opens here.
+        ghostwave::session::delete(&owner);
+        state.connect_durable_ssh(&host, DurablePlacement::Pane);
+        assert_eq!(
+            state.toast.as_ref().map(|(message, _)| message.clone()),
+            Some(format!("durable ssh: {host}"))
+        );
+        assert_eq!(state.tabs.len(), tabs_before + 1, "the attach pane opens in this session");
+    }
+
+    #[test]
+    fn an_option_shaped_host_never_reaches_ssh() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, ssh) = recorded_workspace();
+        let tabs_before = state.tabs.len();
+        for host in ["-F/etc/hosts", "-oProxyCommand=id"] {
+            state.connect_durable_ssh(host, DurablePlacement::Pane);
+            assert_eq!(
+                state.toast.as_ref().map(|(message, _)| message.clone()),
+                Some(format!("not an ssh destination: {host}")),
+                "an option-shaped destination is refused before ssh argv"
+            );
+        }
+        assert_eq!(state.tabs.len(), tabs_before, "no attach pane is opened");
+        assert!(ssh.calls().is_empty(), "no ssh child is started");
+    }
+
+    #[test]
+    fn an_own_session_placement_refuses_a_binding_saved_elsewhere() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, ssh) = recorded_workspace();
+        let pid = std::process::id();
+        let host = format!("own-host-{pid}");
+        let owner = format!("own-owner-{pid}");
+        state.current_session = format!("here-{pid}");
+        let tabs_before = state.tabs.len();
+        let session_before = state.current_session.clone();
+
+        // The owning session is saved and not open, so the refusal rests on
+        // session-file evidence; the own-session placement must obey it too.
+        ghostwave::session::save(&owner, &bound_session(&host, &owner));
+
+        state.connect_durable_ssh(&host, DurablePlacement::OwnSession);
+        assert_eq!(
+            state.toast.as_ref().map(|(message, _)| message.clone()),
+            Some(format!("bound in session {owner}")),
+            "the own-session placement is refused like any other"
+        );
+        assert_eq!(
+            state.current_session, session_before,
+            "a refused attach does not switch or create a session"
+        );
+        assert_eq!(state.tabs.len(), tabs_before, "and opens no attach pane");
+        assert!(
+            ssh.calls().is_empty(),
+            "no upload or ssh child for a refused own-session attach"
+        );
+
+        // A live binding in THIS session is focused rather than attached again.
+        state.replace_tabs(vec![remote_tab(&host, "/bin/sh", &["-c", "true"])]);
+        state.connect_durable_ssh(&host, DurablePlacement::OwnSession);
+        assert_eq!(state.tabs.len(), 1, "the live pane is focused, not doubled");
+        assert_eq!(state.remote_pane_of_host(&host), Some((0, 0)));
+
+        ghostwave::session::delete(&owner);
+    }
+
+    /// A renamed session keeps its durable binding in the new file, while the
+    /// name `ds <host>` targets no longer exists on disk. The own-session
+    /// placement must read that file and refuse instead of starting a fresh
+    /// session and opening a second attach on a daemon that serves one client.
+    #[test]
+    fn a_renamed_binding_still_refuses_a_fresh_own_session_attach() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, ssh) = recorded_workspace();
+        let pid = std::process::id();
+        let host = format!("renamed-host-{pid}");
+        let literal = remote::ssh_session(&host);
+        let moved = format!("{literal}-moved-{pid}");
+
+        ghostwave::session::save(&literal, &bound_session(&host, &literal));
+        ghostwave::session::rename(&literal, &moved);
+        assert!(
+            ghostwave::session::load(&literal).is_none(),
+            "the literal name is free again: a fresh session would be started"
+        );
+        assert_eq!(
+            ghostwave::session::session_of_host(&host).as_deref(),
+            Some(moved.as_str()),
+            "the renamed file is the only record of the binding"
+        );
+
+        state.current_session = literal.clone();
+        let tabs_before = state.tabs.len();
+
+        state.connect_durable_ssh(&host, DurablePlacement::OwnSession);
+        assert_eq!(
+            state.toast.as_ref().map(|(message, _)| message.clone()),
+            Some(format!("bound in session {moved}")),
+            "the binding follows the rename, so the attach is refused"
+        );
+        assert_eq!(
+            state.current_session, literal,
+            "no fresh session is started in place of the renamed one"
+        );
+        assert_eq!(state.tabs.len(), tabs_before, "and no attach pane is opened");
+        assert!(
+            ssh.calls().is_empty(),
+            "no upload or ssh child for a refused own-session attach"
+        );
+        assert!(
+            ghostwave::session::load(&literal).is_none(),
+            "the refusal leaves no session file behind under the old name"
+        );
+
+        ghostwave::session::delete(&moved);
     }
 
     #[test]

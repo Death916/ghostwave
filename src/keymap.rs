@@ -3,6 +3,7 @@
 
 use libghostty_vt::key::{Key, Mods};
 
+use crate::config::DurablePlacement;
 use crate::layout::Dir;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,7 +129,9 @@ pub enum Action {
     ClearTerminal,
     OpenFile(String),
     ConnectSsh(String),
-    ConnectDurableSsh(String),
+    /// A durable attach, with where it was resolved to open (config default or a
+    /// palette override).
+    ConnectDurableSsh(String, DurablePlacement),
     KillRemoteSession,
     NewAi,
     // session mode
