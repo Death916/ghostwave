@@ -510,6 +510,11 @@ fn new_force_recreates_a_killed_name() {
     let mut sandbox = Sandbox::new("force");
     let out = sandbox.new_session("f");
     assert!(out.status.success(), "the session is created: {out:?}");
+    // The daemon publishes its pidfile a moment after `new` returns; a kill that
+    // lands first has no owner to signal (pre-existing window, not this change's).
+    sandbox
+        .wait_for_daemon_pid("f", Duration::from_secs(5))
+        .expect("the daemon records its pid");
     assert!(
         sandbox.run(&["kill", "f"]).status.success(),
         "the session is killed"

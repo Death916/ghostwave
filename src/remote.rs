@@ -845,7 +845,6 @@ mod tests {
 
     use super::*;
     use ghostwave::term::{RemoteSpec, HOST_MAX_LEN};
-    use std::collections::VecDeque;
     use std::time::Instant;
 
     fn outcome(status: i32, stdout: &str) -> SshOutcome {
