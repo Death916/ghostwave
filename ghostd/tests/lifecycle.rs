@@ -83,6 +83,13 @@ impl Sandbox {
         self.dir.join(file)
     }
 
+    /// Deletes the sandbox's state dir, so the next run sees a host that has never
+    /// created one.
+    fn remove_state_dir(&self) {
+        fs::remove_dir_all(&self.dir).expect("the state dir is removed");
+        assert!(!self.dir.exists(), "the state dir is gone");
+    }
+
     /// Run `ghostd <args>` to completion in this sandbox.
     fn run(&self, args: &[&str]) -> std::process::Output {
         Command::new(BIN)
@@ -563,6 +570,89 @@ fn a_kill_of_an_unknown_name_tombstones_it() {
     );
     let out = sandbox.new_session("no-such");
     assert!(out.status.success(), "and then it can be created: {out:?}");
+}
+
+/// A host that has never created a state dir is the daemon-less kill path
+/// (`kill <unknown name>`): nothing else creates the directory, so the tombstone
+/// writer must, or the "stays killed" claim has nothing behind it.
+#[test]
+fn a_kill_records_its_tombstone_even_when_the_state_dir_does_not_exist_yet() {
+    let mut sandbox = Sandbox::new("no-state-dir");
+    sandbox.remove_state_dir();
+
+    let out = sandbox.run_new(&["kill", "ghost"], "ghost");
+    let tombstoned = sandbox.path("ghost.killed").exists();
+    assert!(
+        out.status.success() || String::from_utf8_lossy(&out.stderr).contains("may be recreated"),
+        "a kill either records the tombstone or says the name may be recreated: {out:?}"
+    );
+    assert!(
+        out.status.success() == tombstoned,
+        "a kill that reported success left the tombstone it promises: {out:?}"
+    );
+    assert!(
+        tombstoned,
+        "this host can write the tombstone once the dir is created: {out:?}"
+    );
+    assert!(
+        !sandbox.path("ghost.killed.tmp").exists(),
+        "and leaves no half-written file behind"
+    );
+
+    let refused = sandbox.run(&["new", "ghost"]);
+    assert!(
+        !refused.status.success(),
+        "so the name cannot be recreated by an automatic path: {refused:?}"
+    );
+
+    assert!(
+        sandbox.run(&["unkill", "ghost"]).status.success(),
+        "unkill releases it"
+    );
+    assert!(!sandbox.path("ghost.killed").exists(), "and the tombstone is gone");
+}
+
+/// A tombstone that exists but cannot be removed is a name that is *still*
+/// killed: `unkill` must not report it creatable (the explicit-connect script
+/// would then attach a name it cannot create).
+#[test]
+fn an_unkill_whose_tombstone_will_not_clear_fails() {
+    let sandbox = Sandbox::new("unkill-stuck");
+    fs::create_dir_all(sandbox.path("stuck.killed")).expect("the obstruction exists");
+
+    let out = sandbox.run(&["unkill", "stuck"]);
+    assert!(
+        !out.status.success(),
+        "a tombstone that will not clear is not reported cleared: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("still killed"),
+        "and the message says the name is still killed: {out:?}"
+    );
+    assert!(sandbox.path("stuck.killed").exists(), "the tombstone is still there");
+}
+
+/// `new --force` clears the tombstone after the bind, so a clear that fails must
+/// stop it before it daemonizes: a daemon running under a live tombstone is a
+/// session the user re-created and that every attach then calls killed.
+#[test]
+fn a_force_new_whose_tombstone_will_not_clear_does_not_daemonize() {
+    let mut sandbox = Sandbox::new("force-stuck");
+    fs::create_dir_all(sandbox.path("stuck.killed")).expect("the obstruction exists");
+
+    let out = sandbox.run_new(&["new", "--force", "stuck"], "stuck");
+    assert!(
+        !out.status.success(),
+        "the override refuses a name it cannot un-kill: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("tombstone could not be cleared"),
+        "and says why: {out:?}"
+    );
+    assert!(
+        !sandbox.path("stuck.pid").exists(),
+        "no daemon was left behind to hold the name"
+    );
 }
 
 #[test]

@@ -1576,10 +1576,16 @@ impl AppState {
     /// Respawns every pane waiting to reconnect to `host`, now that its binary is
     /// there.
     ///
-    /// These panes got into `Waiting` from a user action (`connect_remote_pane`,
-    /// or the `ds <host>` path), never from the automatic pass, so the respawn uses
-    /// the explicit-connect command and clears a tombstone the user's earlier
-    /// connect left behind.
+    /// A `Waiting` pane can come from either place: an explicit connect
+    /// (`connect_remote_pane`, `ds <host>`) or the automatic pass, which puts a
+    /// pane that exited non-zero into `Waiting` for its own attempt. So the safety
+    /// of the unkill below does not rest on where the pane came from — it rests on
+    /// uploads being started only by explicit connects: `ensure_remote_binary`'s
+    /// callers are `connect_remote_pane` and `attach_durable_pane`, and
+    /// `binary_ready` is insert-only, so this respawn (which runs the
+    /// explicit-connect argv, tombstone-clearing and all) is always downstream of a
+    /// user action. Any future automatic trigger for an upload would make this a
+    /// resurrection path for a killed session.
     fn respawn_waiting(&mut self, host: &str) {
         if !remote::host_is_valid(host) {
             return;

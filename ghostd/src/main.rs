@@ -29,12 +29,12 @@ use nix::{
 
 use ghostd::{
     bind_listener, clear_tombstone, daemonize, dcs_size_msg, die, fd_poll, fd_read, gdbg,
-    install_term_handler, is_killed, kill_child_group, log_path, pid_gone, probe_session,
-    read_pidfile, recover_session, remove_state_if_owned, set_nonblock, set_term_size, socket_path,
-    spawn_child, state_dir, term_size, truncate_log_front, write_all_blocking, write_pidfile,
-    write_tombstone, write_tombstone_none, ATTACH_ENDED, ATTACH_KILLED, ATTACH_NO_SESSION,
-    ATTACH_WEDGED, DEFAULT_FIRST_ATTACH_SECS, DEFAULT_LOG_CAP_MB, KILL_SUPERSEDED, Probe,
-    TERM_REQUESTED, VERSION,
+    install_term_handler, is_killed, kill_child_group, killed_path, log_path, pid_gone,
+    probe_session, read_pidfile, recover_session, remove_state_if_owned, set_nonblock,
+    set_term_size, socket_path, spawn_child, state_dir, term_size, truncate_log_front,
+    write_all_blocking, write_pidfile, write_tombstone, write_tombstone_none, ATTACH_ENDED,
+    ATTACH_KILLED, ATTACH_NO_SESSION, ATTACH_WEDGED, DEFAULT_FIRST_ATTACH_SECS, DEFAULT_LOG_CAP_MB,
+    KILL_SUPERSEDED, Probe, TERM_REQUESTED, VERSION,
 };
 
 fn eprintln_exit(msg: &str) -> ! {
@@ -392,7 +392,14 @@ fn cmd_new(name: &str, cmd: &[String], log_cap: u64, first_attach_secs: u64, for
     let listener = bind_listener(name).unwrap_or_else(|e| die(&format!("{e}")));
     if force {
         // After the bind: a name this process cannot actually take stays killed.
-        clear_tombstone(name);
+        // A tombstone that will not clear is that case — the daemon is up but the
+        // name it holds still reads killed, so say so instead of daemonizing.
+        if let Err(e) = clear_tombstone(name) {
+            die(&format!(
+                "'{name}' is bound, but its kill tombstone could not be cleared ({e}) — the name still reads killed; remove {} by hand",
+                killed_path(name).display()
+            ));
+        }
     }
     daemonize();
     install_term_handler();
@@ -611,7 +618,14 @@ fn cmd_kill(name: &str) {
         let _ = fs::remove_file(&sock);
         // No daemon to protect, so an orphan hunt is exactly right here — and the
         // tombstone is what keeps the next automatic attach from rebuilding it.
-        write_tombstone_none(name);
+        // Without the tombstone there is nothing behind the claim, so a failed
+        // write is reported instead of announced as a kill.
+        if let Err(e) = write_tombstone_none(name) {
+            eprintln!(
+                "ghostd: no live session '{name}', but the kill could not be recorded ({e}) — '{name}' may be recreated"
+            );
+            std::process::exit(1);
+        }
         println!("ghostd: no live session '{name}'; it stays killed until 'ghostd unkill {name}'");
         return;
     };
@@ -661,19 +675,33 @@ fn cmd_kill(name: &str) {
         std::process::exit(KILL_SUPERSEDED);
     }
     let _ = fs::remove_file(log_path(name));
-    write_tombstone(name, daemon);
+    // The name is only final once its tombstone is on disk: the state above is
+    // already gone, so a failure here is reported as "the kill did not stick"
+    // rather than as a kill.
+    if let Err(e) = write_tombstone(name, daemon) {
+        eprintln!(
+            "ghostd: the daemon for '{name}' is dead, but the kill could not be recorded ({e}) — '{name}' may be recreated"
+        );
+        std::process::exit(1);
+    }
     println!("ghostd: killed '{name}'");
 }
 
 /// Clear a name's kill tombstone, so it may be created again.
 ///
 /// Idempotent: a name that was never killed exits 0 and creates nothing, which is
-/// what lets the explicit-connect script call it blindly.
+/// what lets the explicit-connect script call it blindly. A tombstone that is
+/// there and cannot be removed is a failure: the name is still killed, so the
+/// command must not claim otherwise.
 fn cmd_unkill(name: &str) {
     if name.is_empty() || name.contains('/') {
         die("bad session name");
     }
-    clear_tombstone(name);
+    if let Err(e) = clear_tombstone(name) {
+        die(&format!(
+            "'{name}' is still killed: its tombstone could not be removed ({e})"
+        ));
+    }
     println!("ghostd: '{name}' may be created again");
 }
 

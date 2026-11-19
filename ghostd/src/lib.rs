@@ -315,8 +315,14 @@ pub fn is_killed(name: &str) -> bool {
 ///
 /// Written through `<name>.killed.tmp` and a rename, the rule [`write_pidfile`]
 /// already uses: a concurrent reader never sees a half-written tombstone and
-/// concludes the name is free.
-pub fn write_tombstone(name: &str, daemon: Pid) {
+/// concludes the name is free. The state dir is created if it does not exist yet
+/// (a host that never ran `new`), so a kill is recorded on every host.
+///
+/// Returns the I/O error when the tombstone could not be made durable — a full
+/// disk, a read-only state dir. A kill path **must not** report the kill as final
+/// in that case: a name with no tombstone behind it is a name `new` will happily
+/// recreate.
+pub fn write_tombstone(name: &str, daemon: Pid) -> std::io::Result<()> {
     let body = format!(
         "killed {} {}\n",
         std::time::SystemTime::now()
@@ -325,27 +331,38 @@ pub fn write_tombstone(name: &str, daemon: Pid) {
             .unwrap_or(0),
         daemon.as_raw()
     );
-    write_tombstone_body(name, &body);
+    write_tombstone_body(name, &body)
 }
 
 /// The same tombstone for a name no daemon ever owned — `kill <name>` with no
 /// pidfile left. Pid `0` is written, which no signal path can mistake for an
 /// owner ([`parse_pid`] refuses it).
-pub fn write_tombstone_none(name: &str) {
-    write_tombstone_body(name, "killed 0 0\n");
+///
+/// Fails exactly like [`write_tombstone`], and for the same reason.
+pub fn write_tombstone_none(name: &str) -> std::io::Result<()> {
+    write_tombstone_body(name, "killed 0 0\n")
 }
 
-fn write_tombstone_body(name: &str, body: &str) {
-    let tmp = state_dir().join(format!("{name}.killed.tmp"));
-    if fs::write(&tmp, body).is_ok() {
-        let _ = fs::rename(&tmp, killed_path(name));
-    }
+fn write_tombstone_body(name: &str, body: &str) -> std::io::Result<()> {
+    let dir = state_dir();
+    fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!("{name}.killed.tmp"));
+    fs::write(&tmp, body)?;
+    fs::rename(&tmp, killed_path(name))
 }
 
 /// Clears `name`'s tombstone, so it may be created again. Idempotent: a name
 /// that was never killed is left with no file, and no file is created.
-pub fn clear_tombstone(name: &str) {
-    let _ = fs::remove_file(killed_path(name));
+///
+/// Returns the I/O error when a tombstone that *does* exist could not be removed:
+/// the name is still killed, and a caller must say so rather than report the name
+/// creatable.
+pub fn clear_tombstone(name: &str) -> std::io::Result<()> {
+    match fs::remove_file(killed_path(name)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Returns (cols, rows) of the terminal on `fd` (TIOCGWINSZ).
@@ -803,7 +820,7 @@ mod tests {
         let (_guard, dir) = state_dir_for("tombstone");
         assert!(!is_killed("s"), "a name nobody killed is not killed");
 
-        write_tombstone("s", Pid::from_raw(4242));
+        write_tombstone("s", Pid::from_raw(4242)).expect("the tombstone is written");
         assert!(is_killed("s"), "the tombstone exists");
         assert!(dir.join("s.killed").exists(), "in the state dir, beside the pidfile");
         assert!(!dir.join("s.killed.tmp").exists(), "written through a rename, not left half-written");
@@ -816,23 +833,51 @@ mod tests {
         );
         assert_eq!(fields.next(), Some("4242"), "the daemon that was killed: {body:?}");
 
-        clear_tombstone("s");
+        clear_tombstone("s").expect("the tombstone is removed");
         assert!(!is_killed("s"), "clearing makes the name creatable again");
         assert!(!dir.join("s.killed").exists());
 
-        clear_tombstone("never-killed");
+        clear_tombstone("never-killed").expect("clearing a missing tombstone is a no-op");
         assert!(
             !is_killed("never-killed") && !dir.join("never-killed.killed").exists(),
             "clearing a name that was never killed creates nothing"
         );
 
-        write_tombstone_none("orphan");
+        write_tombstone_none("orphan").expect("the daemon-less tombstone is written");
         let body = fs::read_to_string(dir.join("orphan.killed")).expect("the tombstone is written");
         assert_eq!(
             body.split_whitespace().last(),
             Some("0"),
             "a daemon-less tombstone names no owner: {body:?}"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tombstone_creates_a_state_dir_that_does_not_exist_yet() {
+        let (_guard, dir) = state_dir_for("tombstone-missing-dir");
+        fs::remove_dir_all(&dir).expect("the state dir starts absent");
+
+        write_tombstone_none("s").expect("the writer creates the dir it writes into");
+        assert!(dir.join("s.killed").exists(), "so the kill is recorded after all");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_a_tombstone_that_cannot_be_removed_reports_the_failure() {
+        let (_guard, dir) = state_dir_for("tombstone-unremovable");
+        // A directory where the tombstone would be: `remove_file` fails without
+        // needing privileges a test cannot have.
+        fs::create_dir_all(dir.join("busy.killed")).expect("the obstruction exists");
+        assert!(is_killed("busy"), "the name reads as killed");
+
+        assert!(
+            clear_tombstone("busy").is_err(),
+            "a removal that failed is not reported as success"
+        );
+        assert!(is_killed("busy"), "and the name stays killed");
 
         let _ = fs::remove_dir_all(&dir);
     }
