@@ -1560,3 +1560,28 @@ reconnects, label says "killed"), the kill drops the local attach child and keep
 the pane, and `Ctrl+Shift+K` kills a *connected* pane without the palette. The
 daemon half reaches a host only through the asset rebuild (NEEDS-VULCAN).
 Bounded replay (D6) is sitting 2.
+
+### 0.1.4 assets rebuilt (both targets) — `t_9f9560d8`
+
+`assets/ghostd-x86_64` and `assets/ghostd-aarch64` are rebuilt from this tree and both manifests moved
+to **0.1.4** in one commit (`1155900`), which is what makes the tombstone reach a host: the app
+re-uploads only when `$BIN --version` differs from its own, and the new binaries report `ghostd 0.1.4`.
+
+The rebuild did **not** use `scripts/build-ghostd.sh`: its NixOS path fetches an
+`x86_64-unknown-linux-gnu` rustc, which cannot execute on `uname -m` = `aarch64`. Measured alternatives:
+nixpkgs `rustc` 1.95.0 is the release commit (`59807616e`) but its `--version` carries
+`(built from a source tarball)`, so **official `rust-std` tarballs are rejected** by it —
+`found crate compiler_builtins compiled by an incompatible version of rustc`; `pkgsMusl.rustc` and
+`pkgsCross.musl64.stdenv.cc` are not in the aarch64 binary cache, so both mean a rustc/gcc source
+build. What worked: the **official aarch64 1.95.0 toolchain** (`rustc` + `cargo` tarballs, patchelf'd to
+the nix glibc loader) with the matching official `rust-std` for each target dropped into its own
+sysroot, and `rust-lld` (bundled in that toolchain) linking `relocation-model=static` against the
+std's `self-contained/libc.a`. Host build scripts keep the nix gcc through
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`; the musl flags are per-target so they never reach a
+build script.
+
+Verified here: `assets/ghostd-aarch64 --version` → `ghostd 0.1.4` (rc 0) and `ghostd list` in a scratch
+`GHOSTWAVE_STATE_DIR` → rc 0; both files carry no `PT_INTERP` (`patchelf: cannot find section '.interp'`)
+and the right `e_machine` (`0x3e` x86-64, `0xb7` aarch64). The x86_64 asset cannot be *executed* on
+this aarch64 host — that check, and the real two-window run over ssh, remain for a vulcan window.
+
