@@ -164,6 +164,9 @@ pub enum ReconnectState {
     Waiting { attempt: u32, next: std::time::Instant },
     /// Auto-reconnect exhausted/failed; Enter connects manually.
     Manual,
+    /// The user killed this binding. No automatic path may reconnect or respawn
+    /// it; only an explicit connect (`Enter`, `ds <host>`) resets it to `Idle`.
+    Off,
 }
 
 /// A single terminal pane (one shell session).

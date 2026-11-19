@@ -1231,10 +1231,15 @@ impl AppState {
     /// Connects the remote pane at `(tab, pane)` now: immediately when its host's
     /// ghostd binary is already there, otherwise once the upload lands.
     ///
+    /// This is an **explicit** connect — a key or a `ds <host>` put the user here —
+    /// so it runs the variant that clears the session's kill tombstone. That is
+    /// also what puts a killed pane back in `Idle`: the fork resets the state, and
+    /// nothing automatic ever gets this far (`reconnect_pass` skips `Off`).
+    ///
     /// A manual connect spends no auto-reconnect attempt: the failure count is
     /// reset, so a pane the user reconnects by hand gets the full budget again.
     pub fn connect_remote_pane(&mut self, tab: usize, pane: usize) {
-        let Some((host, _session)) = self.remote_spec_of(tab, pane) else {
+        let Some((host, session)) = self.remote_spec_of(tab, pane) else {
             return;
         };
         let ready = self.binary_ready.contains(&host);
@@ -1247,7 +1252,9 @@ impl AppState {
         let mut guard = handle.lock().unwrap();
         guard.term.reconnect_failures = 0;
         if ready {
-            if guard.respawn_remote() {
+            let argv = remote::attach_argv_explicit(&host, &session);
+            let (program, args) = self.ssh.pane_command(&argv);
+            if guard.respawn_remote_with(&program, &args) {
                 return;
             }
             guard.term.reconnect = ReconnectState::Manual;
@@ -1262,8 +1269,12 @@ impl AppState {
     }
 
     /// Kills the remote session the pane at `(tab, pane)` is bound to, over a
-    /// fresh ssh connection. The local pane stays as it is — it is left
-    /// disconnected, and the kill is the daemon's own to report.
+    /// fresh ssh connection, and leaves the pane as a killed one.
+    ///
+    /// The local attach child is dropped and the pane put in
+    /// [`ReconnectState::Off`] **before** the kill is spawned, so no reconnect
+    /// tick can race it and no local ssh is left orphaned. The pane stays: only
+    /// `Enter` brings it back, and a killed pane owes the clock nothing.
     ///
     /// A binding that did not come out of [`remote::remote_session`] is refused
     /// rather than sent: the session name reaches a remote command line, so it is
@@ -1276,8 +1287,15 @@ impl AppState {
             self.toast(format!("refusing to kill {session} on {host}"));
             return false;
         }
-        self.toast(format!("killing remote session {session} on {host}"));
-        remote::spawn_kill(Arc::clone(&self.ssh), &host, &session)
+        if let Some(handle) = self.pane_at(tab, pane) {
+            handle.lock().unwrap().kill_remote_child();
+        }
+        if !remote::spawn_kill(Arc::clone(&self.ssh), &host, &session) {
+            self.toast(format!("refusing to kill {session} on {host}"));
+            return false;
+        }
+        self.toast(format!("killed {session} on {host} — Enter reconnects"));
+        true
     }
 
     /// Palette "Kill Remote Session": kills the remote session of the focused
@@ -1291,6 +1309,8 @@ impl AppState {
             return;
         };
         if self.kill_remote_pane(tab, pane) {
+            // Closing is allowed because the kill was accepted: the pane holds a
+            // dead child and the binding it pointed at is now terminal.
             self.close_active();
             self.toast(format!("killed remote session {session} on {host}"));
         }
@@ -1356,9 +1376,18 @@ impl AppState {
 
     /// Stops the auto-reconnect loop on the focused pane: it stays disconnected
     /// until Enter connects it.
+    ///
+    /// A killed pane is left alone: `Off` already means "nothing automatic runs",
+    /// and downgrading it to `Manual` would silently stop the pane from saying it
+    /// was killed. The guard lives here rather than in the key table so no future
+    /// caller can reintroduce that downgrade.
     pub fn stop_remote_reconnect(&mut self) {
         if let Some(handle) = self.active_pane() {
-            handle.lock().unwrap().term.reconnect = ReconnectState::Manual;
+            let mut guard = handle.lock().unwrap();
+            if guard.term.reconnect == ReconnectState::Off {
+                return;
+            }
+            guard.term.reconnect = ReconnectState::Manual;
         }
         self.toast("reconnect stopped — Enter to connect");
     }
@@ -1546,7 +1575,18 @@ impl AppState {
 
     /// Respawns every pane waiting to reconnect to `host`, now that its binary is
     /// there.
+    ///
+    /// These panes got into `Waiting` from a user action (`connect_remote_pane`,
+    /// or the `ds <host>` path), never from the automatic pass, so the respawn uses
+    /// the explicit-connect command and clears a tombstone the user's earlier
+    /// connect left behind.
     fn respawn_waiting(&mut self, host: &str) {
+        if !remote::host_is_valid(host) {
+            return;
+        }
+        let session = remote::remote_session(host);
+        let argv = remote::attach_argv_explicit(host, &session);
+        let (program, args) = self.ssh.pane_command(&argv);
         for tab in self.tabs.iter_mut() {
             for entry in tab.panes.iter_mut().flatten() {
                 let Some(handle) = entry.term() else { continue };
@@ -1560,7 +1600,7 @@ impl AppState {
                     .is_some_and(|remote| remote.host == host)
                     && matches!(guard.term.reconnect, ReconnectState::Waiting { .. });
                 if waiting_here {
-                    let _ = guard.respawn_remote();
+                    let _ = guard.respawn_remote_with(&program, &args);
                 }
             }
         }
@@ -1834,6 +1874,34 @@ mod tests {
         )
     }
 
+    /// A tab holding one CONNECTED remote pane for `host`: a real child
+    /// (`/bin/sh -c cat`) that does nothing, so the kill path has a child to drop.
+    fn connected_remote_tab(host: &str) -> Tab {
+        let config = config();
+        let pane = Pane::spawn_program(
+            80,
+            24,
+            cell(&config),
+            config.scrollback,
+            config.max_log_mb * 1024 * 1024,
+            Some("/bin/sh"),
+            &["-c", "cat"],
+            None,
+            Some(RemoteSpec {
+                host: host.to_string(),
+                session: remote::remote_session(host),
+            }),
+        )
+        .expect("a remote pane with a local child");
+        let id = pane.id;
+        let grid = crate::grid_session::state_from_node(&Node::Leaf { pane: 0 }, |_| id);
+        Tab::restored(
+            format!("ssh {host}"),
+            vec![PaneEntry::Term(Arc::new(Mutex::new(pane)))],
+            grid,
+        )
+    }
+
     /// A tab holding one pane that is not a terminal, for the purity check.
     fn content_tab() -> Tab {
         let content = ContentPane::visualizer();
@@ -1991,6 +2059,126 @@ mod tests {
         let guard = handle.lock().unwrap();
         assert_eq!(guard.term.reconnect, ReconnectState::Manual);
         assert_eq!(guard.term.reconnect_failures, 0, "no attempt was spent");
+    }
+
+    #[test]
+    fn killing_a_connected_remote_pane_makes_it_off_and_unreachable_to_reconnect() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, ssh) = recorded_workspace();
+        let tab = connected_remote_tab("prod");
+        let handle = pane(&tab);
+        state.tabs = vec![tab];
+        state.active_tab = 0;
+
+        assert!(state.kill_remote_pane(0, 0), "the kill is accepted");
+
+        {
+            let guard = handle.lock().unwrap();
+            assert_eq!(
+                guard.term.reconnect,
+                ReconnectState::Off,
+                "the binding is killed, not merely disconnected"
+            );
+            assert!(guard.term.exited.is_some(), "the pane has no live connection");
+            assert!(guard.term.child.is_none(), "the local attach child is gone");
+        }
+        assert_eq!(
+            state.toast.as_ref().map(|(m, _)| m.as_str()),
+            Some("killed ghostwave-prod on prod — Enter reconnects"),
+            "the pane says what happened and how to undo it"
+        );
+        let calls = ssh.wait_calls(1, std::time::Duration::from_secs(5));
+        assert_eq!(calls.len(), 1, "one ssh runs the kill: {calls:?}");
+        assert!(calls[0].1.contains("ghostd"), "it is the remote kill: {calls:?}");
+
+        // Three reconnect windows, far past any backoff: nothing may touch it.
+        let now = std::time::Instant::now();
+        for window in 1..=3 {
+            remote::reconnect_pass(
+                &config(),
+                &ready(&["prod"]),
+                std::slice::from_mut(&mut state.tabs[0]),
+                now + std::time::Duration::from_secs(60 * window),
+            );
+        }
+        let guard = handle.lock().unwrap();
+        assert_eq!(guard.term.reconnect, ReconnectState::Off, "still killed");
+        assert_eq!(guard.term.reconnect_failures, 0, "no attempt was spent");
+        assert!(guard.term.child.is_none(), "and nothing was respawned");
+        drop(guard);
+
+        assert!(
+            !remote::pending(&state.tabs),
+            "a killed pane owes the clock nothing"
+        );
+    }
+
+    #[test]
+    fn enter_after_a_kill_clears_off_with_the_explicit_command() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, ssh) = recorded_workspace();
+        let tab = connected_remote_tab("prod");
+        let handle = pane(&tab);
+        state.tabs = vec![tab];
+        state.active_tab = 0;
+        assert!(state.kill_remote_pane(0, 0));
+        state.binary_ready.insert("prod".to_string());
+
+        state.connect_remote_pane(0, 0);
+
+        let guard = handle.lock().unwrap();
+        assert_eq!(
+            guard.term.reconnect,
+            ReconnectState::Idle,
+            "the explicit connect clears the killed state"
+        );
+        assert!(guard.term.exited.is_none(), "and the pane is connected again");
+        assert!(guard.term.child.is_some(), "its command runs again");
+        assert_eq!(
+            guard.term.program.as_deref(),
+            Some("/bin/sh"),
+            "the pane keeps its stored program, not the explicit command"
+        );
+        drop(guard);
+
+        let argvs = ssh.pane_argvs();
+        let last = argvs.last().expect("the explicit connect built an argv");
+        assert_eq!(
+            last.last().map(String::as_str),
+            Some(remote::attach_cmd_explicit("ghostwave-prod").as_str()),
+            "and it is the variant that un-kills: {last:?}"
+        );
+    }
+
+    #[test]
+    fn esc_on_a_killed_pane_leaves_it_killed_and_says_nothing() {
+        let _guard = crate::ui_session::test_lock();
+        let (mut state, _ssh) = recorded_workspace();
+        let tab = connected_remote_tab("prod");
+        let handle = pane(&tab);
+        state.tabs = vec![tab];
+        state.active_tab = 0;
+        assert!(state.kill_remote_pane(0, 0));
+        let killed_toast = state.toast.clone();
+
+        state.stop_remote_reconnect();
+
+        assert_eq!(
+            handle.lock().unwrap().term.reconnect,
+            ReconnectState::Off,
+            "Esc must not downgrade a killed pane to Manual — the label would lie"
+        );
+        assert_eq!(
+            state.toast, killed_toast,
+            "and it must not claim it stopped a reconnect that was not running"
+        );
+
+        // The pane still tells the user it was killed, which is what `Off` feeds.
+        let label = crate::pane_canvas::cell_label(&handle, 1, None, false);
+        assert!(
+            label.contains("killed (Enter reconnect)"),
+            "the pane's label still says it was killed: {label:?}"
+        );
     }
 
     #[test]

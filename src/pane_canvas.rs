@@ -126,6 +126,9 @@ pub fn cell_label(
 fn remote_status(pane: &Pane) -> Option<String> {
     let remote = pane.term.remote.as_ref()?;
     match (&pane.term.reconnect, pane.term.exited.is_some()) {
+        // A killed pane is not "disconnected": it says the kill is final and that
+        // only an explicit connect brings it back.
+        (ReconnectState::Off, _) => Some(format!("ssh {} — killed (Enter reconnect)", remote.host)),
         (ReconnectState::Waiting { attempt, .. }, _) => Some(format!(
             "ssh {} — reconnecting (attempt {attempt}) — Esc to stop",
             remote.host

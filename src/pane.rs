@@ -286,6 +286,44 @@ impl Pane {
         into_pane(term)
     }
 
+    /// Drops this pane's local attach child and marks the binding killed.
+    ///
+    /// `ReconnectState::Off` is the guard that keeps every automatic path away
+    /// from the pane; the recorded exit status is only the honest status of the
+    /// child being dropped, not a guard — dropping the pty makes the reader report
+    /// EOF, and the reconnect pass reads a missing code as a failure. The pty is
+    /// dropped rather than signalled through `Pty::Child`'s own bounded
+    /// SIGHUP→SIGKILL reap, so this never blocks the UI thread.
+    pub fn kill_remote_child(&mut self) {
+        self.term.pty_rx = None;
+        self.term.pty = None;
+        self.term.child = None;
+        self.term.exited = Some("killed (remote session)".to_string());
+        self.term.last_exit_code = Some(0);
+        self.term.reconnect = ReconnectState::Off;
+        self.term.force_repaint = true;
+        self.dirty = true;
+    }
+
+    /// Reconnects a disconnected remote pane with an explicit-connect command,
+    /// then restores the pane's stored program and arguments.
+    ///
+    /// The explicit argv clears the remote tombstone, so it must never become what
+    /// the pane *is*: a later auto-reconnect would then re-run `ghostd unkill` and
+    /// resurrect a session the user killed. The stored pair is restored before the
+    /// call returns, so a session save sees the canonical command.
+    ///
+    /// False when the fork failed; the pane is then still disconnected.
+    pub fn respawn_remote_with(&mut self, program: &str, args: &[String]) -> bool {
+        let (stored_program, stored_args) = (self.term.program.clone(), self.term.args.clone());
+        self.term.program = Some(program.to_string());
+        self.term.args = args.to_vec();
+        let respawned = self.respawn_remote();
+        self.term.program = stored_program;
+        self.term.args = stored_args;
+        respawned
+    }
+
     /// Reconnects a disconnected remote pane: forks its stored command again and
     /// bridges the new pty, leaving the terminal and its history alone.
     ///

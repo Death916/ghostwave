@@ -621,8 +621,13 @@ pub fn pending(tabs: &[Tab]) -> bool {
 }
 
 /// Whether one pane owes the reconnect pass a transition.
+///
+/// A killed pane (`Off`) owes it nothing: no attempt is spent on it and it must
+/// not keep the front-end ticking, so it is excluded before the exit state is
+/// consulted at all.
 fn remote_pending_pane(pane: &crate::pane::Pane) -> bool {
     pane.term.remote.is_some()
+        && pane.term.reconnect != ReconnectState::Off
         && (pane.term.exited.is_some() || pane.term.reconnect != ReconnectState::Idle)
 }
 
@@ -653,6 +658,12 @@ pub fn reconnect_pass(
             };
             let pane = &mut *guard;
             if pane.term.remote.is_none() {
+                continue;
+            }
+            // A killed binding is final: no attempt, no Waiting transition and no
+            // respawn. Placed before the Idle→Waiting step so a kill cannot be
+            // undone by the next tick.
+            if pane.term.reconnect == ReconnectState::Off {
                 continue;
             }
             if pane.term.exited.is_some() && pane.term.reconnect == ReconnectState::Idle {
@@ -743,6 +754,8 @@ pub mod testing {
         pub scripted: Mutex<VecDeque<SshOutcome>>,
         /// Outcomes picked by command substring once `scripted` is empty.
         pub replies: Mutex<Vec<(String, SshOutcome)>>,
+        /// Every argv a pane was asked to run, in order.
+        pub pane_argvs: Mutex<Vec<Vec<String>>>,
     }
 
     impl FakeSsh {
@@ -759,6 +772,14 @@ pub mod testing {
         /// The hosts ssh would have been opened to, in order.
         pub fn hosts(&self) -> Vec<String> {
             self.calls().into_iter().map(|(host, _, _)| host).collect()
+        }
+
+        /// Every argv a pane was asked to run, in order.
+        pub fn pane_argvs(&self) -> Vec<Vec<String>> {
+            self.pane_argvs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
 
         /// Blocks until `n` calls have been recorded, returning what they were —
@@ -801,7 +822,11 @@ pub mod testing {
                 })
         }
 
-        fn pane_command(&self, _argv: &[String]) -> (String, Vec<String>) {
+        fn pane_command(&self, argv: &[String]) -> (String, Vec<String>) {
+            self.pane_argvs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(argv.to_vec());
             ("/bin/sh".to_string(), vec!["-c".to_string(), "true".to_string()])
         }
     }
