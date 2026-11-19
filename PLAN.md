@@ -2807,7 +2807,7 @@ that card lands.
 
 ## kill a durable remote session for good — bounded replay, no resurrection
 
-surface: files=12 lines=~430 new_deps=no
+surface: files=12 lines=~470 new_deps=no
 
 Stage 1 PLAN for job `t_c230fb14`. Re-verified against `wt/kill-durable-session-final`
 (`2128be3`, `= origin/master`), not against the card text. This section plans **S1 only
@@ -2825,7 +2825,7 @@ planned by its own S2 card, created from this one.
 | 5 | replay is the whole ring log, unbounded at the front end | **Confirmed**, `ghostd/src/main.rs:210-224` (whole file), `src/pty_bridge.rs:52` `fmpsc::unbounded`, `COALESCE_CAP` 256 KiB per message. S2. |
 | 6 | `cmd_kill` itself is sound | **Confirmed**, `ghostd/src/main.rs:578-626`. It is the right place to append the tombstone. |
 | 7 | `ReconnectState` is `{Idle, Waiting, Manual}` | **Confirmed**, `src/term.rs:158-167`. |
-| 8 | `RemoteConfig` unchanged | **Confirmed**, `src/config.rs:51`. This plan adds no key. |
+| 8 | `RemoteConfig` unchanged | **Confirmed**, `src/config.rs:47`. This plan adds no key. |
 
 Two things the card did not state, both load-bearing for stage 3:
 
@@ -2847,6 +2847,10 @@ Two things the card did not state, both load-bearing for stage 3:
 
 * `pub const ATTACH_KILLED: i32 = 5;` documented as *terminal*: "the session is absent
   **and** the name carries a kill tombstone; a caller must not create the session".
+* `pub const KILL_SUPERSEDED: i32 = 6;` documented as *not a failure*: "the daemon this
+  `kill` named is gone, but another daemon now owns the name — the client must not sweep
+  by pattern". Read only by `kill_cmd` (§1, `src/remote.rs`); an old daemon never returns
+  it, so the shell's behaviour against one is unchanged.
 * `pub fn killed_path(name: &str) -> PathBuf` — `state_dir().join(format!("{name}.killed"))`.
   Same `state_dir()` the socket, pidfile and log already live in, so `ghostd` and the
   app agree by construction: **the app never reads it**, it only learns the state from
@@ -2870,18 +2874,31 @@ Two things the card did not state, both load-bearing for stage 3:
      daemon-less variant `write_tombstone_none(name)` (a `None` pid renders `0`, which
      no signal path can mistake for an owner — `parse_pid` already refuses `0`). Print
      `ghostd: no live session '<name>'; it stays killed until 'ghostd unkill <name>'`
-     and exit `0`. (Changing this from 1 to 0 is safe: `kill_cmd` already runs
-     `"$BIN" kill … || true`.)
+     and exit `0`. (Changing this from 1 to 0 stays safe now that `kill_cmd` *reads*
+     the status: 0 is the sweep status, and an orphan hunt is exactly what this
+     branch wants — there is no daemon left to protect.)
   2. SIGTERM → 3 s poll → SIGKILL → poll, **unchanged**.
   3. `kill_child_group(child)`, **unchanged**.
   4. If the daemon survived: exit `1`, message unchanged, **no tombstone, no state
-     removal** (a live session must not be marked dead).
+     removal** (a live session must not be marked dead). `kill_cmd` still sweeps on
+     this status — an orphan is exactly what the sweep is for.
   5. `successor = !remove_state_if_owned(name, daemon) && read_pidfile(name).is_some()`
-     — unchanged. `if !successor { remove log; write_tombstone(name, daemon); }`.
-     The tombstone is written **after** socket, pidfile and log are gone, so at no
-     instant does a name look killable (no socket/pidfile) *and* resettable (no
-     tombstone). A successor keeps its own files and gets no tombstone.
-  6. `println!("ghostd: killed '{name}'")`.
+     — unchanged, **plus one re-read**: immediately before the tombstone write the
+     pidfile is read again, and a pidfile that is not `daemon`'s also sets
+     `successor` (a `new` can bind in the gap between the removal and the write).
+     If `successor`: **no** log removal, **no** tombstone,
+     `println!("ghostd: '{name}' was killed; another daemon now owns it")` and
+     `exit(KILL_SUPERSEDED)` — that status is what makes `kill_cmd` skip its sweep
+     (§1, `src/remote.rs`). Otherwise: remove the log, then
+     `write_tombstone(name, daemon)`.
+     **The ordering claim is weaker than the round-1 plan asserted, and this plan
+     states it instead**: between `remove_state_if_owned` and the tombstone write a
+     name is briefly neither killable (no socket/pidfile) nor blocked (no tombstone) —
+     the mandated order *creates* that instant. It is therefore **reported** (exit 6)
+     rather than assumed away, and the residual check-then-act gap after the last
+     ownership read is named in §4 and referred to stage 3, not declared closed.
+  6. `println!("ghostd: killed '{name}'")`, `exit(0)` — the status that lets the shell
+     sweep.
 * `cmd_new(name, cmd, log_cap, first_attach_secs, force)`:
   * after the name check: `if is_killed(name) && !force` → `die("session '<name>' was
     killed — 'ghostd unkill <name>' to create it again (or 'ghostd new --force')")`.
@@ -2939,12 +2956,38 @@ Two things the card did not state, both load-bearing for stage 3:
 * `reconnect_pass`: after the `remote.is_none()` continue, `if pane.term.reconnect ==
   ReconnectState::Off { continue; }` — **before** the Idle→Waiting transition, so it
   spends no attempt and never respawns.
-* `kill_cmd` gains only a doc sentence: `$BIN kill` now tombstones, so the `pkill -9`
-  sweep that follows cannot be undone by anything that recreates the session.
+* `kill_cmd`'s sweep stops being unconditional — **review finding 2**. The script keeps
+  the pidfile kill first and *reads its status*:
+
+  ```
+  BIN="$HOME/.cache/ghostwave/ghostd-$(uname -m)"; [ -x "$BIN" ] || { echo ...; exit 1; }
+  "$BIN" kill <session> 2>&1; krc=$?
+  if [ $krc -eq 6 ]; then :; else pkill -9 -f <pattern> 2>/dev/null || true; fi
+  true
+  ```
+
+  The sweep therefore runs on **every** path except a reported successor: it still runs
+  in the no-pidfile/orphan branch (status 0 + tombstone) and on the survived-SIGKILL
+  path (status 1), and an old daemon never returns 6, so its behaviour is unchanged.
+  Doc comment states why the status matters: the anchored sweep exists for *a daemon
+  whose pidfile is already gone* (`kill_pattern`, `remote.rs:217-229`), while
+  `daemonize` is fork+setsid+fork with **no exec** (`ghostd/src/lib.rs:431-454`), so a
+  freshly bound successor's command line still matches the pattern — sweeping it would
+  SIGKILL a session the user just started and leave its `.sock`/`.pid` behind with no
+  tombstone.
 * Tests: the script-shape tests (`:~1150-1250`) gain a `5` case (exit 0, no `new`), a
   "1 and 3 still run `new`" assertion, a "4 still exits 0" assertion, and a pair
   asserting `attach_cmd` contains **no** `unkill` while `attach_cmd_explicit` runs
   `unkill` **before** `attach` (index comparison, not just containment).
+  **The existing pattern test `the_kill_command_escalates_and_anchors_its_orphan_sweep`
+  (`remote.rs:941-960`) changes with the script**: its "contains `pkill -9 -f <pattern>`"
+  assertion becomes an assertion on the *shape* — `krc=$?` and `[ $krc -eq 6 ]` appear
+  before the `pkill`, and the sweep sits in the `else` arm — because containment alone
+  would pass on a sweep that is no longer conditional. **New test
+  `a_successor_report_skips_the_sweep`**: run the generated script with a stub `$BIN`
+  that exits 6, with a stub `pkill` earlier on `PATH` that appends its argv to a file →
+  the file is empty; with `$BIN` exiting 0 and again with 1 → `pkill` was invoked with
+  the anchored pattern. That is the pin for "a successor is never shot".
 
 **`src/term.rs`** — **D1: a new `ReconnectState::Off` variant** (not a side flag: the
 enum is matched exhaustively in four places, so a variant makes every site decide, and
@@ -2963,9 +3006,16 @@ No other change in this file.
 * `pub fn kill_remote_child(&mut self)` — `pty_rx = None; pty = None; child = None;`
   (`Pty::Child::drop` is the bounded SIGHUP→SIGKILL reap at `src/pty.rs:264`, so this
   cannot hang the UI thread), then `exited = Some("killed (remote session)")`,
-  `last_exit_code = Some(0)`, `reconnect = ReconnectState::Off`, `dirty = true`. The
-  `Some(0)` is belt-and-braces: even if something cleared `Off`, `reconnect_pass` never
-  retries a zero exit.
+  `last_exit_code = Some(0)`, `reconnect = ReconnectState::Off`, `dirty = true`.
+  **`Some(0)` is not a guard, and no test may lean on it** (review finding 4): dropping
+  `pty_rx` makes the reader fail, the bridge posts `BridgeMsg::Exited("pty closed")`
+  (`pty_bridge.rs:96`) → `Message::Exited` (`main.rs:264`) → `pane.exited()` →
+  `child.poll_reap()` with `child == None` → `None` (`pane.rs:349-352`), so
+  `reconnect_pass` reads `unwrap_or(255)` (`remote.rs:611`) on the very next tick and
+  would retry. It is set because it is the honest status of the child we just dropped,
+  not because it stops anything. **`Off` is the only real guard** — and it holds,
+  because nothing in production writes `Idle` except `start_child` (`term.rs:668`).
+  Tests assert `Off` plus "no reconnect attempt spent", never `last_exit_code`.
 * `pub fn respawn_remote_with(&mut self, program: &str, args: &[String]) -> bool` —
   swaps `program`/`args`, calls `respawn_remote()`, restores the canonical
   `program`/`args` **before returning**, so the explicit argv can never reach
@@ -2986,6 +3036,15 @@ No other change in this file.
   The pane stays as a killed pane; only `Enter` revives it.
 * `kill_active_remote_pane()` keeps closing the pane after a successful spawn (D4
   allows it) and its toast says so.
+* `stop_remote_reconnect()` gains **one guard: `if reconnect == Off { return; }`, no
+  toast** — **review finding 5, decided here**: `Esc` on a killed pane is a **no-op,
+  not a downgrade**. Left as it is, `remote_dead_key` (`input.rs:116-130`, which keeps
+  `Esc`) would route it here and this function would silently write `Manual`
+  (`app.rs:1359-1364`), dropping the `pane_canvas` "killed (Enter reconnect)" arm
+  (`pane_canvas.rs:126-139`) and falsifying `Off`'s own doc ("only an explicit connect
+  resets it to `Idle`"). No resurrection either way (`Manual` never retries), but the
+  pane would stop telling the user it was killed. The guard sits in this function
+  rather than in the key table so no future caller can reintroduce the downgrade.
 * `connect_remote_pane(tab, pane)`: clears `Off` and uses the explicit argv —
   `let argv = remote::attach_argv_explicit(&host, &session); let (program, args) =
   self.ssh.pane_command(&argv); guard.respawn_remote_with(&program, &args)` (via the
@@ -2996,12 +3055,19 @@ No other change in this file.
 * Tests: killing a **connected** remote pane sets `Off`, `exited`, drops the child, and
   spends no reconnect attempt across three `reconnect_pass` calls; `Enter` after a kill
   clears `Off` and spawns the explicit command (assert the recorded argv carries
-  `attach_cmd_explicit`); a killed pane leaves `remote::pending()` false.
+  `attach_cmd_explicit`); a killed pane leaves `remote::pending()` false; and
+  **`stop_remote_reconnect` on a killed pane leaves `reconnect == Off`** (with the
+  canvas still offering "killed (Enter reconnect)"), while on a `Waiting` pane it still
+  drops to `Manual` — the pin for finding 5.
 
-**`src/input.rs`** — D5. `remote_dead_key` keeps `k`/`Enter`/`Esc` exactly as they are
-(the dead-pane table is not where the bug was). Add one test: with a *connected* remote
-pane, `Ctrl+Shift+K` kills it (via the recording ssh double) — i.e. the kill no longer
-needs the pane to be dead or the palette to be open.
+**`src/input.rs`** — D5. `remote_dead_key` keeps `k`/`Enter` exactly as they are, and keeps
+`Esc` too — the `Off` guard in `stop_remote_reconnect` (§1, `src/app.rs`) is what makes `Esc`
+a no-op on a killed pane. Add one test: with a *connected* remote pane, `Ctrl+Shift+K` kills
+it (via the recording ssh double) — i.e. the kill no longer needs the pane to be dead or the
+palette to be open. And state the known-and-accepted routing: on a **dead** pane
+`remote_dead_key` returns `true` for **every** key (`input.rs:51`, before `keymap::handle`),
+so `Ctrl+Shift+K` is swallowed there too — that is why `k` stays in the dead-pane table, and
+with the chord working on a live pane **D5 is still met**.
 
 **`src/keymap.rs`** — D5's dedicated chord. `Ctrl+Shift+K` is unbound on the branch
 (`ctrl(k,m,K)` → `ClearTerminal` requires *no* shift, so
@@ -3024,23 +3090,27 @@ so a killed pane says so instead of reusing the "disconnected" line.
 
 ### 2. How it is verified
 
-From `/home/death916/code/ghostwave/.worktrees/t_04c36f8a`, toolchain through the repo's
-own `shell.nix`, every compile through the build gate:
+**Run everything from the CODE card's own worktree** — `$HERMES_KANBAN_WORKSPACE`, with
+`wt/kill-durable-session-final` checked out — and never from another card's worktree or a
+`/var/build/.../t_<someone-else>` tree: stage 3's changes exist only in its own checkout, so
+a gate run elsewhere tests a tree that has none of them. Use the repo's own `shell.nix`, and
+**`CARGO_TARGET_DIR=/var/build/ghostwave-<your card id>`** (per card, never shared, never the
+worktree), with every compile through the build gate:
 
 ```
-CARGO_TARGET_DIR=/var/build/ghostwave-t_04c36f8a \
+CARGO_TARGET_DIR=/var/build/ghostwave-<your card id> \
   nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo test"
 # expected: all root-crate unit+integration tests pass, including the new
 # src/remote.rs script tests, src/keymap.rs, src/app.rs and src/input.rs ones.
 
-CARGO_TARGET_DIR=/var/build/ghostwave-t_04c36f8a \
+CARGO_TARGET_DIR=/var/build/ghostwave-<your card id> \
   nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo test --manifest-path ghostd/Cargo.toml"
-# expected: ghostd lib unit tests (incl. the 1 new tombstone test) and all
-# ghostd/tests/lifecycle.rs tests pass, incl. the 4 new + the rewritten kill test.
+# expected: ghostd lib unit tests (incl. the new tombstone test) and all
+# ghostd/tests/lifecycle.rs tests pass, incl. the new ones and the rewritten kill test.
 
-CARGO_TARGET_DIR=/var/build/ghostwave-t_04c36f8a \
+CARGO_TARGET_DIR=/var/build/ghostwave-<your card id> \
   nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo clippy --all-targets"
-CARGO_TARGET_DIR=/var/build/ghostwave-t_04c36f8a \
+CARGO_TARGET_DIR=/var/build/ghostwave-<your card id> \
   nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo clippy --all-targets --manifest-path ghostd/Cargo.toml"
 # expected: no warnings introduced by this diff.
 ```
@@ -3060,13 +3130,16 @@ Targeted runs, for fast iteration and for the card's evidence:
 daemon binary driven directly, in a throwaway `HOME` so the real cache and
 `~/.local/share/ghostwave` are never touched):
 
-```sh
-H=/var/build/ghostwave-t_04c36f8a/manual-home
+```bash
+H=/var/build/ghostwave-<your card id>/manual-home
+# state_dir() honours GHOSTWAVE_STATE_DIR (ghostd/src/lib.rs:262-269) — left set, the
+# ~/.local/share/ghostwave assertion below would be about a directory nothing wrote.
+unset GHOSTWAVE_STATE_DIR
 rm -rf "$H"; mkdir -p "$H/.cache/ghostwave"
-cp /var/build/ghostwave-t_04c36f8a/debug/ghostd "$H/.cache/ghostwave/ghostd-aarch64"
+cp /var/build/ghostwave-<your card id>/debug/ghostd "$H/.cache/ghostwave/ghostd-aarch64"
 export HOME=$H; BIN=$H/.cache/ghostwave/ghostd-aarch64
 $BIN new demo;                        # exit 0
-$BIN attach demo & sleep 1; kill %1   # (a "client" that drops, as ssh does)
+$BIN attach demo & sleep 1; kill %1   # bash job spec — run this block under bash, not sh
 $BIN kill demo                        # exit 0, "ghostd: killed 'demo'"
 ls "$H/.local/share/ghostwave"        # demo.killed present; no .sock/.pid/.log
 for i in 1 2 3; do                    # ≥2 reconnect windows
@@ -3077,6 +3150,11 @@ done
 $BIN new demo;   echo "new rc=$?"     # non-zero, stderr names unkill
 $BIN new --force demo; echo "force rc=$?"  # 0 — the explicit override works
 $BIN kill demo; $BIN unkill demo; $BIN new demo   # 0 — the explicit-connect path works
+
+# the successor case (finding 2) is NOT hand-reproducible: it needs a `new` to bind in the
+# gap between `kill`'s state removal and its tombstone write. It is covered by the new
+# `a_successor_report_skips_the_sweep` test; a manual probe would be racy by construction and
+# is not claimed here.
 ```
 The **only** half not exercised on orac is an iced window over a real ssh connection;
 the pane-level behaviour is covered by the unit tests through the `SshRunner` seam, and
@@ -3100,14 +3178,27 @@ Smallest honest scope: the eleven source files above, plus `PROGRESS.md`. Explic
 * No change to `ghostd kill`'s signal ladder or to `recover_session`.
 * No upstream touch, no `master` push, no PR, no runtime cap.
 
+**And the honest boundary above all of them — S1 is source-only (review finding 1).** Every
+`ghostd/` change in §1 does nothing on any host until a **separate `NEEDS-VULCAN:` card**
+rebuilds **both** embedded assets (`scripts/build-ghostd.sh both`) and **then** moves **both**
+manifests to `0.1.4` — in that order, never the reverse (§5). `assets/` is already stale:
+last built at `6ebd0cb` (2026-08-19) while `ghostd/src/` moved on at `1bf02ea`, `d57b0de`,
+`6d82359` and `72e9695` with no bump; and `upload_ghostd` **skips the upload** whenever the
+host's `$BIN --version` already equals the app's (`version_check`, `remote.rs:467-472`; the
+skip at `:517-520`). So today every host keeps its 0.1.3 daemon, `attach` returns 1 and its
+`new` recreates — the reported symptom persists there. S1 therefore makes **no `Cargo.toml`
+and no `assets/` edit**: the app half (kill reachable, `Off`, `5 → exit 0`, conditional sweep)
+is real on orac as soon as it lands, the daemon half (tombstone, `unkill`, `--force`, `6`) is
+not — and the stage-3 summary must say so in exactly those words.
+
 ### 4. Risks and unknowns, each with the check that resolves it
 
 | Risk | Check that settles it |
 |---|---|
 | **Where the tombstone lives.** If the app ever needed to read it, two clients could disagree on `state_dir`. | It is only ever read by `ghostd`, from the same `state_dir()` as the socket/pidfile/log, and the app learns the state solely from exit `5`. Check: `grep -rn "killed_path\|is_killed" src/` must find **no** hit outside `ghostd/`. |
-| **An old daemon without `ATTACH_KILLED`.** It returns `1`, which still means "create me". | `attach_cmd` only ever runs the cached binary after a version match against this app (`remote.rs:204-206`), so attach and `new` are always the same, new, binary; and even in the old-daemon case `new` refuses a tombstoned name, so the sequence `1 → new (refused) → exit 1` cannot resurrect — it only burns reconnect attempts. Check: a lifecycle test that asserts `new` refuses **without** consulting `attach` at all. |
-| **Tombstone written before the state is gone** would let a window exist where neither the kill nor the recreate is blocked. | Order is fixed in §1 (kill → verify death → remove state → remove log → tombstone). Check: the lifecycle test asserts `.killed` exists **and** `.sock`/`.pid`/`.log` do not, after one `kill`. |
-| **`pkill -9 -f` sweeping a successor.** `kill_cmd` kills then sweeps by pattern. | The daemon is tombstoned by the time the sweep runs, and a successor can only appear via `new --force`/`unkill` inside that millisecond window. Check: `kill_cmd`'s ordering is asserted by the existing pattern test; the window is documented rather than closed (closing it needs a lock file, which is out of scope). |
+| **An old daemon without `ATTACH_KILLED`.** It returns `1`, which still means "create me". | **Two old daemons, and only one is covered by S1.** (a) A daemon from this tree's *previous* build is caught by `new`'s tombstone refusal, so `1 → new (refused) → exit 1` cannot resurrect — it only burns reconnect attempts. (b) A **stale same-version** daemon — what every host actually runs today — is **not** covered: `version_check` (`remote.rs:467-472`) passes because both crates are still `0.1.3`, so `upload_ghostd` skips, `attach` runs against a daemon with no tombstone code, returns 1, and the script's `new` recreates the session. **The round-1 wording ("attach and `new` are always the same, new, binary") was wrong** and is replaced by §3's boundary: S1 changes no host's behaviour until the `NEEDS-VULCAN:` asset rebuild at 0.1.4. Check: a lifecycle test that asserts `new` refuses **without** consulting `attach` at all. |
+| **Tombstone written before the state is gone** would let a window exist where neither the kill nor the recreate is blocked. | The window exists and **S1 does not claim otherwise**: the order is fixed (kill → verify death → remove state → remove log → tombstone), so between the removal and the write a name is briefly neither killable nor blocked. What S1 changes is that a `new` landing in it is **detected** (pidfile re-read → exit `6` → no sweep → no tombstone, §1) rather than shot and tombstoned. Check: the lifecycle test asserts `.killed` exists **and** `.sock`/`.pid`/`.log` do not after one `kill`; the detection has its own test. |
+| **`pkill -9 -f` sweeping a successor.** `kill_cmd` kills then sweeps by pattern. | **The window is real today and wide** (review finding 2): `cmd_kill` removes state → removes log → writes the tombstone, so a concurrent `new`/`attach_cmd` landing in that gap sees `NoSession`, binds, and `daemonize` (fork+setsid+fork, **no exec**, `ghostd/src/lib.rs:431-454`) leaves an argv that still matches `kill_pattern` (`remote.rs:227-229`) — the following `pkill -9` SIGKILLs the session the user just started, leaving `.sock`/`.pid` with no tombstone. S1 makes the sweep **conditional**: `cmd_kill` re-reads the pidfile and exits `6` when another daemon owns the name, and `kill_cmd` skips `pkill` on `6` only (§1). That closes the reported path; it does **not** close the check-then-act gap between the last ownership read and the remote `pkill` (~one ssh round-trip), and this plan says so explicitly rather than asserting it closed: fully closing it needs a lock file, which is out of S1's scope and **referred to stage 3** — stage 3 must not describe the window as closed either. Check: the updated `the_kill_command_escalates_and_anchors_its_orphan_sweep` (`remote.rs:941-960`) plus `a_successor_report_skips_the_sweep`. |
 | **`--force` short-circuiting the probe**, i.e. clearing a live session's name. | Clear happens after `bind_listener` succeeds, so a healthy/wedged daemon is still handled first. Check: lifecycle test `new --force` against a **live** session exits non-zero with "already exists", and no tombstone is created. |
 | **`Off` making the UI stop ticking while a pane still needs the user.** | `remote_pending_pane` excludes `Off`, so no busy-spin; the pane's own `exited` label and `Enter` handler are not tick-driven. Check: an app test asserting `remote::pending()` is false with a killed pane, and that `Enter` (a key event, not a tick) still revives it. |
 | **The explicit argv leaking into the saved session**, which would make every later auto-reconnect run `unkill`. | `respawn_remote_with` restores `program`/`args` before returning, and `session::save` reads them afterwards. Check: a test that respawns explicitly and then asserts the pane's `program`/`args` equal `remote::attach_argv(...)`; plus the existing session round-trip test stays green. |
@@ -3115,20 +3206,23 @@ Smallest honest scope: the eleven source files above, plus `PROGRESS.md`. Explic
 
 ### 5. What stage 3 (CODE) must do, in order
 
-1. `ghostd/src/lib.rs`: `ATTACH_KILLED`, `killed_path`/`is_killed`/`write_tombstone`
+1. `ghostd/src/lib.rs`: `ATTACH_KILLED`, `KILL_SUPERSEDED`, `killed_path`/`is_killed`/`write_tombstone`
    (+ the no-daemon variant)/`clear_tombstone`, and the one unit test.
-2. `ghostd/src/main.rs`: `cmd_kill` ordering, `cmd_new --force` refusal/clear,
-   `cmd_attach` exit 5, `cmd_unkill`, usage and argument parsing.
+2. `ghostd/src/main.rs`: `cmd_kill` ordering **with the successor report (`6`) and the
+   pidfile re-read before the tombstone**, `cmd_new --force` refusal/clear, `cmd_attach`
+   exit 5, `cmd_unkill`, usage and argument parsing.
 3. `ghostd/tests/lifecycle.rs`: the four new tests and the rewrite of
    `a_kill_leaves_no_state_behind`; run `cargo test --manifest-path ghostd/Cargo.toml`
    through the gate. **This is the point where "a kill is final" is proved** — do not
    go further on a red daemon.
 4. `src/remote.rs`: `attach_script`/`attach_cmd_explicit`/`attach_argv_explicit`, the
    `5 → exit 0` line, the `Off` exclusions in `remote_pending_pane` and `reconnect_pass`,
-   and the script tests.
+   the **conditional sweep in `kill_cmd`**, the updated pattern test and
+   `a_successor_report_skips_the_sweep`.
 5. `src/term.rs` (`Off`), `src/pane.rs` (`kill_remote_child`,
    `respawn_remote_with`), `src/app.rs` (`kill_remote_pane`, `connect_remote_pane`,
-   `respawn_waiting`), `src/pane_canvas.rs` (`Off` label).
+   `respawn_waiting`, the `Off` guard in `stop_remote_reconnect`), `src/pane_canvas.rs`
+   (`Off` label).
 6. `src/keymap.rs` (the chord) + `src/palette.rs` (the label) + `src/input.rs` (the
    connected-pane kill test) — D5.
 7. Full `cargo test` (root and `ghostd`), `clippy --all-targets` both, then the manual
@@ -3144,12 +3238,27 @@ alone end the resurrection (a killed session's `attach` returns 5 → the script
 `reconnect_pass` sees a clean exit → `Manual`), and D1/D4/D5 are then a second sitting on
 the same branch. Ship what is green, never a half-wired `Off`.
 
+**S1 is source-only — no host behaves differently when this card is green (review finding
+1).** The daemon half (every `ghostd/` change in §1) is inert on every host until the
+**separate `NEEDS-VULCAN:` card** does two things **in this order**: `scripts/build-ghostd.sh
+both` rebuilds `assets/ghostd-x86_64` **and** `assets/ghostd-aarch64`, then `Cargo.toml:3`
+and `ghostd/Cargo.toml:3` move to `0.1.4` in one commit, and the app is rebuilt to embed
+them. Reversing that order bricks every durable pane with "ghostd missing/stale — reconnect
+to upload" (§3). The assets are **already stale today** — `assets/` last built at `6ebd0cb`
+(2026-08-19) while `ghostd/src/` moved at `1bf02ea`, `d57b0de`, `6d82359` and `72e9695` with
+no bump — and `upload_ghostd` skips the upload whenever the host's `--version` already
+matches the app's (`version_check` `remote.rs:467-472`, the skip at `:517-520`), which is
+the state every host is in. So **this card edits neither `Cargo.toml` nor `assets/`**; step
+9 exists to create that card, and the stage-3 summary must state plainly that the app half
+is live on orac while the daemon half — tombstone, `unkill`, `--force`, exit `6` — reaches a
+host only through it.
+
 ### 6. The bite-size split
 
 The manager's sizing is adopted, with one honest note.
 
 * **S1 = D1–D5 (this relay's CODE card, `t_129e258a`)** — the daemon protocol change,
-  the pane state, the kill path and the input routing. Twelve files, ~430 lines
+  the pane state, the kill path and the input routing. Twelve files, ~470 lines
   including tests, no new dependency, no new config, no UI redesign. **One sitting, at
   the upper bound.** The internal seam, if a sitting has to be split, is
   *step 1–3* (tombstone + exit code + script, i.e. *a kill is final*) then
@@ -3167,7 +3276,8 @@ The manager's sizing is adopted, with one honest note.
    silently reset to `Idle`?
 2. **Is the tombstone ordering right** — is there any window in `cmd_kill` or `cmd_new`
    where a name is neither killable nor blocked, and is `--force` genuinely unable to
-   preempt a live daemon?
+   preempt a live daemon? (§1 answers the first part honestly: a brief window exists; it is
+   *detected* via the pidfile re-read and exit `6`, not assumed away.)
 3. **Is the explicit connect race-free** — does `attach_cmd_explicit` keep the
    `unkill` *after* the version check and *before* `attach`, and can the explicit argv
    reach the session file?
