@@ -832,7 +832,7 @@ pub fn default_items(themes: &[&str]) -> Vec<PaletteItem> {
         PaletteItem::new("Edit Scrollback in Editor", "Terminal", Some("Ctrl+S E"), EditScrollback),
         PaletteItem::new("Session Manager", "Session", Some("Ctrl+O W"), SessionManager),
         PaletteItem::new("Detach Session", "Session", Some("Ctrl+O D"), Detach),
-        PaletteItem::new("Kill Remote Session", "Session", None, KillRemoteSession),
+        PaletteItem::new("Kill Remote Session", "Session", Some("Ctrl+Shift+K"), KillRemoteSession),
         PaletteItem::new("Command Palette", "View", Some("Ctrl+Shift+P"), OpenCommandBar),
         PaletteItem::new("Toggle Scratchpad Drawer", "View", Some("F12"), ToggleScratchpad),
         PaletteItem::new(

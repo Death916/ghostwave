@@ -2335,18 +2335,29 @@ mod tests {
 
         assert_eq!(
             toast(&s),
-            format!("killing remote session ghostwave-{TEST_HOST} on {TEST_HOST}")
+            format!(
+                "killed ghostwave-{TEST_HOST} on {TEST_HOST} — Enter reconnects"
+            ),
+            "the toast says the kill was sent and how to undo it"
         );
         assert!(
             handle.lock().unwrap().remote_disconnected(),
-            "killing the remote session leaves the local pane as it was"
+            "the pane stays, as a dead one, so Enter can revive it"
+        );
+        assert_eq!(
+            handle.lock().unwrap().term.reconnect,
+            ReconnectState::Off,
+            "and nothing automatic may reconnect it"
         );
         let calls = ssh.wait_calls(1, std::time::Duration::from_secs(5));
         assert_eq!(calls.len(), 1, "the kill is exactly one ssh command: {calls:?}");
         assert_eq!(calls[0].0, TEST_HOST, "it goes to the pane's host");
         assert_eq!(calls[0].2, 0, "the kill streams nothing on stdin");
+        let quote = char::from(34);
         assert!(
-            calls[0].1.contains(&format!("kill \"ghostwave-{TEST_HOST}\"")),
+            calls[0]
+                .1
+                .contains(&format!("kill {quote}ghostwave-{TEST_HOST}{quote}")),
             "the daemon is killed by its own pidfile: {:?}",
             calls[0].1
         );
@@ -2357,6 +2368,60 @@ mod tests {
                 .contains(&format!("pkill -9 -f {}", crate::remote::sweep_pattern(&session))),
             "and the orphan sweep is anchored to that one session: {:?}",
             calls[0].1
+        );
+    }
+
+    /// D5: the kill does not need the pane to be dead, and it does not need the
+    /// palette — whose key event is exactly what queues behind a flood.
+    #[test]
+    fn ctrl_shift_k_kills_a_connected_remote_pane() {
+        let _guard = crate::ui_session::test_lock();
+        let mut s = state();
+        let ssh = record_ssh(&mut s);
+        let pane = crate::pane::Pane::spawn_program(
+            80,
+            24,
+            s.cell,
+            s.config.scrollback,
+            s.config.max_log_mb * 1024 * 1024,
+            Some("/bin/sh"),
+            &["-c", "cat"],
+            None,
+            Some(RemoteSpec {
+                host: TEST_HOST.to_string(),
+                session: crate::remote::remote_session(TEST_HOST),
+            }),
+        )
+        .expect("a connected remote pane");
+        let id = pane.id;
+        let handle = std::sync::Arc::new(std::sync::Mutex::new(pane));
+        let tab = &mut s.tabs[s.active_tab];
+        tab.panes = vec![Some(PaneEntry::Term(handle.clone()))];
+        tab.grid = iced::widget::pane_grid::State::new(GridPane::single(id)).0;
+        tab.active = 0;
+
+        press(&mut s, Key::K, Mods::CTRL | Mods::SHIFT);
+
+        let calls = ssh.wait_calls(1, std::time::Duration::from_secs(5));
+        assert_eq!(calls.len(), 1, "the chord killed it over one ssh: {calls:?}");
+        assert_eq!(calls[0].0, TEST_HOST, "to the pane's host");
+        let quote = char::from(34);
+        assert!(
+            calls[0]
+                .1
+                .contains(&format!("kill {quote}ghostwave-{TEST_HOST}{quote}")),
+            "and it is the daemon kill: {:?}",
+            calls[0].1
+        );
+        assert_eq!(
+            handle.lock().unwrap().term.reconnect,
+            ReconnectState::Off,
+            "the pane is killed, not merely disconnected"
+        );
+        assert!(
+            toast(&s).starts_with("killed remote session ghostwave-"),
+            "and it says so: {:?}",
+            toast(&s)
         );
     }
 

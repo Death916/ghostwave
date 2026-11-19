@@ -246,6 +246,9 @@ pub fn global_binds(k: Key, m: Mods) -> Option<Action> {
         _ if ctrl(k, m, W) => Action::ClosePane,
         _ if ctrl_shift(k, m, T) => Action::NewTab,
         _ if ctrl(k, m, M) => Action::ToggleZoom,
+        // The kill must be reachable from a live, flooding pane — not only from
+        // the palette, whose key event would queue behind the output.
+        _ if ctrl_shift(k, m, K) => Action::KillRemoteSession,
         _ if ctrl(k, m, K) => Action::ClearTerminal,
         _ if plain(k, m, F2) => Action::RenameTab,
         _ if ctrl(k, m, BracketLeft) => Action::PrevTab,
@@ -611,6 +614,21 @@ mod tests {
         assert!(matches!(global_binds(Key::C, Mods::CTRL | Mods::SHIFT), Some(Action::Copy)));
         assert!(matches!(global_binds(Key::V, Mods::CTRL | Mods::SHIFT), Some(Action::Paste)));
         assert_eq!(global_binds(Key::A, Mods::empty()), None);
+    }
+
+    #[test]
+    fn ctrl_shift_k_kills_a_remote_session_and_ctrl_k_still_clears() {
+        assert!(
+            matches!(
+                global_binds(Key::K, Mods::CTRL | Mods::SHIFT),
+                Some(Action::KillRemoteSession)
+            ),
+            "the kill must not need the palette, which a flood delays"
+        );
+        assert!(
+            matches!(global_binds(Key::K, Mods::CTRL), Some(Action::ClearTerminal)),
+            "the unshifted chord keeps its meaning"
+        );
     }
 
     #[test]
