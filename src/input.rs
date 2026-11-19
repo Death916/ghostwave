@@ -2378,27 +2378,17 @@ mod tests {
         let _guard = crate::ui_session::test_lock();
         let mut s = state();
         let ssh = record_ssh(&mut s);
-        let pane = crate::pane::Pane::spawn_program(
-            80,
-            24,
-            s.cell,
-            s.config.scrollback,
-            s.config.max_log_mb * 1024 * 1024,
-            Some("/bin/sh"),
-            &["-c", "cat"],
-            None,
-            Some(RemoteSpec {
-                host: TEST_HOST.to_string(),
-                session: crate::remote::remote_session(TEST_HOST),
-            }),
-        )
-        .expect("a connected remote pane");
-        let id = pane.id;
-        let handle = std::sync::Arc::new(std::sync::Mutex::new(pane));
-        let tab = &mut s.tabs[s.active_tab];
-        tab.panes = vec![Some(PaneEntry::Term(handle.clone()))];
-        tab.grid = iced::widget::pane_grid::State::new(GridPane::single(id)).0;
-        tab.active = 0;
+        let handle = install_disconnected_remote(&mut s, "/bin/sh", &["-c", "cat"]);
+        handle
+            .lock()
+            .unwrap()
+            .term
+            .spawn_child()
+            .expect("the pane is connected");
+        assert!(
+            !s.remote_pane_disconnected(),
+            "the pane is live, so the dead-pane key table does not run"
+        );
 
         press(&mut s, Key::K, Mods::CTRL | Mods::SHIFT);
 
