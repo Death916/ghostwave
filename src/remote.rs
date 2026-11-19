@@ -168,12 +168,23 @@ pub fn ssh_session(host: &str) -> String {
 /// The destination is one argv element and nothing more — the local exec has no
 /// shell — and the command is [`attach_cmd`], which carries no host text.
 pub fn attach_argv(host: &str, session: &str) -> Vec<String> {
+    attach_argv_with(host, &attach_cmd(session))
+}
+
+/// [`attach_argv`] for an **explicit** connect: the user asked for this pane
+/// (`Enter`, `ds <host>`), so the script clears the session's kill tombstone
+/// first. The only path in the app that may un-kill anything.
+pub fn attach_argv_explicit(host: &str, session: &str) -> Vec<String> {
+    attach_argv_with(host, &attach_cmd_explicit(session))
+}
+
+fn attach_argv_with(host: &str, command: &str) -> Vec<String> {
     vec![
         "-t".to_string(),
         "-o".to_string(),
         format!("ConnectTimeout={PANE_CONNECT_TIMEOUT}"),
         host.to_string(),
-        attach_cmd(session),
+        command.to_string(),
     ]
 }
 
@@ -185,9 +196,10 @@ pub fn attach_argv(host: &str, session: &str) -> Vec<String> {
 /// session is busy elsewhere", `3` is "the daemon is wedged", so both are
 /// followed by `new` — whose own probe refuses a session that is merely in use,
 /// which is why busy needs no branch of its own here and gets none. `4` is "the
-/// session ended", reported to the pane as a clean exit: the reconnect pass only
-/// retries a non-zero status, so a killed session is not recreated, and `Enter`
-/// reconnects it by hand. No other status creates anything.
+/// session ended" and `5` is "the session was killed": both are reported to the
+/// pane as a clean exit. The reconnect pass only retries a non-zero status, so a
+/// killed session is not recreated, and `Enter` reconnects it by hand. No other
+/// status creates anything.
 ///
 /// `exec` is deliberately absent: the second attach goes through the same
 /// translation, or a session that ends right after being created still reports 4
@@ -199,15 +211,33 @@ pub fn attach_argv(host: &str, session: &str) -> Vec<String> {
 /// which is what makes a quote-bearing host harmless here. The script itself is
 /// one single-quoted word ([`sq`]), so a name carrying a `'` cannot end it.
 pub fn attach_cmd(session: &str) -> String {
+    attach_script(session, false)
+}
+
+/// [`attach_cmd`] for an explicit connect: `ghostd unkill` runs after the version
+/// check and before the attach, so a stale binary cannot fake an un-kill, and it
+/// is the only variant that clears a tombstone.
+pub fn attach_cmd_explicit(session: &str) -> String {
+    attach_script(session, true)
+}
+
+fn attach_script(session: &str, explicit: bool) -> String {
     let session = dquoted(session);
+    // Only an explicit connect may un-kill: every automatic path runs
+    // `attach_cmd`, which never mentions unkill at all.
+    let unkill = if explicit {
+        format!("\"$BIN\" unkill {session} >/dev/null 2>&1 || true; ")
+    } else {
+        String::new()
+    };
     let script = format!(
         "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
          if [ ! -x \"$BIN\" ] || [ \"$($BIN --version 2>/dev/null)\" != \"ghostd {ver}\" ]; then \
          echo \"ghostd missing/stale — reconnect to upload\"; exit 1; fi; \
-         \"$BIN\" attach {session} 2>/dev/null; rc=$?; \
+         {unkill}\"$BIN\" attach {session} 2>/dev/null; rc=$?; \
          if [ $rc -eq 1 ] || [ $rc -eq 3 ]; then \
          if \"$BIN\" new {session} >/dev/null 2>&1; then \"$BIN\" attach {session} 2>/dev/null; rc=$?; fi; fi; \
-         if [ $rc -eq 4 ]; then exit 0; fi; \
+         if [ $rc -eq 4 ] || [ $rc -eq 5 ]; then exit 0; fi; \
          exit $rc",
         ver = env!("CARGO_PKG_VERSION")
     );
@@ -244,14 +274,26 @@ pub fn sweep_pattern(session: &str) -> String {
 /// Runs on its own ssh connection, so it works when the pane is dead or the
 /// daemon is wedged: the daemon escalates TERM → KILL for itself and the
 /// session's process group off its own pidfile, and the anchored `pkill` is the
-/// last resort for a daemon whose pidfile is already gone. The script is one
-/// single-quoted word ([`sq`]), so a session name carrying a `'` cannot end it.
+/// last resort for a daemon whose pidfile is already gone.
+///
+/// The sweep is skipped when the daemon reports exit status 6 (ghostd's
+/// `KILL_SUPERSEDED`): that
+/// status means another daemon now owns the name, and `daemonize` is
+/// fork+setsid+fork with no exec, so the successor's command line still matches
+/// the pattern. Sweeping it would SIGKILL the session the user just started and
+/// leave its socket and pidfile behind with no tombstone. Every other status —
+/// 0 (killed and tombstoned), 1 (survived SIGKILL) — still sweeps, because an
+/// orphan is exactly what the sweep is for. A daemon that predates the status
+/// never returns 6, so its behaviour is unchanged.
+///
+/// The script is one single-quoted word ([`sq`]), so a session name carrying a
+/// `'` cannot end it.
 pub fn kill_cmd(session: &str) -> String {
     let script = format!(
         "BIN=\"$HOME/.cache/ghostwave/ghostd-$(uname -m)\"; \
          if [ ! -x \"$BIN\" ]; then echo \"no ghostd binary on this host\"; exit 1; fi; \
-         \"$BIN\" kill {session} 2>&1 || true; \
-         pkill -9 -f {pattern} 2>/dev/null || true; true",
+         \"$BIN\" kill {session} 2>&1; krc=$?; \
+         if [ $krc -eq 6 ]; then :; else pkill -9 -f {pattern} 2>/dev/null || true; fi; true",
         session = dquoted(session),
         pattern = sweep_pattern(session),
     );
@@ -913,8 +955,12 @@ mod tests {
             "only a missing or wedged session is created: {cmd}"
         );
         assert!(
-            cmd.contains("if [ $rc -eq 4 ]; then exit 0; fi"),
-            "an ended session is a clean exit, so the pane does not recreate it: {cmd}"
+            cmd.contains("if [ $rc -eq 4 ] || [ $rc -eq 5 ]; then exit 0; fi"),
+            "an ended or killed session is a clean exit, so the pane does not recreate it: {cmd}"
+        );
+        assert!(
+            !cmd.contains("unkill"),
+            "an automatic attach never un-kills a session the user killed: {cmd}"
         );
         assert!(
             !cmd.contains("exec ") && !cmd.contains("|| {"),
@@ -938,24 +984,36 @@ mod tests {
     }
 
     #[test]
-    fn the_kill_command_escalates_and_anchors_its_orphan_sweep() {
+    fn the_kill_command_skips_its_orphan_sweep_only_for_a_reported_successor() {
         let cmd = kill_cmd("ghostwave-prod");
         assert!(cmd.starts_with("sh -c '"));
         assert!(
             cmd.contains("no ghostd binary on this host"),
             "reports a missing binary: {cmd}"
         );
-        assert!(cmd.contains("kill \"ghostwave-prod\""), "the pidfile kill is quoted: {cmd}");
+        assert!(
+            cmd.contains(&format!("kill {} 2>&1; krc=$?", dquoted("ghostwave-prod"))),
+            "the pidfile kill is quoted and its status read: {cmd}"
+        );
+        // The shape, not just containment: a sweep that runs unconditionally would
+        // still contain the pattern, so the condition has to be in the script.
+        let status_at = cmd.find("krc=$?").expect("the kill status is captured");
+        let guard_at = cmd.find("if [ $krc -eq 6 ]").expect("the successor status is checked");
+        let sweep_at = cmd.find("pkill -9 -f").expect("the sweep is there");
+        assert!(
+            status_at < guard_at && guard_at < sweep_at,
+            "the sweep is gated on the status the kill reported: {cmd}"
+        );
         assert!(
             cmd.contains(&format!(
-                "pkill -9 -f {}",
+                "else pkill -9 -f {} 2>/dev/null || true; fi",
                 sweep_pattern("ghostwave-prod")
             )),
-            "the sweep is anchored and leaves the name a literal: {cmd}"
+            "the sweep is the else arm, so only a successor skips it: {cmd}"
         );
         assert!(cmd.ends_with("true'"), "the kill always reports success: {cmd}");
         assert!(
-            !cmd.contains("pkill -9 -f \"ghostd-$(uname -m) new"),
+            !cmd.contains("ghostd-$(uname -m) new"),
             "the broad sweep is gone: {cmd}"
         );
     }
@@ -1119,7 +1177,7 @@ mod tests {
             let arch = Command::new("uname").arg("-m").output().ok()?;
             let arch = String::from_utf8_lossy(&arch.stdout).trim().to_string();
             let stub = format!(
-                "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"{version}\"; exit 0;;\n  attach) echo \"$*\" >> \"$HOME/attach.count\"; echo \"$*\" > \"$HOME/record\"; exit {attach_rc};;\n  new) echo \"$*\" > \"$HOME/record.new\"; exit {new_rc};;\nesac\nexit 1\n"
+                "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"{version}\"; exit 0;;\n  attach) echo \"$*\" >> \"$HOME/attach.count\"; echo \"$*\" > \"$HOME/record\"; exit {attach_rc};;\n  new) echo \"$*\" > \"$HOME/record.new\"; exit {new_rc};;\n  unkill) echo \"$*\" > \"$HOME/record.unkill\"; exit 0;;\nesac\nexit 1\n"
             );
             let path = cache.join(format!("ghostd-{arch}"));
             std::fs::write(&path, stub).ok()?;
@@ -1249,6 +1307,158 @@ mod tests {
             "the create was attempted — and refused by `new`, not by the script: {out:?}"
         );
         stub.close();
+    }
+
+    /// The line that ends the resurrection loop: a killed session is *terminal*, so
+    /// the pane reports a clean exit and nothing is created — no `new`, and no
+    /// `unkill` on an automatic path.
+    #[test]
+    fn a_killed_session_is_a_clean_exit_and_never_a_recreate() {
+        let version = format!("ghostd {}", env!("CARGO_PKG_VERSION"));
+        let stub = StubRemote::new(&version, 5, 0).expect("the stub remote is built");
+
+        let out = stub.run(&attach_cmd("ghostwave-prod"));
+
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "kill is terminal, so the pane sees a clean exit: {out:?}"
+        );
+        assert!(
+            stub.record("record.new").is_none(),
+            "a killed session is never recreated: {out:?}"
+        );
+        assert!(
+            stub.record("record.unkill").is_none(),
+            "and an automatic attach never un-kills it: {out:?}"
+        );
+        assert_eq!(stub.attach_count(), 1, "one attach, then stop: {out:?}");
+        stub.close();
+    }
+
+    /// The explicit connect is the one path allowed to un-kill: `unkill` runs after
+    /// the version check and before `attach`, so the user's Enter creates a fresh
+    /// session where an automatic reconnect would have stopped.
+    #[test]
+    fn only_an_explicit_connect_un_kills_and_it_runs_before_attach() {
+        let version = format!("ghostd {}", env!("CARGO_PKG_VERSION"));
+        let stub = StubRemote::new(&version, 5, 0).expect("the stub remote is built");
+
+        let out = stub.run(&attach_cmd_explicit("ghostwave-prod"));
+
+        assert!(out.status.success(), "the pane exits clean: {out:?}");
+        assert_eq!(
+            stub.record("record.unkill").as_deref(),
+            Some("unkill ghostwave-prod\n"),
+            "the explicit connect clears the tombstone: {out:?}"
+        );
+        assert_eq!(stub.attach_count(), 1, "and attaches once: {out:?}");
+        let cmd = attach_cmd_explicit("ghostwave-prod");
+        let unkill_at = cmd.find("unkill").expect("the explicit script un-kills");
+        let attach_at = cmd
+            .find(&format!("attach {}", dquoted("ghostwave-prod")))
+            .expect("it attaches");
+        let version_at = cmd.find("--version").expect("the version check is first");
+        assert!(
+            version_at < unkill_at && unkill_at < attach_at,
+            "the un-kill comes after the version check and before the attach: {cmd}"
+        );
+        stub.close();
+    }
+
+    /// A throwaway HOME whose cached `ghostd-<arch>` exits `kill_rc` for every
+    /// invocation, plus a `pkill` stub earlier on `PATH` that records its argv —
+    /// so the generated kill script can be run for real without killing anything.
+    struct KillStub {
+        home: std::path::PathBuf,
+    }
+
+    impl KillStub {
+        fn new(kill_rc: i32) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+
+            let home = std::env::temp_dir().join(format!("ghostwave-kill-{}", unique_token()));
+            let bin = home.join("bin");
+            std::fs::create_dir_all(home.join(".cache/ghostwave")).ok()?;
+            std::fs::create_dir_all(&bin).ok()?;
+            let arch = Command::new("uname").arg("-m").output().ok()?;
+            let arch = String::from_utf8_lossy(&arch.stdout).trim().to_string();
+            let ghostd = home.join(format!(".cache/ghostwave/ghostd-{arch}"));
+            std::fs::write(
+                &ghostd,
+                format!("#!/bin/sh\necho \"$*\" >> \"$HOME/ghostd.argv\"\nexit {kill_rc}\n"),
+            )
+            .ok()?;
+            std::fs::set_permissions(&ghostd, std::fs::Permissions::from_mode(0o755)).ok()?;
+            let pkill = bin.join("pkill");
+            std::fs::write(&pkill, "#!/bin/sh\necho \"$*\" >> \"$HOME/pkill.argv\"\n").ok()?;
+            std::fs::set_permissions(&pkill, std::fs::Permissions::from_mode(0o755)).ok()?;
+            Some(Self { home })
+        }
+
+        /// Runs the real `kill_cmd` script the way a remote login shell would.
+        fn run(&self) -> std::process::Output {
+            let path = format!(
+                "{}:{}",
+                self.home.join("bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            Command::new("sh")
+                .args(["-c", &kill_cmd("ghostwave-prod")])
+                .env("HOME", &self.home)
+                .env("PATH", path)
+                .output()
+                .expect("sh runs")
+        }
+
+        fn record(&self, name: &str) -> Option<String> {
+            std::fs::read_to_string(self.home.join(name)).ok()
+        }
+
+        fn close(&self) {
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    /// A daemon that reports a successor (exit 6) is never swept: the `pkill` would
+    /// SIGKILL the session the user just started, whose command line still matches
+    /// the pattern because `daemonize` never re-execs.
+    #[test]
+    fn a_successor_report_skips_the_sweep() {
+        let stub = KillStub::new(6).expect("the kill stub is built");
+        let out = stub.run();
+        assert!(out.status.success(), "the kill script still exits 0: {out:?}");
+        assert_eq!(
+            stub.record("ghostd.argv").as_deref(),
+            Some("kill ghostwave-prod\n"),
+            "the daemon was asked to kill the session: {out:?}"
+        );
+        assert!(
+            stub.record("pkill.argv").is_none(),
+            "a reported successor is not swept: {:?}",
+            stub.record("pkill.argv")
+        );
+        stub.close();
+    }
+
+    /// Every other status — 0 (killed) and 1 (survived SIGKILL) — still sweeps the
+    /// orphans, with the anchored pattern.
+    #[test]
+    fn a_kill_that_is_not_superseded_still_sweeps_its_orphans() {
+        for rc in [0, 1] {
+            let stub = KillStub::new(rc).expect("the kill stub is built");
+            let out = stub.run();
+            assert!(out.status.success(), "rc {rc}: the kill script exits 0: {out:?}");
+            let argv = stub
+                .record("pkill.argv")
+                .unwrap_or_else(|| panic!("rc {rc}: the sweep ran: {out:?}"));
+            assert_eq!(
+                argv.trim_end(),
+                format!("-9 -f {}", kill_pattern("ghostwave-prod")),
+                "rc {rc}: the sweep is anchored to this session"
+            );
+            stub.close();
+        }
     }
 
     /// The temp path an `install_cmd` writes through.
