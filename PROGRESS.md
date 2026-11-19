@@ -1548,3 +1548,15 @@ keep the ordinary fuzzy list, so typing another command is never hijacked.
   `cargo fmt --check` is already 5033 lines dirty at the base and was not run.
 - **NEEDS-OWNER-VERIFY**: this box is headless, so nobody looked at the row. The tests pin its
   text, category, action and the toast; the pixels are the owner's.
+
+## 2026-11-19 — kill a durable remote session for good (sitting 1: kill is final and reachable)
+
+`ghostd` now tombstones a killed name (`<name>.killed`): `attach` exits 5 and
+`new` refuses it (unless `--force`) until `ghostd unkill`, so no automatic path
+can rebuild a session the user killed. `kill` exits 6 when another daemon owns
+the name, which makes the pane's `pkill` sweep conditional. In the front end a
+killed pane is `ReconnectState::Off` (no auto-reconnect, no respawn, `Enter`
+reconnects, label says "killed"), the kill drops the local attach child and keeps
+the pane, and `Ctrl+Shift+K` kills a *connected* pane without the palette. The
+daemon half reaches a host only through the asset rebuild (NEEDS-VULCAN).
+Bounded replay (D6) is sitting 2.
