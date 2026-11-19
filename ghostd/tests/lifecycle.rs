@@ -105,6 +105,13 @@ impl Sandbox {
         out
     }
 
+    /// Run `ghostd new <args…>` for `name`, registering the name so the guard
+    /// reaps any daemon it created — including one a `--force` created.
+    fn run_new(&mut self, args: &[&str], name: &str) -> std::process::Output {
+        self.names.push(name.to_string());
+        self.run(args)
+    }
+
     /// An `ghostd attach <name>` client with its stdin held open (that is what
     /// keeps it attached) and its output drained by a reader thread, so a test can
     /// talk to it and watch what it prints while it runs.
@@ -294,6 +301,19 @@ fn a_new_session_does_not_replay_a_killed_ones_output() {
         "the killed session's log went with its daemon"
     );
 
+    // A kill is final: the name cannot be recreated until it is un-killed, so the
+    // automatic path that follows a killed attach cannot rebuild it.
+    let refused = sandbox.run(&["new", "s"]);
+    assert!(!refused.status.success(), "a killed name is refused: {refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("unkill"),
+        "and says how to undo it: {refused:?}"
+    );
+
+    assert!(
+        sandbox.run(&["unkill", "s"]).status.success(),
+        "the explicit connect clears the tombstone"
+    );
     let out = sandbox.new_session("s");
     assert!(out.status.success(), "a new session is created: {out:?}");
 
@@ -387,7 +407,7 @@ fn a_session_that_ended_is_not_reported_as_missing() {
 }
 
 #[test]
-fn a_kill_leaves_no_state_behind() {
+fn a_kill_leaves_only_its_tombstone_behind() {
     let mut sandbox = Sandbox::new("clean");
     let marker = "MARKER-BEFORE-KILL";
     let out = sandbox.new_session("k");
@@ -406,7 +426,25 @@ fn a_kill_leaves_no_state_behind() {
             "{file} outlives the daemon that owned it"
         );
     }
+    assert!(
+        sandbox.path("k.killed").exists(),
+        "the kill leaves a tombstone in the state dir"
+    );
 
+    let refused = sandbox.run(&["new", "k"]);
+    assert!(
+        !refused.status.success(),
+        "a killed name is not recreated by `new`: {refused:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("unkill"),
+        "and the refusal names the way out: {refused:?}"
+    );
+
+    assert!(
+        sandbox.run(&["unkill", "k"]).status.success(),
+        "the name can be released"
+    );
     let out = sandbox.new_session("k");
     assert!(out.status.success(), "the name is reusable: {out:?}");
     let mut client = sandbox.attach("k");
@@ -415,6 +453,125 @@ fn a_kill_leaves_no_state_behind() {
     assert!(
         !seen.contains(marker),
         "the reused name starts with an empty log: {seen:?}"
+    );
+}
+
+#[test]
+fn a_killed_session_reports_killed_and_cannot_be_recreated() {
+    let mut sandbox = Sandbox::new("killed");
+    let out = sandbox.new_session("s");
+    assert!(out.status.success(), "the session is created: {out:?}");
+
+    let mut client = sandbox.attach("s");
+    client.write("echo ALIVE\n");
+    client.expect_output("ALIVE", Duration::from_secs(10));
+    drop(client);
+
+    assert!(
+        sandbox.run(&["kill", "s"]).status.success(),
+        "the session is killed"
+    );
+
+    let attach = sandbox.run(&["attach", "s"]);
+    assert_eq!(
+        attach.status.code(),
+        Some(5),
+        "a killed session is 5 — terminal, never the 1 that means create me: {attach:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&attach.stderr).contains("unkill"),
+        "and its stderr names unkill: {attach:?}"
+    );
+
+    let new = sandbox.run(&["new", "s"]);
+    assert!(
+        !new.status.success(),
+        "a killed name is refused even when attach is not consulted: {new:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&new.stderr).contains("unkill"),
+        "the refusal names unkill: {new:?}"
+    );
+
+    assert!(sandbox.path("s.killed").exists(), "the tombstone is there");
+    assert!(
+        !sandbox.path("s.pid").exists(),
+        "and nothing recreated the session behind the refusal"
+    );
+    let list = sandbox.run(&["list"]);
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).contains('s'),
+        "a killed session is not listed as a session: {list:?}"
+    );
+}
+
+#[test]
+fn new_force_recreates_a_killed_name() {
+    let mut sandbox = Sandbox::new("force");
+    let out = sandbox.new_session("f");
+    assert!(out.status.success(), "the session is created: {out:?}");
+    assert!(
+        sandbox.run(&["kill", "f"]).status.success(),
+        "the session is killed"
+    );
+
+    let forced = sandbox.run_new(&["new", "--force", "f"], "f");
+    assert!(
+        forced.status.success(),
+        "the explicit override creates the name again: {forced:?}"
+    );
+    assert!(
+        !sandbox.path("f.killed").exists(),
+        "and the tombstone is gone"
+    );
+    sandbox
+        .wait_for_daemon_pid("f", Duration::from_secs(5))
+        .expect("the new daemon records its pid");
+
+    let mut client = sandbox.attach("f");
+    client.write("echo FORCED\n");
+    client.expect_output("FORCED", Duration::from_secs(10));
+}
+
+#[test]
+fn a_kill_of_an_unknown_name_tombstones_it() {
+    let mut sandbox = Sandbox::new("unknown");
+    let out = sandbox.run_new(&["kill", "no-such"], "no-such");
+    assert!(
+        out.status.success(),
+        "killing a name with no daemon is not an error — there is nothing left to protect: {out:?}"
+    );
+    assert!(
+        sandbox.path("no-such.killed").exists(),
+        "and it still tombstones the name"
+    );
+
+    let refused = sandbox.run(&["new", "no-such"]);
+    assert!(
+        !refused.status.success(),
+        "so the name cannot be created by an automatic path: {refused:?}"
+    );
+
+    assert!(
+        sandbox.run(&["unkill", "no-such"]).status.success(),
+        "unkill releases it"
+    );
+    let out = sandbox.new_session("no-such");
+    assert!(out.status.success(), "and then it can be created: {out:?}");
+}
+
+#[test]
+fn an_unkill_with_nothing_killed_is_a_no_op() {
+    let sandbox = Sandbox::new("unkill-noop");
+    let out = sandbox.run(&["unkill", "fresh"]);
+    assert!(out.status.success(), "unkill of a live name exits 0: {out:?}");
+    assert!(
+        !sandbox.path("fresh.killed").exists(),
+        "and creates no tombstone"
+    );
+    assert!(
+        !sandbox.path("fresh.pid").exists() && !sandbox.path("fresh.sock").exists(),
+        "and touches no session state"
     );
 }
 

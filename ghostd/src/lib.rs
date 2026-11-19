@@ -55,6 +55,22 @@ pub const ATTACH_WEDGED: i32 = 3;
 /// duplicate pane from resurrecting a killed session.
 pub const ATTACH_ENDED: i32 = 4;
 
+/// `ghostd attach` exit status: the session is absent **and** its name carries a
+/// kill tombstone.
+///
+/// Terminal: a caller must not create the session. Only `ghostd unkill <name>`
+/// (or `ghostd new --force`) clears a tombstone, which is what keeps an
+/// automatic reconnect path from resurrecting a session the user killed.
+pub const ATTACH_KILLED: i32 = 5;
+
+/// `ghostd kill` exit status: the daemon that was named is gone, but another
+/// daemon now owns the name.
+///
+/// Not a failure. The caller must not sweep by pattern, because the daemon that
+/// holds the name is the one the user just started. A daemon older than this
+/// code never returns it, so nothing that predates it changes behaviour.
+pub const KILL_SUPERSEDED: i32 = 6;
+
 /// Set when SIGTERM arrives (ghostd kill); the accept loop cleans up.
 pub static TERM_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -275,6 +291,61 @@ pub fn log_path(name: &str) -> PathBuf {
 }
 pub fn pid_path(name: &str) -> PathBuf {
     state_dir().join(format!("{name}.pid"))
+}
+
+/// Where a killed name's tombstone lives: `<name>.killed` in the same state dir
+/// as the socket, pidfile and log.
+///
+/// The app never reads this file — it only learns the state from `ghostd`'s exit
+/// status [`ATTACH_KILLED`] — so the daemon is the single reader and the two can
+/// never disagree about what a name means.
+pub fn killed_path(name: &str) -> PathBuf {
+    state_dir().join(format!("{name}.killed"))
+}
+
+/// Whether `name` was killed and has not been explicitly un-killed.
+///
+/// The presence of the file is the whole semantic; its body is diagnostic only.
+pub fn is_killed(name: &str) -> bool {
+    killed_path(name).exists()
+}
+
+/// Records that `name` was killed by `daemon`, so nothing recreates it until
+/// `clear_tombstone` runs.
+///
+/// Written through `<name>.killed.tmp` and a rename, the rule [`write_pidfile`]
+/// already uses: a concurrent reader never sees a half-written tombstone and
+/// concludes the name is free.
+pub fn write_tombstone(name: &str, daemon: Pid) {
+    let body = format!(
+        "killed {} {}\n",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        daemon.as_raw()
+    );
+    write_tombstone_body(name, &body);
+}
+
+/// The same tombstone for a name no daemon ever owned — `kill <name>` with no
+/// pidfile left. Pid `0` is written, which no signal path can mistake for an
+/// owner ([`parse_pid`] refuses it).
+pub fn write_tombstone_none(name: &str) {
+    write_tombstone_body(name, "killed 0 0\n");
+}
+
+fn write_tombstone_body(name: &str, body: &str) {
+    let tmp = state_dir().join(format!("{name}.killed.tmp"));
+    if fs::write(&tmp, body).is_ok() {
+        let _ = fs::rename(&tmp, killed_path(name));
+    }
+}
+
+/// Clears `name`'s tombstone, so it may be created again. Idempotent: a name
+/// that was never killed is left with no file, and no file is created.
+pub fn clear_tombstone(name: &str) {
+    let _ = fs::remove_file(killed_path(name));
 }
 
 /// Returns (cols, rows) of the terminal on `fd` (TIOCGWINSZ).
@@ -723,6 +794,45 @@ mod tests {
             "the owner removes its own state"
         );
         assert!(!dir.join("s.sock").exists() && !dir.join("s.pid").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tombstone_marks_a_name_killed_until_it_is_cleared() {
+        let (_guard, dir) = state_dir_for("tombstone");
+        assert!(!is_killed("s"), "a name nobody killed is not killed");
+
+        write_tombstone("s", Pid::from_raw(4242));
+        assert!(is_killed("s"), "the tombstone exists");
+        assert!(dir.join("s.killed").exists(), "in the state dir, beside the pidfile");
+        assert!(!dir.join("s.killed.tmp").exists(), "written through a rename, not left half-written");
+        let body = fs::read_to_string(dir.join("s.killed")).expect("the tombstone is readable");
+        let mut fields = body.split_whitespace();
+        assert_eq!(fields.next(), Some("killed"), "body: {body:?}");
+        assert!(
+            fields.next().and_then(|s| s.parse::<u64>().ok()).is_some(),
+            "the kill time is a number: {body:?}"
+        );
+        assert_eq!(fields.next(), Some("4242"), "the daemon that was killed: {body:?}");
+
+        clear_tombstone("s");
+        assert!(!is_killed("s"), "clearing makes the name creatable again");
+        assert!(!dir.join("s.killed").exists());
+
+        clear_tombstone("never-killed");
+        assert!(
+            !is_killed("never-killed") && !dir.join("never-killed.killed").exists(),
+            "clearing a name that was never killed creates nothing"
+        );
+
+        write_tombstone_none("orphan");
+        let body = fs::read_to_string(dir.join("orphan.killed")).expect("the tombstone is written");
+        assert_eq!(
+            body.split_whitespace().last(),
+            Some("0"),
+            "a daemon-less tombstone names no owner: {body:?}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

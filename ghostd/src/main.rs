@@ -28,11 +28,12 @@ use nix::{
 };
 
 use ghostd::{
-    bind_listener, daemonize, dcs_size_msg, die, fd_poll, fd_read, gdbg, install_term_handler,
-    kill_child_group, log_path, pid_gone, probe_session, read_pidfile, recover_session,
-    remove_state_if_owned, set_nonblock, set_term_size, socket_path, spawn_child, state_dir,
-    term_size, truncate_log_front, write_all_blocking, write_pidfile, ATTACH_ENDED,
-    ATTACH_NO_SESSION, ATTACH_WEDGED, DEFAULT_FIRST_ATTACH_SECS, DEFAULT_LOG_CAP_MB, Probe,
+    bind_listener, clear_tombstone, daemonize, dcs_size_msg, die, fd_poll, fd_read, gdbg,
+    install_term_handler, is_killed, kill_child_group, log_path, pid_gone, probe_session,
+    read_pidfile, recover_session, remove_state_if_owned, set_nonblock, set_term_size, socket_path,
+    spawn_child, state_dir, term_size, truncate_log_front, write_all_blocking, write_pidfile,
+    write_tombstone, write_tombstone_none, ATTACH_ENDED, ATTACH_KILLED, ATTACH_NO_SESSION,
+    ATTACH_WEDGED, DEFAULT_FIRST_ATTACH_SECS, DEFAULT_LOG_CAP_MB, KILL_SUPERSEDED, Probe,
     TERM_REQUESTED, VERSION,
 };
 
@@ -352,9 +353,19 @@ fn handle_client(
 /// has nothing to replay — then bind **before** daemonizing, so a stale socket is
 /// cleared and a bind failure reaches the caller with a real exit status instead
 /// of vanishing into `/dev/null`.
-fn cmd_new(name: &str, cmd: &[String], log_cap: u64, first_attach_secs: u64) {
+///
+/// A killed name is refused before the probe unless `force` says otherwise, so a
+/// session the user killed is never recreated by an automatic path. `force`
+/// clears the tombstone only after the listener is bound, so a failed bind
+/// leaves the name killed instead of quietly un-killing it.
+fn cmd_new(name: &str, cmd: &[String], log_cap: u64, first_attach_secs: u64, force: bool) {
     if name.is_empty() || name.contains('/') {
         die("bad session name");
+    }
+    if is_killed(name) && !force {
+        die(&format!(
+            "session '{name}' was killed — 'ghostd unkill {name}' to create it again (or 'ghostd new --force')"
+        ));
     }
     let _ = fs::create_dir_all(state_dir());
     // Liveness check with RECOVERY: a socket that refuses connections is
@@ -379,6 +390,10 @@ fn cmd_new(name: &str, cmd: &[String], log_cap: u64, first_attach_secs: u64) {
     }
     let _ = fs::write(&log, b"");
     let listener = bind_listener(name).unwrap_or_else(|e| die(&format!("{e}")));
+    if force {
+        // After the bind: a name this process cannot actually take stays killed.
+        clear_tombstone(name);
+    }
     daemonize();
     install_term_handler();
     set_nonblock(listener.as_raw_fd());
@@ -391,6 +406,13 @@ fn cmd_new(name: &str, cmd: &[String], log_cap: u64, first_attach_secs: u64) {
 
 fn cmd_attach(name: &str) {
     let Some(mut stream) = ghostd::connect_with_retry(name) else {
+        // A killed name is absent *and* blocked: report it as terminal instead of
+        // the 1 that a caller may follow with `new`, or every reconnect would
+        // rebuild the session the user just killed.
+        if is_killed(name) {
+            eprintln!("ghostd: session '{name}' was killed — 'ghostd unkill {name}' to create it again");
+            std::process::exit(ATTACH_KILLED);
+        }
         eprintln!("ghostd: no session '{name}'");
         std::process::exit(ATTACH_NO_SESSION);
     };
@@ -566,15 +588,19 @@ fn cmd_list() {
     }
 }
 
-/// Kill a session's daemon, verify that it died, and drop the state it owned.
+/// Kill a session's daemon, verify that it died, and leave a tombstone so
+/// nothing recreates the name.
 ///
 /// The pidfile names the victim; without one there is no owner to signal, so a
 /// socket that still answers means a live daemon we must not delete out from
-/// under (report it), and a refused socket is stale state we may clear. State is
-/// removed only after the daemon is confirmed dead *and* the pidfile still names
-/// it, so a daemon that took the name over meanwhile keeps its own files. The log
-/// goes with them: replay is only ever the history of the daemon that is attached
-/// to, and this daemon no longer is.
+/// under (report it, and tombstone nothing — a daemon we cannot name is not a
+/// daemon we may declare dead), while a refused socket is stale state we clear
+/// and tombstone. State is removed only after the daemon is confirmed dead *and*
+/// the pidfile still names it, so a daemon that took the name over meanwhile
+/// keeps its own files; that case exits [`KILL_SUPERSEDED`] and writes no
+/// tombstone, because the name now belongs to a live session. The log goes with
+/// the dead daemon: replay is only ever the history of the daemon that is
+/// attached to.
 fn cmd_kill(name: &str) {
     let Some((daemon, child)) = read_pidfile(name) else {
         let sock = socket_path(name);
@@ -583,8 +609,11 @@ fn cmd_kill(name: &str) {
             std::process::exit(1);
         }
         let _ = fs::remove_file(&sock);
-        eprintln!("ghostd: no session '{name}'");
-        std::process::exit(1);
+        // No daemon to protect, so an orphan hunt is exactly right here — and the
+        // tombstone is what keeps the next automatic attach from rebuilding it.
+        write_tombstone_none(name);
+        println!("ghostd: no live session '{name}'; it stays killed until 'ghostd unkill {name}'");
+        return;
     };
     // SIGTERM the daemon; its handler cleans up its own files. If it's
     // wedged, escalate: SIGKILL it and kill the session's process group
@@ -610,7 +639,8 @@ fn cmd_kill(name: &str) {
         kill_child_group(c, Duration::from_secs(2));
     }
     if !pid_gone(daemon) {
-        // Say what happened rather than claiming a kill that did not happen.
+        // Say what happened rather than claiming a kill that did not happen. A
+        // live session must never be marked dead, so no tombstone here either.
         eprintln!("ghostd: daemon {daemon} for '{name}' survived SIGKILL");
         std::process::exit(1);
     }
@@ -618,11 +648,33 @@ fn cmd_kill(name: &str) {
     // left" is the normal death path and not a successor. A pidfile that still
     // exists names a daemon that took the name over meanwhile — that one's state
     // and log are not ours to delete.
-    let successor = !remove_state_if_owned(name, daemon) && read_pidfile(name).is_some();
-    if !successor {
-        let _ = fs::remove_file(log_path(name));
+    let mut successor = !remove_state_if_owned(name, daemon) && read_pidfile(name).is_some();
+    // Read once more, immediately before the tombstone: a `new` can bind in the
+    // gap between the removal above and the write below. Reported, not prevented
+    // — closing that gap for good needs a lock file, which this change does not
+    // add.
+    if !successor && read_pidfile(name).is_some_and(|(owner, _)| owner != daemon) {
+        successor = true;
     }
+    if successor {
+        println!("ghostd: '{name}' was killed; another daemon now owns it");
+        std::process::exit(KILL_SUPERSEDED);
+    }
+    let _ = fs::remove_file(log_path(name));
+    write_tombstone(name, daemon);
     println!("ghostd: killed '{name}'");
+}
+
+/// Clear a name's kill tombstone, so it may be created again.
+///
+/// Idempotent: a name that was never killed exits 0 and creates nothing, which is
+/// what lets the explicit-connect script call it blindly.
+fn cmd_unkill(name: &str) {
+    if name.is_empty() || name.contains('/') {
+        die("bad session name");
+    }
+    clear_tombstone(name);
+    println!("ghostd: '{name}' may be created again");
 }
 
 fn cmd_kill_all() {
@@ -648,16 +700,22 @@ fn usage() -> ! {
         "ghostd {VERSION} — ghostwave remote session daemon\n\
          \n\
          usage:\n\
-         \x20 ghostd new <name> [cmd...]     create a session (daemonizes)\n\
+         \x20 ghostd new [--force] <name> [cmd...]  create a session (daemonizes)\n\
          \x20 ghostd attach <name>            attach to a session\n\
+         \x20 ghostd unkill <name>            allow a killed name to be created again\n\
          \x20 ghostd list                     list sessions\n\
-         \x20 ghostd kill <name>              kill a session\n\
+         \x20 ghostd kill <name>              kill a session (final until unkill)\n\
          \x20 ghostd kill-all                 kill all sessions\n\
          \x20 ghostd --version\n\
          \n\
          options (new):\n\
+         \x20 --force                    create a name that was killed\n\
          \x20 --first-attach-secs <n>   exit if no client attaches within n secs (default {DEFAULT_FIRST_ATTACH_SECS})\n\
          \x20 --log-cap-mb <n>          ring log cap in MiB (default {DEFAULT_LOG_CAP_MB})\n\
+         \n\
+         exit status:\n\
+         \x20 attach 1 no session (or busy)  3 wedged  4 ended  5 killed — do not create\n\
+         \x20 kill   6 another daemon now owns the name — do not sweep for it\n\
          \n\
          state: {:?}",
         state_dir()
@@ -675,11 +733,13 @@ fn main() {
         "new" => {
             let mut log_cap = DEFAULT_LOG_CAP_MB * 1024 * 1024;
             let mut first_attach = DEFAULT_FIRST_ATTACH_SECS;
+            let mut force = false;
             let mut name: Option<String> = None;
             let mut cmd: Vec<String> = Vec::new();
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
+                    "--force" => force = true,
                     "--log-cap-mb" => {
                         i += 1;
                         log_cap = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_LOG_CAP_MB) * 1024 * 1024;
@@ -694,11 +754,15 @@ fn main() {
                 i += 1;
             }
             let Some(name) = name else { usage() };
-            cmd_new(&name, &cmd, log_cap, first_attach);
+            cmd_new(&name, &cmd, log_cap, first_attach, force);
         }
         "attach" => {
             let Some(name) = args.get(1) else { usage() };
             cmd_attach(name);
+        }
+        "unkill" => {
+            let Some(name) = args.get(1) else { usage() };
+            cmd_unkill(name);
         }
         "list" => cmd_list(),
         "kill" => {
