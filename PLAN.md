@@ -3316,7 +3316,7 @@ Two things the card did not say, both load-bearing for stage 3:
   rewrites.** `6d3f620` (the S1 FIX, committed after this plan's `5c464a5`) touches
   `ghostd/src/lib.rs` (+77: `is_killed`, the tombstone writers, `clear_tombstone`),
   `ghostd/src/main.rs` (+50: hunks at the `use nix` import list of that diff, `cmd_new`,
-  `cmd_kill` and the help text) and `ghostd/tests/lifecycle.rs` (+90: `Sandbox::settled_log`,
+  `cmd_kill` and the help text) and `ghostd/tests/lifecycle.rs` (+90: `Sandbox::remove_state_dir`,
   `a_kill_records_its_tombstone_even_when_the_state_dir_does_not_exist_yet`,
   `an_unkill_whose_tombstone_will_not_clear_fails`,
   `a_force_new_whose_tombstone_will_not_clear_does_not_daemonize`), plus `src/app.rs` (not in
@@ -3521,13 +3521,23 @@ Nothing else changes. In particular `src/main.rs`'s `Message::Output` arm, `src/
 
 ### 2. How it is verified (stage 3 runs these and pastes the real output)
 
-From the repo root, on the job branch. `CARGO_TARGET_DIR` is keyed to **the executing
-card's own id** (`ghostwave-$HERMES_KANBAN_TASK`), never another card's directory — the
-first draft of this plan hardcoded the PLAN card's id, which is exactly what stage 3 must
-not do:
+From the repo root, on the job branch. `CARGO_TARGET_DIR` must belong to **the executing
+card alone**, never another card's directory — the first draft of this plan hardcoded the PLAN
+card's id, which is exactly what stage 3 must not do. Note that **the per-task id variable is not
+present in a worker's shell**: `scrub_kanban_env` in `tools/environments/local.py` strips the
+`TASK`, `RUN_ID`, `CLAIM_LOCK` and `GOAL_*` keys from every local child env, so only `BOARD`,
+`BRANCH`, `DB`, `WORKSPACE`, `WORKSPACES_ROOT` and `CLAIM_TTL` survive. Derive the id from
+`$HERMES_KANBAN_WORKSPACE`, whose last path component is this card's own worktree directory
+(`…/.worktrees/t_<card id>`), and let the assertion below fail loudly rather than silently
+collapsing to the shared bare prefix `/var/build/ghostwave-`:
 
 ```
-export CTD=/var/build/ghostwave-$HERMES_KANBAN_TASK
+# Per-card target dir: the worktree basename is this card's id (t_<id>).
+export CTD=/var/build/ghostwave-${HERMES_KANBAN_WORKSPACE##*/}
+# Assert the derivation happened: the suffix must be non-empty and a single path component.
+case "${CTD#/var/build/ghostwave-}" in
+  ''|*/*|.) echo "CTD='$CTD' is not a per-card dir; export CTD=/var/build/ghostwave-<your card id> by hand" >&2; exit 1;;
+esac
 CARGO_TARGET_DIR=$CTD nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo test"
 CARGO_TARGET_DIR=$CTD nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo test --manifest-path ghostd/Cargo.toml"
 CARGO_TARGET_DIR=$CTD nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo clippy --all-targets"
