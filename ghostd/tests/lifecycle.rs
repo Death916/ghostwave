@@ -149,6 +149,30 @@ impl Sandbox {
         Attach { child, stdin, out }
     }
 
+    /// The session log's bytes, waiting until the file has stopped changing for
+    /// `quiet`: a live shell repaints its prompt whenever it becomes ready for
+    /// input, so a read taken mid-repaint is not a settle point.
+    fn settled_log(&self, name: &str, quiet: Duration, timeout: Duration) -> Vec<u8> {
+        let path = self.path(&format!("{name}.log"));
+        let deadline = Instant::now() + timeout;
+        let mut last = fs::read(&path).expect("the log exists");
+        let mut stable_since = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(20));
+            let now = fs::read(&path).expect("the log exists");
+            if now != last {
+                last = now;
+                stable_since = Instant::now();
+            } else if stable_since.elapsed() >= quiet {
+                return last;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the log never settled within {timeout:?}"
+            );
+        }
+    }
+
     /// The daemon pid the pidfile's first line names.
     fn daemon_pid(&self, name: &str) -> Option<i32> {
         fs::read_to_string(self.path(&format!("{name}.pid")))
@@ -683,7 +707,13 @@ fn a_busy_attach_is_not_reported_as_ended() {
     first.expect_output("FIRST-ATTACHED", Duration::from_secs(10));
 
     let pid_before = fs::read(sandbox.path("b.pid")).expect("the pidfile exists");
-    let log_before = fs::read(sandbox.path("b.log")).expect("the log exists");
+
+    // Quiesce first: the session is live, so the shell repaints its prompt
+    // whenever it is ready for input. Snapshot only once the log has settled
+    // after a sync command's output, so no repaint is in flight.
+    first.write("echo BUSY-QUIESCED\n");
+    first.expect_output("BUSY-QUIESCED", Duration::from_secs(10));
+    let log_before = sandbox.settled_log("b", Duration::from_millis(300), Duration::from_secs(10));
 
     // The second client keeps its stdin open too (as a pane's tty does): with
     // stdin at EOF it would exit 0 for "my client went away" and never report
@@ -701,10 +731,17 @@ fn a_busy_attach_is_not_reported_as_ended() {
         pid_before,
         "a refused attach does not touch the pidfile"
     );
-    assert_eq!(
-        fs::read(sandbox.path("b.log")).expect("the log survives"),
-        log_before,
-        "a refused attach does not touch the log"
+    // A refused attach may not rewrite or truncate the log; appended bytes are
+    // tolerated because the live shell's own repaint can still land after the
+    // snapshot, and nothing in the log can tell that apart from an append.
+    let log_after = sandbox.settled_log("b", Duration::from_millis(300), Duration::from_secs(10));
+    assert!(
+        log_after.starts_with(&log_before),
+        "a refused attach does not touch the log: {} bytes before, {} after\nbefore: {:?}\nafter: {:?}",
+        log_before.len(),
+        log_after.len(),
+        String::from_utf8_lossy(&log_before),
+        String::from_utf8_lossy(&log_after)
     );
 
     // And the session is untouched: the first client still relays both ways.
