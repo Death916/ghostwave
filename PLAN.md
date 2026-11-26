@@ -3290,35 +3290,47 @@ The manager's sizing is adopted, with one honest note.
 
 ## bounded replay and responsive ingest for durable sessions (S2)
 
-surface: files=5 lines=~330 new_deps=no
+surface: files=5 lines=~350 new_deps=no
 
 Stage 1 PLAN for job `t_c230fb14`, **S2 of 2** — D6 from the S1 plan
 (`## kill a durable remote session for good — bounded replay, no resurrection`, above).
-Re-verified against `wt/kill-durable-session-final` at `5ba2ff8`, not against the card
-text. D6's shape is fixed by the manager (bound the replay, keep input live, no new
-dependency, `OK\n` untouched); this plan only puts it into files, tests and an order.
+Re-verified against `wt/kill-durable-session-final` at `c395551` (round-2 revision; the
+plan was first written at `5ba2ff8`, and `6d3f620` + the test-only `c395551` landed on top
+of it afterwards — §0 says exactly which files those moved), not against the card text.
+D6's shape is fixed by the manager (bound the replay, keep input live, no new dependency,
+`OK\n` untouched); this plan only puts it into files, tests and an order.
 
-### 0. Premises — re-checked on the branch
+### 0. Premises — re-checked on the branch at `c395551`
 
-| # | Card premise | Reality at `5ba2ff8` |
+| # | Card premise | Reality at `c395551` |
 |---|---|---|
-| 5a | replay is the whole ring log | **Confirmed.** `ghostd/src/main.rs:211-225` opens the log, `File::open` → `read(&mut [0u8; 32768])` → `write_all_blocking` in a loop until EOF. No cap, no offset, no line snap. The log's cap is `DEFAULT_LOG_CAP_MB = 32` MiB (`ghostd/src/lib.rs:34`), enforced in the accept loop (`main.rs:109-116`). |
-| 5b | the front end pushes that at the UI in 256 KiB units through an unbounded channel | **Confirmed.** `src/pty_bridge.rs:16` `COALESCE_CAP = 256 * 1024`; coalescing loop `:59-86`; `fmpsc::unbounded` at `:52` (spawn) and `:117` (idle); `stream()` maps to `Message::Output` (`:131`). The app's arm is `src/main.rs:256-263` → `pane.ingest` (`src/pane.rs:373-384`: log write, `scan_queries`, `vt_write`, `flush_response`). Keys arrive on a *different* subscription (`iced::event::listen_with(key_listener)`, `src/main.rs:660`) but every message is handled on the same update loop, so one 256 KiB `vt_write` + `refresh_search` is time a key waits. |
+| 5a | replay is the whole ring log | **Confirmed.** `ghostd/src/main.rs:211-226` opens the log, `File::open` → `read(&mut [0u8; 32768])` → `write_all_blocking` in a loop until EOF. No cap, no offset, no line snap. The log's cap is `DEFAULT_LOG_CAP_MB = 32` MiB (`ghostd/src/lib.rs:34`), enforced in the accept loop (`main.rs:110-115`). |
+| 5b | the front end pushes that at the UI in 256 KiB units through an unbounded channel | **Confirmed.** `src/pty_bridge.rs:16` `COALESCE_CAP = 256 * 1024`; extend-then-coalesce loop `:60-86`; `fmpsc::unbounded` at `:52` (spawn) and `:117` (idle); `stream()` maps to `Message::Output` (`:131`). The app's arm is `src/main.rs:256-263` → `pane.ingest` (`src/pane.rs:373-385`: log write, `scan_queries`, `vt_write`, `flush_response`). Keys arrive on a *different* subscription (`iced::event::listen_with(key_listener)`, `src/main.rs:659`) but every message is handled on the same update loop, so one 256 KiB `vt_write` + `refresh_search` is time a key waits. |
 | 5c | a reconnect that dies mid-replay re-replays from byte 0 | **Confirmed** by construction: replay always starts at the file's first byte, and the log is only discarded by `new`/`kill`, so the next attach repeats the identical prefix. Bounding the replay removes the loop this causes. |
-| 6 | `src/pty.rs` reader is already bounded | **Confirmed, and it matters:** `spawn_reader` uses `sync_channel(512)` (`src/pty.rs:128`). Only the iced side is unbounded, so the pty→app hop already has backpressure to build on. |
-| 8 | `RemoteConfig` untouched | **Confirmed.** `{auto_reconnect, reconnect_attempts, reconnect_delay_secs, durable_ssh_placement}`, `src/config.rs:46-59`. This plan adds no key (D7). |
+| 6 | `src/pty.rs` reader is already bounded | **Confirmed, and it matters:** `spawn_reader` uses `sync_channel(512)` (`src/pty.rs:128`), but it hands the bridge **up to 64 KiB per `PtyMsg::Data`** (`src/pty.rs:133`, `buf = [0u8; 65536]`). Only the iced side is unbounded, so the pty→app hop already has backpressure to build on — and the 64 KiB read is why §1 splits an over-cap first chunk instead of trusting the coalesce loop. |
+| 8 | `RemoteConfig` untouched | **Confirmed.** `{auto_reconnect, reconnect_attempts, reconnect_delay_secs, durable_ssh_placement}`, `src/config.rs:45-56`. This plan adds no key (D7). |
 
 Two things the card did not say, both load-bearing for stage 3:
 
-* **S1 did not touch the files this plan changes.** `git diff 2128be3..5ba2ff8 --
-  ghostd/src/main.rs` has no hunk inside `handle_client` (its hunks start at `cmd_new`,
-  `:352`), and `src/pty_bridge.rs` is absent from `git diff --stat 2128be3..5ba2ff8`
-  entirely. So the replay rewrite does not have to step around S1's tombstone work; only
-  the import list at `main.rs:30-38` changes on both sides and is re-merged by rustfmt.
+* **The S1 commits landed on 3 of the 5 files this plan changes — but not on the code it
+  rewrites.** `6d3f620` (the S1 FIX, committed after this plan's `5c464a5`) touches
+  `ghostd/src/lib.rs` (+77: `is_killed`, the tombstone writers, `clear_tombstone`),
+  `ghostd/src/main.rs` (+50: hunks at the `use nix` import list of that diff, `cmd_new`,
+  `cmd_kill` and the help text) and `ghostd/tests/lifecycle.rs` (+90: `Sandbox::settled_log`,
+  `a_kill_records_its_tombstone_even_when_the_state_dir_does_not_exist_yet`,
+  `an_unkill_whose_tombstone_will_not_clear_fails`,
+  `a_force_new_whose_tombstone_will_not_clear_does_not_daemonize`), plus `src/app.rs` (not in
+  this plan's file list). `c395551` is test-only and touches `ghostd/tests/lifecycle.rs` again
+  (`settled_log` + `a_busy_attach_is_not_reported_as_ended`). **Neither commit has a hunk
+  inside `handle_client` (`main.rs:144-342`) or its replay step (`:211-226`), and neither
+  touches `src/pty_bridge.rs` or `src/input.rs`** — so the load-bearing premise survives (the
+  replay rewrite steps around nobody); what the two commits do move is the line numbers
+  (re-derived at `c395551` in §0/§1) and the test baseline (§2, §5). Stage 3 rebases on
+  `c395551`, not on the commit this section was first written against.
 * **`ghostd new <name> <cmd…>` silently ignores `<cmd>`.** `cmd_new` takes `cmd` and
-  `main.rs:404` calls `accept_loop(listener, name, log_cap, first_attach_secs)` — `cmd`
-  never reaches `spawn_child(&[])` (`main.rs:48`). Pre-existing, not this card's job, but
-  it means **no verification here may rely on `ghostd new name seq …`**; the session is
+  `main.rs:411` calls `accept_loop(listener, name, log_cap, first_attach_secs)` — `cmd`
+  never reaches `spawn_child(&[])` (`main.rs:48`). Pre-existing, not this card's job, but it
+  means **no verification here may rely on `ghostd new name seq …`**; the session is
   driven by attaching and typing into the login shell (see §2, manual check).
 
 ### 1. What changes, file by file
@@ -3358,7 +3370,7 @@ Unit tests (in the existing `mod tests`, using the `state_dir_for` temp-dir help
 
 **`ghostd/src/main.rs`** — the replay step only.
 
-* Replace `handle_client` step 3 (`:211-225`) with:
+* Replace `handle_client` step 3 (`:211-226`) with:
 
   ```rust
   // 3. Replay a bounded tail of the log — history continuity without wedging
@@ -3380,7 +3392,9 @@ Unit tests (in the existing `mod tests`, using the `state_dir_for` temp-dir help
 
 **`ghostd/tests/lifecycle.rs`** — the end-to-end bound, on the real binary.
 
-* Add a raw-bytes attach helper next to `Attach` (`:217-275`), because `Attach` drains
+* Add a raw-bytes attach helper after `Attach` (`struct Attach` `:262-266`, `impl Attach`
+  `:268-308` at `c395551` — the card's `:238` is `impl Drop for Sandbox`, which drifted),
+  because `Attach` drains
   through `String::from_utf8_lossy` and a byte budget must be counted in bytes:
   `fn attach_raw(&self, name: &str) -> RawAttach` collecting into `Arc<Mutex<Vec<u8>>>`,
   with `fn len(&self)`, `fn bytes(&self)`, `fn wait_quiet(&self, quiet: Duration, max:
@@ -3402,16 +3416,31 @@ Unit tests (in the existing `mod tests`, using the `state_dir_for` temp-dir help
 
 **`src/pty_bridge.rs`** — bound what reaches the UI and stop growing a queue for a replay.
 
-* `COALESCE_CAP`: `256 * 1024` → `32 * 1024`, with the doc comment saying why (one iced
-  update's `vt_write` is the longest a key can wait; a replay then arrives as ~8 updates
-  per 256 KiB instead of one).
+* `COALESCE_CAP`: `256 * 1024` → `32 * 1024`, and the doc comment says exactly what it now
+  guarantees: "Cap, in bytes, on **every** coalesced output message this bridge sends. The
+  coalesce loop stops extending past it, and a reader chunk larger than the cap is split
+  before it is sent, so one iced update's `vt_write` never exceeds it — that is the longest a
+  key can wait behind one update." (Today's comment claims a per-update bound the code does
+  not have: `spawn_reader` hands over up to 64 KiB per `PtyMsg::Data` (`src/pty.rs:133`) and
+  only the coalesce *loop* is capped (`:63`), so the first chunk goes out whole. This
+  revision takes **option (a)** of review finding D2 — split an over-cap first chunk before
+  `send` — so the claim becomes true rather than being restated weaker. That adds one
+  behaviour ("cap every message, splitting when needed") to the same file and the same gate
+  run: S2 stays one sitting, daemon half then front-end half if stage 3 must split it.)
 * `const COALESCE_QUEUE: usize = 64;` — at most 64 × 32 KiB = 2 MiB in flight between the
-  bridge thread and the UI, instead of an unbounded `Vec` queue.
+  bridge thread and the UI, a *hard* bound now that every message is ≤ `COALESCE_CAP`,
+  instead of an unbounded `Vec` queue.
+* `Slot`'s field types change with the bounded channel (review finding **D3**): `rx` at
+  `:31`, `Mutex<Option<fmpsc::UnboundedReceiver<BridgeMsg>>>` →
+  `Mutex<Option<fmpsc::Receiver<BridgeMsg>>>`; `keepalive` at `:35`,
+  `Option<fmpsc::UnboundedSender<BridgeMsg>>` → `Option<fmpsc::Sender<BridgeMsg>>`.
+  Compile-forced by the channel swap, but it is part of this file's diff and stage 4 will
+  read it.
 * `fmpsc::channel::<BridgeMsg>(COALESCE_QUEUE)` in `spawn` (`:52`) and in `idle` (`:117`)
   instead of `fmpsc::unbounded`. Do **not** use `iced::futures::executor::block_on`: iced
   depends on `futures` with `default-features = false, features = ["std", "async-await"]`
   (`iced_futures-0.14.0/Cargo.toml:51-57`), so the `executor` module is not compiled in.
-  Instead add one helper, used for every send:
+  Instead add two helpers, used for every send:
 
   ```rust
   /// Hands `msg` to the UI, waiting (1 ms at a time) while the queue is full so a
@@ -3429,20 +3458,44 @@ Unit tests (in the existing `mod tests`, using the `state_dir_for` temp-dir help
           }
       }
   }
+
+  /// Sends `buf` as one or more `COALESCE_CAP`-sized data messages, then empties it.
+  /// A single reader chunk can exceed the cap (`spawn_reader` reads up to 64 KiB,
+  /// `src/pty.rs:133`), so the split is what makes "at most `COALESCE_CAP` per
+  /// `Message::Output`" true instead of merely typical. Returns false once the UI
+  /// side is gone.
+  fn send_data(tx: &mut fmpsc::Sender<BridgeMsg>, buf: &mut Vec<u8>) -> bool {
+      let mut start = 0;
+      while start < buf.len() {
+          let end = (start + COALESCE_CAP).min(buf.len());
+          if !send_blocking(tx, BridgeMsg::Data(buf[start..end].to_vec())) {
+              return false;
+          }
+          start = end;
+      }
+      buf.clear();
+      true
+  }
   ```
 
-  Every `tx.unbounded_send(...)` in the thread (`:78, :83, :88, :92, :96`) becomes
+  The `PtyMsg::Data` arm becomes `if !buf.is_empty() && !send_data(&mut tx, &mut buf) {
+  return; }`, replacing the `tx.unbounded_send(… std::mem::take(&mut buf))` at `:77-81`.
+  Every other `tx.unbounded_send(...)` in the thread (`:83, :88, :92, :96`) becomes
   `if !send_blocking(&mut tx, …) { return; }`. Backpressure then runs the existing chain:
   bridge thread waits → the reader's `sync_channel(512)` fills → the reader thread blocks
   in `send` → the pty buffer fills → the flooding program blocks on write. That is what a
   terminal does; **terminal output is never dropped**.
-* `stream()` (`:127-135`) is unchanged — it still maps one `BridgeMsg` to one
-  `Message::Output`; only the message size and queue depth change.
+* `stream()` (`:127-136`) is unchanged apart from the receiver type — a bounded
+  `fmpsc::Receiver` is still a `Stream`, so the `map` from one `BridgeMsg` to one
+  `Message::Output` stays; only the message size and queue depth change.
 * `#[cfg(test)] mod tests` (the file has none today):
-  * `a_replay_sized_burst_arrives_as_bounded_messages` — feed 1 MiB through
-    `sync_channel` in 4 KiB chunks, drive `stream()` with a hand-rolled poll loop
+  * `a_replay_sized_burst_arrives_as_bounded_messages` — feed **a 96 KiB first chunk** (one
+    and a half caps: larger than any message may be, which is the only feed that can make the
+    `<= COALESCE_CAP` assertion fail — 4 KiB chunks always coalesce to exactly the cap),
+    then 4 KiB chunks up to 1 MiB total, through `sync_channel`, and drive `stream()` with a
+    hand-rolled poll loop
     (`std::task::Waker::noop()` + `Context::from_waker`, 1 ms sleep on `Pending`; no
-    executor needed), assert every `Message::Output` payload is `<= COALESCE_CAP`, the
+    executor needed). Assert every `Message::Output` payload is `<= COALESCE_CAP`, the
     concatenation equals the input exactly, and the message count is
     `>= 1 MiB / COALESCE_CAP` (a replay is many updates, not one blob). The poll loop runs
     a stand-in for the key path (increment a counter) after each message and asserts it ran
@@ -3464,24 +3517,45 @@ Unit tests (in the existing `mod tests`, using the `state_dir_for` temp-dir help
 
 Nothing else changes. In particular `src/main.rs`'s `Message::Output` arm, `src/pane.rs`,
 `src/remote.rs`, `src/config.rs`, `src/session.rs` and the daemon's live relay
-(`main.rs:319-339`) are untouched.
+(`main.rs:228-341`) are untouched.
 
 ### 2. How it is verified (stage 3 runs these and pastes the real output)
 
-From the repo root, on the job branch:
+From the repo root, on the job branch. `CARGO_TARGET_DIR` is keyed to **the executing
+card's own id** (`ghostwave-$HERMES_KANBAN_TASK`), never another card's directory — the
+first draft of this plan hardcoded the PLAN card's id, which is exactly what stage 3 must
+not do:
 
 ```
-CARGO_TARGET_DIR=/var/build/ghostwave-t_78037545 nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo test"
-CARGO_TARGET_DIR=/var/build/ghostwave-t_78037545 nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo test --manifest-path ghostd/Cargo.toml"
-CARGO_TARGET_DIR=/var/build/ghostwave-t_78037545 nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo clippy --all-targets"
-CARGO_TARGET_DIR=/var/build/ghostwave-t_78037545 nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo clippy --all-targets --manifest-path ghostd/Cargo.toml"
+export CTD=/var/build/ghostwave-$HERMES_KANBAN_TASK
+CARGO_TARGET_DIR=$CTD nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo test"
+CARGO_TARGET_DIR=$CTD nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo test --manifest-path ghostd/Cargo.toml"
+CARGO_TARGET_DIR=$CTD nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo clippy --all-targets"
+CARGO_TARGET_DIR=$CTD nix-shell --run "bash ~/.hermes/scripts/build_gate.sh cargo clippy --all-targets --manifest-path ghostd/Cargo.toml"
 ```
 
-Expected: root `cargo test` green with the bin tests at **204** (201 at `5ba2ff8` + 2
-`pty_bridge` + 1 `input`), lib at 93, integration unchanged, 0 failures; ghostd green with
-lifecycle at **10** (9 + `an_attach_replays_only_a_bounded_tail`) and lib at **12** (8 + 4
-`replay_tail` tests). Record the clippy warning count *before* the change and assert it did
-not grow (the remaining ones at `5ba2ff8` are pre-existing — `dead_code` in `input.rs`,
+Both manifests are needed: the root run does not build `ghostd`'s tests and the `ghostd/` run
+does not build the app's.
+
+Expected counts, stated against the **branch-tip baseline at `c395551`** so stage 3 can
+reconcile instead of guessing:
+
+| suite | baseline at `c395551` | this plan adds | expected after S2 |
+|---|---|---|---|
+| root bin (`cargo test`) | 201 (unchanged since `5ba2ff8`: `src/` carries the same 294 `#[test]` at both revisions) | 2 `pty_bridge` + 1 `input` | **204** |
+| root lib | 93 | 0 | **93** |
+| `ghostd` lifecycle | **12** | 1 (`an_attach_replays_only_a_bounded_tail`) | **13** |
+| `ghostd` lib | **10** | 4 (`replay_tail` unit tests) | **14** |
+
+The round-1 review card says stage 3 "will see lib 13 / lifecycle 14"; that is the same +5
+split the other way (3 lib + 2 lifecycle). This plan names **four** `replay_tail` unit tests
+and **one** lifecycle test (§1), so the numbers to reconcile against are lib 14 / lifecycle
+13. If stage 3 lands a different split it must say which named test replaced which — the
+total (+5 in `ghostd`) is what must hold, and every one of the tip's 12 lifecycle + 10 lib
+tests must still pass (none of them touches the replay step or `pty_bridge`).
+
+Record the clippy warning count *before* the change and assert it did
+not grow (the remaining ones at `c395551` are pre-existing — `dead_code` in `input.rs`,
 the `ghostd` `cmd` unused argument, and `remote.rs:736`; take the count with
 `cargo clippy --all-targets 2>&1 | grep -c '^warning'` before and after). `rc 3` from the gate = another build holds the lock →
 comment that on the card and block `transient`, never compile anyway; `rc 4` = RAM floor →
@@ -3492,7 +3566,7 @@ are directly observable):
 
 ```
 export GHOSTWAVE_STATE_DIR=$(mktemp -d /tmp/gw-s2-XXXX)
-B=/var/build/ghostwave-t_78037545/debug/ghostd          # after cargo build --manifest-path ghostd/Cargo.toml
+B=$CTD/debug/ghostd          # after cargo build --manifest-path ghostd/Cargo.toml with the same CARGO_TARGET_DIR
 "$B" new big
 # Fill the log by driving the session's own shell (ghostd new ignores a command argument).
 ( sleep 0.5; printf 'seq 1 400000; echo TAIL-MARKER-42\n'; sleep 3 ) | "$B" attach big >/dev/null
@@ -3515,17 +3589,18 @@ for this job, and stage 4/5 should record it as such rather than as verified her
 ### 3. Scope edges — the smallest honest change
 
 Done: a named 256 KiB replay bound snapped to a line boundary; the UI fed in 32 KiB
-updates through a 64-message bounded queue with backpressure; tests at the daemon, the
-bridge and the ingest seam.
+updates through a 64-message bounded queue with backpressure, where "32 KiB" is a real
+per-message cap (an over-cap reader chunk is split before it is sent); tests at the daemon,
+the bridge and the ingest seam.
 
 Explicitly **not** done: replay resume offsets (the card excludes them); any protocol
 change, including the `OK\n` handshake and the `SIZE`/DCS size messages; any new config key
 or CLI flag (D7 — the bound is a constant); any new dependency; dynamic/adaptive bounds;
-bounding the daemon's live per-client buffer `client_out` (`main.rs:320-331`, which grows
+bounding the daemon's live per-client buffer `client_out` (`main.rs:319-332`, which grows
 while a client is slow *during* live output — a different defect, and backpressure there
 would need a decision the card does not make); dropping terminal output under load (the
 front end backpressures instead); the session-file log replay at startup
-(`src/session.rs:451`); plain `ssh <host>` panes; S1's kill/tombstone behaviour; upstream.
+(`src/session.rs:439-453`); plain `ssh <host>` panes; S1's kill/tombstone behaviour; upstream.
 
 ### 4. Risks / unknowns
 
@@ -3535,7 +3610,8 @@ front end backpressures instead); the session-file log replay at startup
 | A tail with **no** newline (a single line longer than the bound, or `\r`-only progress output). | Nothing is snapped; the tail is returned bounded as-is. Documented on the helper and pinned by `a_tail_with_no_line_break_is_still_bounded` (exactly `cap` bytes, the file's last bytes). Accepted: bounded garbage beats an unbounded replay. |
 | Snapping lands on an empty result (the window begins with `\n` as its last byte). | `replay_tail` returns empty, `handle_client` skips the write, live relay starts immediately. Correct (there is nothing to show) and cheaper than today. |
 | The log grows between `metadata` and the read, so the replay exceeds the bound. | `f.take(cap)` caps the read; the test writes `> 1 MiB` and asserts `<= bound + 4096`, so a regression here fails. |
-| Bounding the daemon alone is not enough — a 256 KiB replay still arrives as one 256 KiB `vt_write`. | Both halves are planned: `COALESCE_CAP` 32 KiB and the bounded queue. `a_replay_sized_burst_arrives_as_bounded_messages` fails if a message ever exceeds `COALESCE_CAP`. |
+| Bounding the daemon alone is not enough — a 256 KiB replay still arrives as one 256 KiB `vt_write`. | Both halves are planned: `COALESCE_CAP` 32 KiB and the bounded queue. `a_replay_sized_burst_arrives_as_bounded_messages` feeds a first chunk larger than the cap and fails if a message ever exceeds `COALESCE_CAP`. |
+| A split inside a reader chunk cuts an escape sequence or a UTF-8 character in half. | Harmless: `Message::Output` reaches `pane.ingest` → `vt_write` (`src/pane.rs:381`), and the Ghostty parser is stateful across calls — it already sees arbitrary boundaries because the daemon writes the log in 32 KiB pieces and the reader reads up to 64 KiB. The split only chooses different boundaries, never reorders or drops bytes (the test asserts the concatenation equals the input exactly). |
 | `iced::futures` has no executor, so `block_on`/`.send().await` is unavailable. | Verified in the registry manifest (`iced_futures-0.14.0/Cargo.toml` sets `default-features = false`); the plan uses `try_send` + a 1 ms sleep loop and needs no feature flag. |
 | A full queue blocks the bridge thread while its pane is being torn down. | `send_blocking` returns `false` on `TrySendError::disconnected` and the thread exits, exactly as today's `unbounded_send(...).is_err()` path did. |
 | The reader thread stalls with the queue full, so the pty child blocks on write. | That is the intended backpressure chain (§1), and the child's output is still being logged by the daemon on the remote side; a local pane's child simply runs slower while the UI drains. No new deadlock: the UI always polls the stream while the pane exists. |
@@ -3548,14 +3624,17 @@ front end backpressures instead); the session-file log replay at startup
 1. `ghostd/src/lib.rs`: add `REPLAY_TAIL_BYTES` + `replay_tail` with the §1 contract and
    its four unit tests; run `cargo test --manifest-path ghostd/Cargo.toml --lib`.
 2. `ghostd/src/main.rs`: swap the replay step for `replay_tail`, fix the import list, run
-   the ghostd suite (the 9 existing lifecycle tests must stay green — nothing in S1's
-   paths moves).
+   the ghostd suite (the 12 lifecycle tests and 10 lib tests at the tip must stay green —
+   nothing in S1's or the FIX's paths moves).
 3. `ghostd/tests/lifecycle.rs`: add `RawAttach` + `an_attach_replays_only_a_bounded_tail`;
    run it alone, then the whole ghostd suite.
-4. `src/pty_bridge.rs`: `COALESCE_CAP` → 32 KiB, `COALESCE_QUEUE` + `fmpsc::channel` +
-   `send_blocking`, and its two tests; run `cargo test --bin ghostwave pty_bridge`.
+4. `src/pty_bridge.rs`: `COALESCE_CAP` → 32 KiB and its corrected doc comment, the `Slot`
+   field types (`rx`, `keepalive`), `COALESCE_QUEUE` + `fmpsc::channel` + `send_blocking` +
+   `send_data` (the over-cap split), and its two tests; run
+   `cargo test --bin ghostwave pty_bridge`.
 5. `src/input.rs`: add `a_replay_sized_ingest_leaves_the_next_key_working`.
-6. Full gate: both `cargo test` runs and both clippy runs (§2), paste the real output.
+6. Full gate: both `cargo test` runs and both clippy runs (§2), paste the real output, and
+   reconcile the counts against the §2 table (bin 204 / lib 93 / lifecycle 13 / lib 14).
 7. Manual check in §2 against a scratch `GHOSTWAVE_STATE_DIR`; record the byte count and
    `grep -c TAIL-MARKER`, and the before number if it is cheap to take on `5ba2ff8`.
 8. Commit in that order (daemon helper → daemon call site → lifecycle test → bridge →
@@ -3563,17 +3642,20 @@ front end backpressures instead); the session-file log replay at startup
 
 ### 6. Bite-size split
 
-**One sitting.** 5 files, ~330 changed lines, no new dependency, no cross-crate API
+**One sitting.** 5 files, ~350 changed lines, no new dependency, no cross-crate API
 change (one new `pub` helper in `ghostd`'s own lib), and the two test suites it touches are
 the ones this job already runs. Compare S1: 12 files / ~470 lines in one sitting. If stage 3
 finds the lifecycle test cannot be made deterministic within one attempt, the natural split
 is *daemon half* (items 1–3) then *front-end half* (items 4–5) — the two halves do not
 share a file and each is independently verifiable — but there is no reason to expect that.
+The D2 split (`send_data`) does not add a second behaviour to plan around: it is part of
+"cap every message" and lands in item 4 with the rest of the bridge.
 
 ### 7. What stage 2 has to judge
 
 1. **Is 256 KiB the right bound**, and is `32 KiB`/`64 messages` a defensible UI-side
-   pairing (2 MiB in flight), or does it over-constrain throughput?
+   pairing (2 MiB in flight — a hard bound once every message is split to ≤ `COALESCE_CAP`,
+   as §1 now does), or does it over-constrain throughput?
 2. **Is the line-snap fallback honest** — is returning an unsnapped bounded tail the right
    answer for a log with no newline in the window, versus replaying nothing?
 3. **Is the `OK\n` claim true** — does bounding the bytes after the ack leave every reader
