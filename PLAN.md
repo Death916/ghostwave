@@ -3052,8 +3052,22 @@ then push with: bash ~/.hermes/scripts/fleet_push.sh dev "$PWD" origin wt/fix-ki
 #### 4.1 S1 — wire the decoder, and prove where the payload dies
 
 1. **Measure first (no code change).** Add the ingest test of §6.1 in two forms and paste both results: with the
-   decoder not installed and after `install_png_decoder()`. Expected: `None` then `Some`. If the first is already
-   `Some`, stop and comment on the card — defect 1 is disproven and S1 collapses to the startup call alone.
+   decoder not installed and after `install_png_decoder()`, **both on the same thread and in that order**.
+   Precondition the test must establish itself: `set_kitty_image_storage_limit(64 * 1024 * 1024)` on the raw
+   `Terminal` (mirroring `term.rs:321-325`). Storage enabled and a decoder installed are the *two* independent
+   prerequisites for a stored image (`graphics.rs:15-18`) and only the second is what S1 changes, so the test says
+   which one it is exercising. Print `kitty_image_storage_limit()` on the fresh `Terminal`, before the setter, and
+   paste it: the pinned libghostty commit (`a887df4`, `src/terminal/Screen.zig:259-262` and
+   `Terminal.zig:250-257`) defaults to a **non-zero** limit — 10 MB (`10 000 000`) for the `.lib` artifact that
+   `libghostty-vt-sys` builds (`build.rs:147` passes `-Demit-lib-vt=true`) and 320 MB for `.ghostty` — and to zero
+   only when kitty graphics is compiled out (in which case the whole chain is moot). So the expected reading is
+   `10000000`, or `320000000` if the artifact flag is not what this build uses; anything non-zero means storage is
+   already enabled and only the decoder is missing. The value is printed so it is a measurement, and the setter is
+   called anyway so the test never depends on the artifact default.
+   Expected: `None` then `Some`. If the first is already `Some`, stop and comment on the card — defect 1 is
+   disproven and S1 collapses to the startup call alone. That stop-rule is live: with storage enabled and no
+   decoder on the thread, a PNG is rejected (`is_none()`), so `Some` can only mean the payload was accepted
+   without a decoder.
 2. **Make the install idempotent and impossible to forget.** `install_png_decoder()` (`term.rs:1271`) is
    process-global (`graphics::set_png_decoder`, a `thread_local` in the crate, `graphics.rs:828-880`) and must run
    on the same thread as the terminals, which for us is the iced main thread that creates every `Pane`. Call it
@@ -3117,17 +3131,24 @@ then push with: bash ~/.hermes/scripts/fleet_push.sh dev "$PWD" origin wt/fix-ki
 
 ---
 
-### 6. Tests — each one fails when the work is wrong
+### 6. Tests — each one fails when the work is wrong, except the ones labelled pin / green control
 
 Baseline at `2128be3`: **285** test functions in `src/` + **7** in `tests/` = **292**
 (`grep -rh '#\[test\]' src/ | wc -l`, `… tests/ | wc -l`).
 
 **Chain A**
 
-1. `term::tests::png_payload_is_rejected_without_a_decoder` (S1, RED first). Build a `Terminal` (as
-   `terminal_responds_to_probes` does, `term.rs:1317`), `vt_write` a hand-built APC for a 1×1 PNG
-   (`ESC _ G i=1,a=T,f=100;<base64> ESC \`), assert `kitty_graphics().image(1).is_none()`. Then, in a *separate
-   test binary run* (see 2), the same payload must be `Some`.
+1. `term::tests::png_payload_is_rejected_without_a_decoder` (**green control, not RED** — same class as the pins;
+   it documents *why* the payload dies, it does not prove the fix). Build a `Terminal` as
+   `terminal_responds_to_probes` does (`term.rs:1317`) **and call `set_kitty_image_storage_limit(64 * 1024 * 1024)`
+   on it** (mirroring `term.rs:321-325`; at this pin the raw default is already non-zero — 10 MB for `.lib`,
+   320 MB for `.ghostty` (`Screen.zig:259-262`) — so the call only removes dependence on that default), `vt_write` a
+   hand-built APC for a 1×1 PNG (`ESC _ G i=1,a=T,f=100;<base64> ESC \`), assert
+   `kitty_graphics().image(1).is_none()`. Also assert
+   `kitty_image_storage_limit().unwrap() > 0` so a future default of zero cannot make the test green for the wrong
+   reason. Green on `2128be3` and green after S1: `set_png_decoder`'s callback lives in a `thread_local`
+   (`graphics.rs:815-817`), so a test thread that never installs one gets `false` and the image is rejected no
+   matter what other tests in the process did. The "now it is accepted" half is §6.2's job.
 2. `term::tests::a_fresh_process_accepts_a_kitty_png` (S1, RED first) — the one that pins the *wiring*, which is
    the actual defect. The decoder is process-global and one-way, so a test that calls `install_png_decoder()` in
    the same process cannot tell "wired at startup" from "the previous test installed it". Re-exec the test binary
@@ -3136,12 +3157,19 @@ Baseline at `2128be3`: **285** test functions in `src/` + **7** in `tests/` = **
    `Term::new` call. Add `--test-threads` independence by giving the child its own `CARGO_TARGET_DIR`-free path
    (no build in the child).
 3. `term::tests::a_stored_placement_becomes_one_box` (S2, RED first — `placement_boxes` does not exist).
-   Install the decoder, `vt_write` a `a=T,i=7` PNG of 2×2 px with `c=2,r=1` so the grid size is known, assert
+   Same raw `Terminal` setup as (1) **including `set_kitty_image_storage_limit(64 * 1024 * 1024)`**, then
+   `install_png_decoder()` *on that test's own thread* (the callback is a `thread_local`, `graphics.rs:815-817`),
+   `vt_write` a `a=T,i=7` PNG of 2×2 px with `c=2,r=1` so the grid size is known, assert
    `placement_boxes(&term, cell)` returns exactly one box with `image_id == 7`, `w == 2`, `h == 2`,
    `x == 0.0`, `y == 0.0` at the cursor origin, and that a second write with `a=p,i=7,p=…` adds a second box.
-4. `pane_canvas::tests::an_image_is_drawn_inside_the_pane_body` (S2). Pure arithmetic on the draw pass: for one
-   box and a pane rect, the destination rectangle is inside `rect` inset by `padding` — and therefore ≥ `padding`
-   from every edge, so it cannot touch a stroke. This is the guard that keeps chain A from re-opening chain B.
+   The box count is meaningful only because storage is on and the decoder is installed on this thread; with either
+   missing the image never stores and the assertion fails for an unrelated reason.
+4. `pane_canvas::tests::an_image_is_drawn_inside_the_pane_body` (S2, RED first — it takes a `PlacementBox`,
+   which does not exist before S2, so at base it does not compile). Pure arithmetic on the draw pass, no iced
+   types: for one `PlacementBox` and a pane rect, the destination rectangle the pass would use sits inside `rect`
+   inset by `padding` — and therefore ≥ `padding` from every edge, so it cannot touch a stroke. After S2 it fails
+   if the pass stops insetting (draws in window space, or skips the body inset/clip). This is the guard that keeps
+   chain A from re-opening chain B.
 5. The manual, owner-run check of §7.2 — a human check cannot exit non-zero, so it is a
    checklist item marked `NEEDS-OWNER-VERIFY`, not a test.
 
@@ -3171,7 +3199,7 @@ export CARGO_TARGET_DIR=/var/build/ghostwavekitty      # chain A
 # 0. baseline, before the diff (paste it next to the after-run)
 grep -rh '#\[test\]' src/ | wc -l        # 285
 grep -rh '#\[test\]' tests/ | wc -l      # 7
-grep -rh '#\[test\]' ghostd/ | wc -l     # 0
+grep -rh '#\[test\]' ghostd/ | wc -l     # 12 (ghostd is not a workspace member — outside the root `cargo test`)
 
 # 1. the suite, through the shell and the gate
 bash ~/.hermes/scripts/build_gate.sh nix-shell --run \
@@ -3193,8 +3221,9 @@ bash ~/.hermes/scripts/build_gate.sh nix-shell --run \
 bash ~/.hermes/scripts/build_gate.sh nix-shell --run \
   'CARGO_TARGET_DIR=/var/build/ghostwavekitty cargo test focus_does_not_change_the_inset 2>&1 | tail -15'
 ```
-A test that is green before the change is labelled a **pin** in the commit body (chain B's (7) and (8), chain A's
-(4)), never presented as evidence of a fix.
+A test that is green before the change is labelled a **pin** (or a **green control**, when it documents behaviour
+rather than protecting it) in the commit body — chain B's (7) and (8), chain A's (1) — never presented as evidence
+of a fix. Chain A's (2), (3) and (4) are RED first and must be pasted failing before their code lands.
 
 **7.2 the owner-visible check — cannot be done on orac** (`kitten`/`kitty` not installed, no display), so it goes
 on the card as `NEEDS-OWNER-VERIFY` with the exact commands:
@@ -3252,8 +3281,9 @@ collect is `GHOST_ICED_DEBUG=1` output plus the terminal's reply to the graphics
 ### 10. Ordered work items for stage 3
 
 **Chain A (`wt/fix-kitty-graphics`), sitting 1 of 2** — ingest wiring:
-1. Write §6.1 and §6.2, run both on `2128be3`, paste the RED output; if §6.1's "no decoder" half is already
-   `Some`, comment on the card and stop.
+1. Write §6.1 and §6.2, run both on `2128be3`: paste **§6.2's RED output** (that is S1's failing evidence) and
+   §6.1's green output *with* the printed `kitty_image_storage_limit()` value; if §6.1's "no decoder" half is
+   already `Some`, comment on the card and stop.
 2. Add the `Once`-guarded `install_png_decoder()` call to `Term::new` (`term.rs:255`); fix the comment at
    `term.rs:1268-1270`; commit.
 3. Re-run §6.1/§6.2 (green), §7.1, §7.2's clippy; paste the full suite count.
@@ -3282,6 +3312,7 @@ collect is `GHOST_ICED_DEBUG=1` output plus the terminal's reply to the graphics
    not reproducible in our layer and the acceptance for it is an owner check. Is that acceptable, or does the card
    want a bigger investigation before any frame code lands?
 4. **Are the numbers right?** 292 base test functions, chain A → 296, chain B → 294; two pins declared as pins
-   (§6 (7), (8), (4)) rather than as fixes.
+   (§6 (7), (8)) and chain A's (1) declared a green control rather than a fix, with the RED-first tests named as
+   such ((2), (3), (4) in chain A, (6) in chain B).
 5. **Are the branch mechanics safe?** Two branches off `2128be3`, no reuse of this plan's
    `wt/fix-kitty-images-pane-frame`, no push to `master`, PRs opened but not merged.
