@@ -704,6 +704,89 @@ fn a_kill_of_an_unknown_name_tombstones_it() {
     assert!(out.status.success(), "and then it can be created: {out:?}");
 }
 
+/// The socket, pidfile and tombstone are all `<state dir>/<name>.*`, so a kill
+/// whose name carries a path separator would name files outside the state
+/// directory: `kill ../victim` would delete `<state dir>/../victim.sock` and
+/// tombstone `<state dir>/../victim.killed`. The name is refused before any of
+/// those paths is derived.
+#[test]
+fn a_kill_of_a_traversing_name_is_refused_before_it_touches_anything() {
+    let sandbox = Sandbox::new("traversal");
+    let outside = sandbox.dir.parent().expect("the state dir has a parent").to_path_buf();
+    let tag = sandbox
+        .dir
+        .file_name()
+        .expect("the state dir has a name")
+        .to_string_lossy()
+        .to_string();
+    let victim = format!("{tag}-victim");
+    // The file the unfixed code deletes on its daemon-less path
+    // (`fs::remove_file(socket_path(name))`) and the marker it writes next.
+    let sock = outside.join(format!("{victim}.sock"));
+    let tombstone = outside.join(format!("{victim}.killed"));
+    fs::write(&sock, b"do not touch").expect("the sentinel is written");
+    let _ = fs::remove_file(&tombstone);
+
+    for name in [format!("../{victim}"), format!("sub/{victim}"), String::new()] {
+        let out = sandbox.run(&["kill", &name]);
+        assert!(!out.status.success(), "'{name}' is refused: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("bad session name"),
+            "'{name}' is refused by name validation: {out:?}"
+        );
+    }
+
+    assert_eq!(
+        fs::read_to_string(&sock).expect("the sentinel survives"),
+        "do not touch",
+        "nothing outside the state dir was removed or written"
+    );
+    assert!(!tombstone.exists(), "and no tombstone was created outside it");
+    assert!(
+        !sandbox.path(&format!("sub/{victim}.killed")).exists(),
+        "nor inside a subdirectory named by the traversal"
+    );
+
+    // The same rule guards every verb that derives a path from a name, so the
+    // refusal cannot be sidestepped by choosing another one.
+    let traversing = format!("../{victim}");
+    assert!(!sandbox.run(&["new", &traversing]).status.success(), "new refuses it");
+    assert!(!sandbox.run(&["unkill", &traversing]).status.success(), "unkill refuses it");
+    assert!(
+        fs::read_to_string(&sock).expect("the sentinel still survives") == "do not touch"
+            && !tombstone.exists(),
+        "and neither verb touched the path outside the state dir"
+    );
+
+    let _ = fs::remove_file(&sock);
+}
+
+/// A symlink squatting on `<name>.killed` is not a tombstone, so it neither
+/// refuses the name nor survives the unkill: the link is unlinked and its target
+/// is never followed.
+#[test]
+fn a_symlink_marker_does_not_pin_a_name_and_unkill_unlinks_it() {
+    let mut sandbox = Sandbox::new("marker-link");
+    let target = sandbox.path("sibling");
+    fs::write(&target, b"keep me").expect("the target is written");
+    std::os::unix::fs::symlink(&target, sandbox.path("l.killed")).expect("the link exists");
+
+    let out = sandbox.new_session("l");
+    assert!(
+        out.status.success(),
+        "a symlink marker does not refuse the name: {out:?}"
+    );
+
+    let out = sandbox.run(&["unkill", "l"]);
+    assert!(out.status.success(), "unkill clears the marker path: {out:?}");
+    assert!(!sandbox.path("l.killed").exists(), "the link is gone");
+    assert_eq!(
+        fs::read_to_string(&target).expect("the target survives"),
+        "keep me",
+        "and its target was not followed, emptied or removed"
+    );
+}
+
 /// A host that has never created a state dir is the daemon-less kill path
 /// (`kill <unknown name>`): nothing else creates the directory, so the tombstone
 /// writer must, or the "stays killed" claim has nothing behind it.
@@ -749,10 +832,20 @@ fn a_kill_records_its_tombstone_even_when_the_state_dir_does_not_exist_yet() {
 /// would then attach a name it cannot create).
 #[test]
 fn an_unkill_whose_tombstone_will_not_clear_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    if nix::unistd::geteuid().is_root() {
+        eprintln!("skipped: a root process can unlink from a read-only directory");
+        return;
+    }
     let sandbox = Sandbox::new("unkill-stuck");
-    fs::create_dir_all(sandbox.path("stuck.killed")).expect("the obstruction exists");
+    fs::write(sandbox.path("stuck.killed"), b"killed 0 0\n").expect("the tombstone exists");
+    fs::set_permissions(&sandbox.dir, fs::Permissions::from_mode(0o500))
+        .expect("the state dir loses its write bit");
 
     let out = sandbox.run(&["unkill", "stuck"]);
+
+    fs::set_permissions(&sandbox.dir, fs::Permissions::from_mode(0o700))
+        .expect("the write bit is restored so the sandbox can be removed");
     assert!(
         !out.status.success(),
         "a tombstone that will not clear is not reported cleared: {out:?}"
@@ -764,21 +857,55 @@ fn an_unkill_whose_tombstone_will_not_clear_fails() {
     assert!(sandbox.path("stuck.killed").exists(), "the tombstone is still there");
 }
 
-/// `new --force` clears the tombstone after the bind, so a clear that fails must
-/// stop it before it daemonizes: a daemon running under a live tombstone is a
-/// session the user re-created and that every attach then calls killed.
+/// A non-tombstone object on the marker path (here a non-empty directory) never
+/// killed the name, so it must not be reported as one — but `unkill` must also
+/// not claim the path is clear when it could not remove the object.
+#[test]
+fn an_unkill_of_a_non_tombstone_marker_reports_it_instead_of_claiming_a_clear() {
+    let mut sandbox = Sandbox::new("unkill-foreign");
+    fs::create_dir_all(sandbox.path("odd.killed")).expect("the obstruction exists");
+    fs::write(sandbox.path("odd.killed/inside"), b"x").expect("a file inside it");
+
+    let out = sandbox.run(&["unkill", "odd"]);
+    assert!(
+        !out.status.success(),
+        "a clear that removed nothing is not a success: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not killed"),
+        "and the message does not call the name killed: {out:?}"
+    );
+    assert!(
+        sandbox.path("odd.killed/inside").exists(),
+        "the obstruction was neither removed nor recursed into"
+    );
+
+    // The name was never killed, so the automatic path may create it even though
+    // the obstruction is still there: nothing is pinned forever.
+    let out = sandbox.new_session("odd");
+    assert!(
+        out.status.success(),
+        "a non-tombstone marker does not refuse the name: {out:?}"
+    );
+}
+
+/// `new --force` clears the marker after the bind, so a marker path that will not
+/// clear must stop it before it daemonizes: a daemon running where the next
+/// kill's tombstone could not be renamed into place is a session whose kill
+/// cannot be recorded.
 #[test]
 fn a_force_new_whose_tombstone_will_not_clear_does_not_daemonize() {
     let mut sandbox = Sandbox::new("force-stuck");
     fs::create_dir_all(sandbox.path("stuck.killed")).expect("the obstruction exists");
+    fs::write(sandbox.path("stuck.killed/inside"), b"x").expect("a file inside it");
 
     let out = sandbox.run_new(&["new", "--force", "stuck"], "stuck");
     assert!(
         !out.status.success(),
-        "the override refuses a name it cannot un-kill: {out:?}"
+        "the override refuses a name whose marker path will not clear: {out:?}"
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("tombstone could not be cleared"),
+        String::from_utf8_lossy(&out.stderr).contains("kill marker could not be cleared"),
         "and says why: {out:?}"
     );
     assert!(

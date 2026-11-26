@@ -29,17 +29,29 @@ use nix::{
 
 use ghostd::{
     bind_listener, clear_tombstone, daemonize, dcs_size_msg, die, fd_poll, fd_read, gdbg,
-    install_term_handler, is_killed, kill_child_group, killed_path, log_path, pid_gone,
+    install_term_handler, is_killed, kill_child_group, killed_path, log_path, marker_state, pid_gone,
     probe_session, read_pidfile, recover_session, remove_state_if_owned, replay_tail,
     set_nonblock, set_term_size, socket_path, spawn_child, state_dir, term_size,
     truncate_log_front, write_all_blocking, write_pidfile, write_tombstone, write_tombstone_none,
-    ATTACH_ENDED, ATTACH_KILLED, ATTACH_NO_SESSION, ATTACH_WEDGED, DEFAULT_FIRST_ATTACH_SECS,
-    DEFAULT_LOG_CAP_MB, KILL_SUPERSEDED, Probe, REPLAY_TAIL_BYTES, TERM_REQUESTED, VERSION,
+    ATTACH_ENDED, ATTACH_KILLED, ATTACH_NO_SESSION, ATTACH_WEDGED, Cleared, DEFAULT_FIRST_ATTACH_SECS,
+    DEFAULT_LOG_CAP_MB, KILL_SUPERSEDED, MarkerState, Probe, REPLAY_TAIL_BYTES, TERM_REQUESTED, VERSION,
 };
 
 fn eprintln_exit(msg: &str) -> ! {
     eprintln!("ghostd: {msg}");
     std::process::exit(1);
+}
+
+/// Whether `name` is a session name this CLI may derive a state path from.
+///
+/// Every command that *changes* state through a name-derived path (`new`, `kill`,
+/// `unkill`) answers to this first, as does `kill-all` for each name it reads back
+/// out of the state dir: the socket, pidfile, log and tombstone are all
+/// `<state dir>/<name>.*`, so a name carrying a path separator — `../victim` —
+/// would name a file outside the state dir and let a kill remove, tombstone or
+/// signal another session's state.
+fn valid_session_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/')
 }
 
 /// Accept loop. `tx` is where pty output is published for the client.
@@ -350,7 +362,7 @@ fn handle_client(
 /// clears the tombstone only after the listener is bound, so a failed bind
 /// leaves the name killed instead of quietly un-killing it.
 fn cmd_new(name: &str, cmd: &[String], log_cap: u64, first_attach_secs: u64, force: bool) {
-    if name.is_empty() || name.contains('/') {
+    if !valid_session_name(name) {
         die("bad session name");
     }
     if is_killed(name) && !force {
@@ -383,13 +395,21 @@ fn cmd_new(name: &str, cmd: &[String], log_cap: u64, first_attach_secs: u64, for
     let listener = bind_listener(name).unwrap_or_else(|e| die(&format!("{e}")));
     if force {
         // After the bind: a name this process cannot actually take stays killed.
-        // A tombstone that will not clear is that case — the daemon is up but the
-        // name it holds still reads killed, so say so instead of daemonizing.
-        if let Err(e) = clear_tombstone(name) {
-            die(&format!(
-                "'{name}' is bound, but its kill tombstone could not be cleared ({e}) — the name still reads killed; remove {} by hand",
+        // A marker path that will not clear is that case — the daemon is up but
+        // the name still reads killed (or something squats the marker path that
+        // the next kill's tombstone could not be renamed over), so say so instead
+        // of daemonizing.
+        match clear_tombstone(name) {
+            Err(e) => die(&format!(
+                "'{name}' is bound, but its kill marker could not be cleared ({e}) — the name {}; remove {} by hand",
+                if is_killed(name) { "still reads killed" } else { "cannot be recorded as killed" },
                 killed_path(name).display()
-            ));
+            )),
+            Ok(Cleared::Foreign(kind)) => eprintln!(
+                "ghostd: '{name}': removed a {kind} at {} that was not a kill tombstone",
+                killed_path(name).display()
+            ),
+            Ok(Cleared::Tombstone) | Ok(Cleared::Absent) => {}
         }
     }
     daemonize();
@@ -600,6 +620,12 @@ fn cmd_list() {
 /// the dead daemon: replay is only ever the history of the daemon that is
 /// attached to.
 fn cmd_kill(name: &str) {
+    // Before any path is derived from it: the socket, pidfile, log and tombstone
+    // are all `<state dir>/<name>.*`, so a separator here would point the connect,
+    // the removal and the tombstone at another session's files.
+    if !valid_session_name(name) {
+        die("bad session name");
+    }
     let Some((daemon, child)) = read_pidfile(name) else {
         let sock = socket_path(name);
         if UnixStream::connect(&sock).is_ok() {
@@ -678,22 +704,39 @@ fn cmd_kill(name: &str) {
     println!("ghostd: killed '{name}'");
 }
 
-/// Clear a name's kill tombstone, so it may be created again.
+/// Clear a name's kill marker, so it may be created again.
 ///
 /// Idempotent: a name that was never killed exits 0 and creates nothing, which is
-/// what lets the explicit-connect script call it blindly. A tombstone that is
-/// there and cannot be removed is a failure: the name is still killed, so the
-/// command must not claim otherwise.
+/// what lets the explicit-connect script call it blindly. A regular tombstone
+/// that is there and cannot be removed is a failure: the name is still killed, so
+/// the command must not claim otherwise. A *non*-tombstone object on the path (a
+/// directory, a symlink) never killed the name: it is removed the safe way and
+/// reported, or — when it cannot be removed — the command says the name is not
+/// killed but the path is still occupied, instead of calling an untouched
+/// obstruction a successful clear.
 fn cmd_unkill(name: &str) {
-    if name.is_empty() || name.contains('/') {
+    if !valid_session_name(name) {
         die("bad session name");
     }
-    if let Err(e) = clear_tombstone(name) {
-        die(&format!(
-            "'{name}' is still killed: its tombstone could not be removed ({e})"
-        ));
+    let marker = marker_state(name);
+    match clear_tombstone(name) {
+        Err(e) => match marker {
+            MarkerState::Tombstone => die(&format!(
+                "'{name}' is still killed: its tombstone could not be removed ({e})"
+            )),
+            _ => die(&format!(
+                "'{name}' is not killed, but {} could not be removed ({e})",
+                killed_path(name).display()
+            )),
+        },
+        Ok(Cleared::Foreign(kind)) => println!(
+            "ghostd: '{name}' may be created again (removed a {kind} at {} that was not a kill tombstone)",
+            killed_path(name).display()
+        ),
+        Ok(Cleared::Tombstone) | Ok(Cleared::Absent) => {
+            println!("ghostd: '{name}' may be created again")
+        }
     }
-    println!("ghostd: '{name}' may be created again");
 }
 
 fn cmd_kill_all() {
@@ -705,6 +748,9 @@ fn cmd_kill_all() {
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         if let Some(base) = name.strip_suffix(".pid") {
+            if !valid_session_name(base) {
+                continue;
+            }
             cmd_kill(base);
             any = true;
         }

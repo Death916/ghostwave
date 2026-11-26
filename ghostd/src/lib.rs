@@ -303,11 +303,53 @@ pub fn killed_path(name: &str) -> PathBuf {
     state_dir().join(format!("{name}.killed"))
 }
 
+/// What `name`'s `<name>.killed` marker path holds, read with `symlink_metadata`
+/// so a symlink is classified as a symlink instead of being followed.
+///
+/// Only a regular file is a tombstone — that is exactly what [`write_tombstone`]
+/// puts there with a rename. A directory, a symlink or any other object
+/// squatting on the path is [`MarkerState::Foreign`] and does **not** kill the
+/// name, so a stale or hostile object can never pin a session name forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerState {
+    /// Nothing is at the marker path: the name is not killed.
+    Absent,
+    /// A regular tombstone file: the name is killed.
+    Tombstone,
+    /// A non-regular object that is not a tombstone. It never kills the name;
+    /// the kind is named for the operator's message.
+    Foreign(&'static str),
+}
+
+/// The kind of a non-regular marker object, for [`MarkerState::Foreign`].
+fn foreign_kind(ft: fs::FileType) -> &'static str {
+    if ft.is_dir() {
+        "directory"
+    } else if ft.is_symlink() {
+        "symlink"
+    } else {
+        "special file"
+    }
+}
+
+/// See [`MarkerState`]. Unreadable-or-absent both report [`MarkerState::Absent`]:
+/// a marker this process cannot stat is a marker no `is_killed` call may turn
+/// into a refusal.
+pub fn marker_state(name: &str) -> MarkerState {
+    match fs::symlink_metadata(killed_path(name)) {
+        Ok(meta) if meta.file_type().is_file() => MarkerState::Tombstone,
+        Ok(meta) => MarkerState::Foreign(foreign_kind(meta.file_type())),
+        Err(_) => MarkerState::Absent,
+    }
+}
+
 /// Whether `name` was killed and has not been explicitly un-killed.
 ///
-/// The presence of the file is the whole semantic; its body is diagnostic only.
+/// A regular tombstone file is the whole semantic; its body is diagnostic only.
+/// A directory or symlink on the path is not a tombstone (see [`MarkerState`]), so
+/// a name whose marker path holds one stays creatable.
 pub fn is_killed(name: &str) -> bool {
-    killed_path(name).exists()
+    marker_state(name) == MarkerState::Tombstone
 }
 
 /// Records that `name` was killed by `daemon`, so nothing recreates it until
@@ -347,22 +389,77 @@ fn write_tombstone_body(name: &str, body: &str) -> std::io::Result<()> {
     let dir = state_dir();
     fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!("{name}.killed.tmp"));
-    fs::write(&tmp, body)?;
+    // A temp file left by an interrupted writer is ours to replace, and unlinking
+    // it never follows it. The create then refuses anything else already at the
+    // path (O_EXCL) and refuses a symlink outright (O_NOFOLLOW), so a planted
+    // link can never make this write land outside the state dir.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        file.write_all(body.as_bytes())?;
+    }
+    // `rename` replaces whatever is at the destination (including a symlink)
+    // rather than writing through it.
     fs::rename(&tmp, killed_path(name))
 }
 
-/// Clears `name`'s tombstone, so it may be created again. Idempotent: a name
-/// that was never killed is left with no file, and no file is created.
+/// What [`clear_tombstone`] found and did at the marker path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cleared {
+    /// Nothing was there: the name was never killed (or was already cleared).
+    Absent,
+    /// The regular tombstone was unlinked.
+    Tombstone,
+    /// A non-tombstone object squatted on the path and was removed: a symlink is
+    /// unlinked (never followed), a directory is removed only if empty (never
+    /// recursed into), any other object is unlinked.
+    Foreign(&'static str),
+}
+
+/// Clears `name`'s kill marker, so it may be created again.
 ///
-/// Returns the I/O error when a tombstone that *does* exist could not be removed:
-/// the name is still killed, and a caller must say so rather than report the name
-/// creatable.
-pub fn clear_tombstone(name: &str) -> std::io::Result<()> {
-    match fs::remove_file(killed_path(name)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+/// A regular tombstone is unlinked, which makes the name creatable. A
+/// non-tombstone object on the path ([`MarkerState::Foreign`]) never killed the
+/// name; this removes it the only safe way — a symlink is unlinked without being
+/// followed, a directory is removed only when empty — and reports which kind it
+/// was. Idempotent: a name that was never killed is left with no file, and no
+/// file is created here — only the tombstone writer touches `<name>.killed.tmp`.
+///
+/// Returns the I/O error when something is still at the path afterwards: a
+/// tombstone that could not be unlinked, or a foreign object that could not be
+/// removed (a non-empty directory, an object in a read-only state dir). The
+/// caller must say so rather than report the marker clear. The name's killed
+/// state is [`is_killed`]'s answer throughout — a failed clear of a foreign
+/// object leaves a name that is not killed.
+pub fn clear_tombstone(name: &str) -> std::io::Result<Cleared> {
+    let path = killed_path(name);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Cleared::Absent),
+        Err(e) => return Err(e),
+    };
+    let ft = meta.file_type();
+    if ft.is_file() {
+        fs::remove_file(&path)?;
+        return Ok(Cleared::Tombstone);
     }
+    if ft.is_dir() {
+        fs::remove_dir(&path)?;
+        return Ok(Cleared::Foreign("directory"));
+    }
+    // `remove_file` unlinks the object itself, so a symlink is removed without
+    // ever being followed to its target.
+    fs::remove_file(&path)?;
+    Ok(Cleared::Foreign(foreign_kind(ft)))
 }
 
 /// Returns (cols, rows) of the terminal on `fd` (TIOCGWINSZ).
@@ -911,19 +1008,135 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A regular tombstone that cannot be unlinked (its state dir is read-only for
+    /// this non-owner user) is still a kill the name cannot escape: the clear
+    /// reports the failure instead of the name as creatable.
     #[test]
-    fn clearing_a_tombstone_that_cannot_be_removed_reports_the_failure() {
-        let (_guard, dir) = state_dir_for("tombstone-unremovable");
-        // A directory where the tombstone would be: `remove_file` fails without
-        // needing privileges a test cannot have.
-        fs::create_dir_all(dir.join("busy.killed")).expect("the obstruction exists");
-        assert!(is_killed("busy"), "the name reads as killed");
+    fn a_tombstone_that_cannot_be_unlinked_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            // Root ignores the directory's write bit, so there is no failure to
+            // observe and the assertion below would be meaningless.
+            eprintln!("skipped: a root process can unlink from a read-only directory");
+            return;
+        }
+        let (_guard, dir) = state_dir_for("tombstone-unreadable");
+        write_tombstone_none("busy").expect("the tombstone is written");
+        assert!(is_killed("busy"), "a regular file is a tombstone");
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500))
+            .expect("the state dir loses its write bit");
+        let cleared = clear_tombstone("busy");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .expect("the write bit is restored so the sandbox can be removed");
 
         assert!(
-            clear_tombstone("busy").is_err(),
-            "a removal that failed is not reported as success"
+            cleared.is_err(),
+            "a removal that failed is not reported as success: {cleared:?}"
         );
         assert!(is_killed("busy"), "and the name stays killed");
+    }
+
+    /// A directory squatting on `<name>.killed` is not a tombstone: the name was
+    /// never killed by it, so it must stay creatable, and clearing the path must
+    /// not recurse into it.
+    #[test]
+    fn a_directory_marker_does_not_kill_a_name_and_is_removed_without_recursing() {
+        let (_guard, dir) = state_dir_for("marker-dir");
+        fs::create_dir(dir.join("d.killed")).expect("the obstruction exists");
+        assert_eq!(
+            marker_state("d"),
+            MarkerState::Foreign("directory"),
+            "a directory is not a regular tombstone"
+        );
+        assert!(!is_killed("d"), "so the name is not killed by it");
+
+        assert_eq!(
+            clear_tombstone("d").expect("an empty directory is removed"),
+            Cleared::Foreign("directory")
+        );
+        assert!(!dir.join("d.killed").exists(), "and the path is clear again");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A non-empty directory cannot be removed by a non-recursive clear, and that
+    /// failure leaves the name creatable: the obstruction is reported, never
+    /// recursed into, and never treated as a kill.
+    #[test]
+    fn a_foreign_marker_that_cannot_be_removed_is_reported_and_never_kills() {
+        let (_guard, dir) = state_dir_for("marker-dir-nonempty");
+        fs::create_dir_all(dir.join("n.killed")).expect("the obstruction exists");
+        fs::write(dir.join("n.killed").join("inside"), b"x").expect("a file in the directory");
+
+        assert!(!is_killed("n"), "the object does not pin the name");
+        let cleared = clear_tombstone("n");
+        assert!(
+            cleared.is_err(),
+            "a non-empty directory is not removed: {cleared:?}"
+        );
+        assert!(
+            dir.join("n.killed").join("inside").exists(),
+            "and nothing inside it was touched"
+        );
+        assert!(!is_killed("n"), "the name stays creatable regardless");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink on the marker path is read as a symlink, not followed: it kills
+    /// nothing, and clearing it unlinks the link while leaving its target alone.
+    #[test]
+    fn a_symlink_marker_does_not_kill_a_name_and_is_unlinked_not_followed() {
+        let (_guard, dir) = state_dir_for("marker-symlink");
+        let target = dir.join("sibling");
+        fs::write(&target, b"keep me").expect("the target is written");
+        std::os::unix::fs::symlink(&target, dir.join("s.killed")).expect("the link exists");
+
+        assert_eq!(marker_state("s"), MarkerState::Foreign("symlink"));
+        assert!(!is_killed("s"), "a link to a file is not a tombstone");
+
+        assert_eq!(
+            clear_tombstone("s").expect("the link is unlinked"),
+            Cleared::Foreign("symlink")
+        );
+        assert!(!dir.join("s.killed").exists(), "the link is gone");
+        assert!(
+            target.exists() && fs::read_to_string(&target).unwrap() == "keep me",
+            "and its target was neither removed nor written through"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The tombstone writer's temp file is created no-follow: a link planted at
+    /// `<name>.killed.tmp` must not become the write's destination.
+    #[test]
+    fn a_temporary_marker_write_does_not_follow_a_planted_symlink() {
+        let (_guard, dir) = state_dir_for("marker-tmp");
+        let victim = dir.join("victim");
+        fs::write(&victim, b"original").expect("the victim file is written");
+        std::os::unix::fs::symlink(&victim, dir.join("s.killed.tmp")).expect("the link exists");
+
+        write_tombstone_none("s").expect("the tombstone is written");
+
+        assert_eq!(
+            fs::read_to_string(&victim).expect("the victim is still readable"),
+            "original",
+            "the planted link was not written through"
+        );
+        assert!(is_killed("s"), "and the tombstone landed where it belongs");
+        assert!(
+            fs::symlink_metadata(dir.join("s.killed"))
+                .expect("the tombstone exists")
+                .file_type()
+                .is_file(),
+            "as a regular file, not a link"
+        );
+        assert!(
+            !dir.join("s.killed.tmp").exists(),
+            "and the temp file was renamed away"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
