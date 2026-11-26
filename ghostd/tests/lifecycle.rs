@@ -20,6 +20,8 @@ use nix::{
     unistd::Pid,
 };
 
+use ghostd::REPLAY_TAIL_BYTES;
+
 /// The daemon binary Cargo built for this test target.
 const BIN: &str = env!("CARGO_BIN_EXE_ghostd");
 
@@ -147,6 +149,34 @@ impl Sandbox {
             }
         });
         Attach { child, stdin, out }
+    }
+
+    /// An `ghostd attach <name>` whose stdout is collected as **bytes**, for a test
+    /// that has to count a byte budget (`Attach` decodes through
+    /// `String::from_utf8_lossy`, which would make the count a guess).
+    fn attach_raw(&self, name: &str) -> RawAttach {
+        let mut child = Command::new(BIN)
+            .args(["attach", name])
+            .env("GHOSTWAVE_STATE_DIR", &self.dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("ghostd attach runs");
+        let stdin = child.stdin.take();
+        let mut stdout = child.stdout.take().expect("stdout is piped");
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&out);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        RawAttach { child, stdin, out }
     }
 
     /// The session log's bytes, waiting until the file has stopped changing for
@@ -302,6 +332,84 @@ impl Attach {
         let status = self.child.wait().expect("the client exits");
         std::thread::sleep(Duration::from_millis(50)); // let the reader drain the tail
         (status.code(), self.output())
+    }
+}
+
+/// A running `ghostd attach` whose output is kept as raw bytes, so a test can
+/// count exactly what the daemon replayed instead of a lossy decode.
+struct RawAttach {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    out: Arc<Mutex<Vec<u8>>>,
+}
+
+impl RawAttach {
+    fn write(&mut self, text: &str) {
+        let stdin = self.stdin.as_mut().expect("the client's stdin is open");
+        stdin
+            .write_all(text.as_bytes())
+            .expect("the client accepts input");
+        stdin.flush().expect("the client's stdin flushes");
+    }
+
+    /// Every byte the client has printed so far.
+    fn bytes(&self) -> Vec<u8> {
+        self.out.lock().unwrap().clone()
+    }
+
+    fn len(&self) -> usize {
+        self.out.lock().unwrap().len()
+    }
+
+    /// The client's bytes, once its buffer has not grown for `quiet`: a replay has
+    /// landed when the stream stops moving, not after a fixed sleep.
+    fn wait_quiet(&self, quiet: Duration, max: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + max;
+        let mut last = self.len();
+        let mut stable_since = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(20));
+            let now = self.len();
+            if now != last {
+                last = now;
+                stable_since = Instant::now();
+            } else if stable_since.elapsed() >= quiet {
+                return self.bytes();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the client's output never settled within {max:?} ({last} bytes)"
+            );
+        }
+    }
+
+    /// The client's bytes once they contain `needle`.
+    fn wait_for(&self, needle: &[u8], max: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + max;
+        loop {
+            let seen = self.bytes();
+            if seen.windows(needle.len()).any(|w| w == needle) {
+                return seen;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "waited {max:?} for {:?}, saw {} bytes",
+                String::from_utf8_lossy(needle),
+                seen.len()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Ends the client outright and reaps it, so no reader thread is left draining.
+    fn kill(mut self) {
+        let _ = kill(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
+        let _ = self.child.wait();
+    }
+
+    /// The client's exit status once it has exited, without waiting for it.
+    fn exited(&mut self) -> Option<i32> {
+        self.child.try_wait().ok().flatten().and_then(|status| status.code())
     }
 }
 
@@ -747,4 +855,98 @@ fn a_busy_attach_is_not_reported_as_ended() {
     // And the session is untouched: the first client still relays both ways.
     first.write("echo STILL-RELAYING\n");
     first.expect_output("STILL-RELAYING", Duration::from_secs(10));
+}
+
+#[test]
+fn an_attach_replays_only_a_bounded_tail() {
+    let mut sandbox = Sandbox::new("tail");
+    let out = sandbox.new_session("s");
+    assert!(out.status.success(), "the session is created: {out:?}");
+
+    // 1. Fill the log past the bound by driving the session's own shell
+    //    (`ghostd new` ignores a command argument).
+    let mut first = sandbox.attach_raw("s");
+    first.write("seq 1 400000; echo TAIL-MARKER\n");
+    first.wait_for(b"TAIL-MARKER", Duration::from_secs(30)); // the line reached the shell
+    drop(first); // closing stdin detaches it; the daemon keeps the shell and the log
+
+    // 2. Wait for the fill to finish rather than for a marker count: the log only
+    //    stops changing once `seq` is done, and a replay taken mid-stream would
+    //    legitimately be bounded but then followed by megabytes of live output.
+    let log = sandbox.settled_log("s", Duration::from_millis(500), Duration::from_secs(60));
+    assert!(
+        log.len() as u64 > 1024 * 1024,
+        "the log is far past the bound: {} bytes",
+        log.len()
+    );
+    assert!(
+        log.windows(11).any(|window| window == b"TAIL-MARKER"),
+        "the fill's output is in the log"
+    );
+
+    // 3. A fresh attach replays only the newest, bounded window. The first attempt
+    //    can still be refused as busy while the detached client's exit reaches the
+    //    daemon, so it is retried rather than assumed.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (mut second, received) = loop {
+        let mut client = sandbox.attach_raw("s");
+        std::thread::sleep(Duration::from_millis(200));
+        if client.exited().is_some() {
+            client.kill();
+            assert!(
+                Instant::now() < deadline,
+                "every attach was refused: the detached client never released the session"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        let bytes = client.wait_quiet(Duration::from_millis(300), Duration::from_secs(15));
+        if bytes.is_empty() {
+            client.kill();
+            assert!(
+                Instant::now() < deadline,
+                "every attach replayed nothing"
+            );
+            continue;
+        }
+        break (client, bytes);
+    };
+
+    assert!(
+        received.len() as u64 <= REPLAY_TAIL_BYTES + 4096,
+        "the replay is bounded: {} bytes (bound {REPLAY_TAIL_BYTES})",
+        received.len()
+    );
+    assert!(
+        received
+            .windows(11)
+            .any(|window| window == b"TAIL-MARKER"),
+        "the replay keeps the newest bytes, not the oldest: {} bytes starting {:?}",
+        received.len(),
+        String::from_utf8_lossy(&received[..received.len().min(120)])
+    );
+    let nl = received
+        .iter()
+        .position(|&b| b == b'\n')
+        .expect("the replay's first line ends with a newline");
+    let mut first_line = &received[..nl];
+    if first_line.last() == Some(&b'\r') {
+        first_line = &first_line[..first_line.len() - 1];
+    }
+    assert!(
+        !first_line.is_empty() && first_line.iter().all(u8::is_ascii_digit),
+        "the replay starts on a whole line, not mid-number: {:?}",
+        String::from_utf8_lossy(first_line)
+    );
+
+    // 4. Live relay still works after the truncated replay.
+    second.write("echo LIVE-MARKER\n");
+    let seen = second.wait_for(b"LIVE-MARKER", Duration::from_secs(10));
+    assert!(
+        seen.len() > received.len(),
+        "the live output follows the replay: {} then {} bytes",
+        received.len(),
+        seen.len()
+    );
+    second.kill();
 }
