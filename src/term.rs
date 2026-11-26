@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Once,
     },
     time::{Duration, Instant},
 };
@@ -323,6 +323,11 @@ impl TermPane {
             .set_kitty_image_from_file_allowed(true)?
             .set_kitty_image_from_temp_file_allowed(true)?
             .set_kitty_image_from_shared_mem_allowed(true)?;
+        // Storing a kitty image needs two independent prerequisites: storage
+        // (set just above) and a PNG decoder. The decoder is process-global and
+        // must live on the thread that owns the terminals, so it is installed
+        // here, where every pane — local, remote or restored — passes through.
+        install_png_decoder_once()?;
 
         term
             .on_pty_write({
@@ -1265,9 +1270,38 @@ impl SelectionState<'_> {
     }
 }
 
-/// Install a kitty graphics PNG decoder (process-global, once at startup).
-/// The crate's own RustPngDecoder has no public constructor (stale docs), so
-/// we implement DecodePng ourselves using the png crate.
+/// Runs the one process-wide PNG decoder install; see [`install_png_decoder`].
+static PNG_DECODER_ONCE: Once = Once::new();
+
+/// Outcome of that one install attempt, so every later pane sees the same
+/// result instead of registering a second decoder.
+static PNG_DECODER_INSTALL_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Install the PNG decoder on this thread, at most once per process.
+///
+/// Fails if the first attempt failed, so a pane is never built believing PNG
+/// payloads will be accepted when they will be rejected.
+fn install_png_decoder_once() -> Result<()> {
+    PNG_DECODER_ONCE.call_once(|| {
+        if let Err(e) = install_png_decoder() {
+            *PNG_DECODER_INSTALL_ERROR.lock().unwrap() = Some(e.to_string());
+        }
+    });
+    match PNG_DECODER_INSTALL_ERROR.lock().unwrap().clone() {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
+}
+
+/// Install the kitty graphics PNG decoder for the calling thread.
+///
+/// The crate's own `RustPngDecoder` has no public constructor at 0.2.2 (the
+/// docs still mention one), so we implement `DecodePng` ourselves with the
+/// `png` crate. Registration is thread-local and one-way: it may only be done
+/// on the thread that owns the terminals, and it is what decides whether a PNG
+/// payload is stored or rejected at ingest. [`TermPane::new`] installs it once
+/// per process on the pane thread; a decoder that is never installed is
+/// indistinguishable from a decoder that does not work.
 pub fn install_png_decoder() -> Result<()> {
     graphics::set_png_decoder(Some(Box::new(PngDecoder)))?;
     Ok(())
@@ -1309,6 +1343,118 @@ impl graphics::DecodePng for PngDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 1×1 opaque red PNG, encoded at test time so the payload is a real
+    /// PNG the `png` crate accepts rather than a magic constant.
+    fn one_pixel_png_b64() -> String {
+        let mut png = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut png, 1, 1);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().expect("png header");
+            writer.write_image_data(&[255, 0, 0, 255]).expect("png data");
+        }
+        base64(&png)
+    }
+
+    /// Standard base64 (RFC 4648): the kitty APC payload is base64 of the file.
+    fn base64(data: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+            for i in 0..4 {
+                if i < chunk.len() + 1 {
+                    out.push(T[(n >> (18 - 6 * i) & 0x3f) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// The APC a kitty client sends for `kitten icat x.png`: transmit and
+    /// display (`a=T`) a PNG (`f=100`) with a known image id.
+    fn kitty_png_apc(image_id: u32) -> Vec<u8> {
+        let mut apc = format!("\x1b_Gi={image_id},a=T,f=100;{}", one_pixel_png_b64()).into_bytes();
+        apc.extend_from_slice(b"\x1b\\");
+        apc
+    }
+
+    /// Green control, not fix evidence: storage is enabled but this test thread
+    /// has no PNG decoder, so the payload is rejected and no image is stored.
+    /// It documents *where* an unwired decoder kills `kitten icat`; the
+    /// "accepted once wired" half is `a_fresh_process_accepts_a_kitty_png`.
+    #[test]
+    fn png_payload_is_rejected_without_a_decoder() {
+        let mut term =
+            Terminal::new(TerminalOptions { cols: 80, rows: 24, max_scrollback: 100 }).unwrap();
+        // Print the pin's own default before overriding it: a non-zero value
+        // means storage was already enabled and only the decoder was missing.
+        println!(
+            "kitty_image_storage_limit() before setter = {}",
+            term.kitty_image_storage_limit().unwrap()
+        );
+        term.set_kitty_image_storage_limit(64 * 1024 * 1024).unwrap();
+        assert!(
+            term.kitty_image_storage_limit().unwrap() > 0,
+            "storage must be enabled, or this control proves nothing"
+        );
+
+        let _ = term.vt_write(&kitty_png_apc(1));
+
+        assert!(
+            term.kitty_graphics().unwrap().image(1).is_none(),
+            "a PNG was accepted on a thread with no decoder installed"
+        );
+    }
+
+    /// The wiring test: a *fresh process* builds a pane through `TermPane::new`
+    /// and must end up with the PNG stored. The decoder is process-global and
+    /// one-way, so only a re-exec can tell "installed at pane construction"
+    /// from "some earlier test in this process installed it".
+    #[test]
+    fn a_fresh_process_accepts_a_kitty_png() {
+        const CHILD_ENV: &str = "GHOSTWAVE_KITTY_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let cell = CellDims { w: 10.0, h: 26.0, baseline: 20.0 };
+            // spawn=false: no shell is needed to exercise the ingest path.
+            let mut pane = TermPane::new(80, 24, cell, None, &[], None, 0, 0, false, None)
+                .expect("child: TermPane::new");
+            let _ = pane.term.vt_write(&kitty_png_apc(1));
+            let present = pane
+                .term
+                .kitty_graphics()
+                .expect("child: kitty_graphics")
+                .image(1)
+                .is_some();
+            println!("CHILD-IMAGE-PRESENT={present}");
+            std::process::exit(if present { 0 } else { 1 });
+        }
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "term::tests::a_fresh_process_accepts_a_kitty_png",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("spawn child test process");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(out.status.success(), "a fresh process rejected a kitty PNG\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            stdout.contains("CHILD-IMAGE-PRESENT=true"),
+            "child did not run or did not report a stored image\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
 
     /// Does the terminal core generate responses for the standard startup
     /// probes? Checks each probe type individually so a single response

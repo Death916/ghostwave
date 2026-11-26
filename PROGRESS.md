@@ -1548,3 +1548,43 @@ keep the ordinary fuzzy list, so typing another command is never hijacked.
   `cargo fmt --check` is already 5033 lines dirty at the base and was not run.
 - **NEEDS-OWNER-VERIFY**: this box is headless, so nobody looked at the row. The tests pin its
   text, category, action and the toast; the pixels are the owner's.
+
+### Kitty graphics: the PNG decoder was never installed (card `t_34fb7f54`, 2026-11-26)
+
+relay: job=t_deccf588 — chain A, sitting 1 of 2
+
+`kitten icat x.png` showed nothing because the payload never survived ingest: `install_png_decoder()`
+existed in `src/term.rs` but nothing in `src/` called it, and libghostty rejects PNG data when no
+decoder is registered on the terminal's thread. Storing an image has two independent prerequisites —
+a non-zero storage limit and a decoder — and the first was already satisfied.
+
+`TermPane::new` now calls a new `install_png_decoder_once()` right after the kitty storage-limit
+chain: a `std::sync::Once` runs the one process-wide registration, and every later pane replays that
+attempt's outcome instead of registering a second decoder (registration is thread-local and one-way,
+so it must happen on the thread that owns the terminals — the UI thread that builds every pane). A
+failed install now returns an error instead of leaving panes that believe PNG will be accepted. The
+comment on `install_png_decoder` said the crate's decoder has "no public constructor (stale docs)" and
+implied ours was wired; it now says why ours exists *and* who installs it, which is what the old text
+hid.
+
+- **Measured, not assumed**: a fresh raw `Terminal` reports `kitty_image_storage_limit() = 10000000`
+  (the 10 MB `.lib` default the plan predicted at `Screen.zig:259-262`), so storage was on before any
+  setter ran and only the decoder was missing.
+- **§6.1 `term::tests::png_payload_is_rejected_without_a_decoder`** — a *green control, not fix
+  evidence*: storage set to 64 MiB, limit asserted `> 0`, no decoder on the test thread, `a=T,f=100`
+  APC written, `image(1)` is `None`. Green before and after, as designed.
+- **§6.2 `term::tests::a_fresh_process_accepts_a_kitty_png`** — RED first. It re-execs its own test
+  binary (`GHOSTWAVE_KITTY_CHILD=1`, `--exact`), builds a `TermPane` with `spawn=false` through the
+  product path, writes the same APC and reports `CHILD-IMAGE-PRESENT`. Base commit
+  `2128be3`: `CHILD-IMAGE-PRESENT=false`, test failed. After the change: ok. Only a fresh process can
+  tell "installed at pane construction" from "an earlier test installed it".
+- **Suite**: 294 passed / 0 failed (94 lib + 193 bin + 1 `flood_throughput` + 6 `term_core` + 0 doc),
+  against the base's 292 = +2, both in `src/term.rs`. `ghostd` stays outside this count
+  (`grep -rh '#\[test\]' ghostd/ | wc -l` → 12).
+- **clippy**: `cargo clippy --all-targets` rc 0, no warning site in `src/term.rs`.
+- **Not in this sitting**: nothing paints a stored placement yet, so the owner still sees no image —
+  that is sitting 2 (`placement_boxes` + the `paint_pane` pass). Ingest alone was always invisible.
+- **NEEDS-OWNER-VERIFY** (§7.2, cannot run here — no `kitten`/`kitty`, no `DISPLAY` on orac):
+  `nix-shell --run 'cargo run'`, then `kitten icat ~/Pictures/sac.png` (PNG inside the pane, cursor
+  advances, no error text) and `kitten icat --place 40x20@10x5 ~/Pictures/sac.png`. After sitting 2,
+  not now.
