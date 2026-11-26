@@ -582,6 +582,52 @@ pub fn truncate_log_front(path: &Path, cap: u64) {
     let _ = fs::write(path, &tail);
 }
 
+/// Most log bytes a freshly attached client is replayed. The ring log can hold far
+/// more; showing the tail is what a terminal attach is for.
+pub const REPLAY_TAIL_BYTES: u64 = 256 * 1024;
+
+/// The bytes to replay to a newly attached client: at most `cap` trailing bytes of
+/// the log, started just after the first line break inside that window so the
+/// replay does not begin mid-line.
+///
+/// A log no larger than `cap` is returned whole and unsnapped — there is no byte to
+/// drop. A window with no line break at all is returned as-is: it is still bounded,
+/// and a single line longer than the bound has no boundary to snap to.
+///
+/// Best-effort: an unreadable log replays nothing.
+pub fn replay_tail(path: &Path, cap: u64) -> Vec<u8> {
+    let Ok(meta) = fs::metadata(path) else {
+        return Vec::new();
+    };
+    let oversized = meta.len() > cap;
+    let Ok(mut f) = File::open(path) else {
+        return Vec::new();
+    };
+    if oversized {
+        use std::io::Seek;
+        if f.seek(std::io::SeekFrom::Start(meta.len() - cap)).is_err() {
+            return Vec::new();
+        }
+    }
+    // `take(cap)` is the guarantee, not the metadata: the accept loop can append to
+    // the log between the `metadata` call above and this read.
+    let mut buf = Vec::new();
+    if f.take(cap).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    // Only an oversized log is snapped: a log that fits the bound has no byte to
+    // drop, and dropping its first line would be a behaviour change for small logs.
+    let snap = if oversized {
+        buf.iter().position(|&b| b == b'\n')
+    } else {
+        None
+    };
+    if let Some(i) = snap {
+        buf.drain(..=i);
+    }
+    buf
+}
+
 /// Connect to a session socket, retrying briefly (the daemon may still be
 /// binding right after `new`).
 pub fn connect_with_retry(name: &str) -> Option<UnixStream> {
@@ -1020,5 +1066,86 @@ mod tests {
             ),
             "and the grace ran out into a SIGKILL of the same group: {status:?}"
         );
+    }
+
+    #[test]
+    fn a_log_smaller_than_the_bound_is_replayed_whole() {
+        let (_guard, dir) = state_dir_for("replay-small");
+        let path = dir.join("small.log");
+        let whole = b"one\r\ntwo\r\nthree\r\n";
+        fs::write(&path, whole).expect("the log is written");
+
+        assert_eq!(
+            replay_tail(&path, REPLAY_TAIL_BYTES),
+            whole.to_vec(),
+            "a log under the bound is replayed in full, unsnapped"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_oversized_log_replays_at_most_the_bound_and_starts_on_a_line() {
+        let (_guard, dir) = state_dir_for("replay-big");
+        let path = dir.join("big.log");
+        let mut log = Vec::new();
+        for n in 0..1000u32 {
+            log.extend_from_slice(format!("{n:07}\r\n").as_bytes());
+        }
+        fs::write(&path, &log).expect("the log is written");
+        let cap = 100;
+
+        let tail = replay_tail(&path, cap);
+        assert!(
+            tail.len() as u64 <= cap,
+            "the replay is bounded: {} bytes",
+            tail.len()
+        );
+        assert!(log.ends_with(&tail), "the replay is the log's newest bytes");
+        let nl = tail
+            .iter()
+            .position(|&b| b == b'\n')
+            .expect("the window holds a line break");
+        let mut first = &tail[..nl];
+        if first.last() == Some(&b'\r') {
+            first = &first[..first.len() - 1];
+        }
+        assert!(
+            first.iter().all(|b| b.is_ascii_digit()),
+            "the replay starts on a whole line, not mid-number: {:?}",
+            String::from_utf8_lossy(first)
+        );
+        assert_eq!(first.len(), 7, "and on that line's own start");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tail_with_no_line_break_is_still_bounded() {
+        let (_guard, dir) = state_dir_for("replay-nonl");
+        let path = dir.join("nonl.log");
+        let log = vec![b'x'; 500];
+        fs::write(&path, &log).expect("the log is written");
+
+        let tail = replay_tail(&path, 100);
+        assert_eq!(tail.len(), 100, "an unsnappable tail is bounded anyway");
+        assert_eq!(tail, log[log.len() - 100..], "and is the log's last bytes");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_log_replays_nothing() {
+        let (_guard, dir) = state_dir_for("replay-empty");
+        let path = dir.join("empty.log");
+        fs::write(&path, b"").expect("the empty log is written");
+
+        assert!(replay_tail(&path, REPLAY_TAIL_BYTES).is_empty());
+        assert!(
+            replay_tail(&dir.join("absent.log"), REPLAY_TAIL_BYTES).is_empty(),
+            "a log that is not there replays nothing"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
