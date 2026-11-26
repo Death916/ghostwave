@@ -2803,3 +2803,485 @@ that card lands.
 5. **Are the numbers right** — 273 → 274 in the app, 0 → 7 in `ghostd` (5 lifecycle + 2 lib), and are the
    RED expectations for all seven new tests actually red on `a91a1a8` (the busy pin is the one exception: it
    guards a status that must *stay* 1, so it passes on `a91a1a8` too and is labelled as a pin)?
+---
+
+## kitty graphics protocol + pane frame overlap
+
+Two independent symptoms in one owner report (job `t_deccf588`, card `t_719da072`). They do **not** share a root
+cause: one is a terminal-emulation/renderer defect in `src/term.rs` + `src/pane_canvas.rs`, the other is a 1-pixel
+geometry defect in `src/panes_grid.rs` (and, for the part the owner saw, possibly nothing of ours at all — §2.4).
+They are therefore **two chains on two branches** (§3), and this plan hands **the kitty chain** to PLAN REVIEW
+first.
+
+Base: `origin/master` = `2128be3`. Everything cited below is measured at that commit.
+
+---
+
+### 0. The report, and what I could and could not verify
+
+> kitty protcol not showing images when using kitten icat and pane frame still overlaps borders sometimes. pics
+> included in this — https://ibb.co/LWW8PRC · https://ibb.co/RpNwbHqH
+
+Both pages were fetched from orac and the **full-size** images behind them downloaded (the first `i.ibb.co` URL in
+each page is a thumbnail; the originals are the third one):
+
+| symptom | page | image actually read | size (from the PNG IHDR) |
+|---|---|---|---|
+| kitty graphics | https://ibb.co/LWW8PRC | `https://i.ibb.co/wXXRLgK/1795087914.png` | 1086 × 1471 |
+| pane frame | https://ibb.co/RpNwbHqH | `https://i.ibb.co/TB132hsh/1795086073.png` | 2851 × 1787 |
+
+What each image shows, and how solid that reading is:
+
+* **Image 1 (kitty).** A ghostwave pane in `~/Pictures`; an `ls -l` above it, then two commands typed on
+  consecutive prompts — `kitten icat sac.png` and `kitten icat nukes.gif` — and the space under them **empty**:
+  no image, and no error text from `kitten`. Read visually from the 1086×1471 file (no OCR tooling on orac);
+  the *emptiness* is not a measurement, the two command lines are legible.
+* **Image 2 (frame).** A two-pane window on a 2851×1787 desktop shot. This one **was measured**, pixel by pixel,
+  with `ffmpeg` → raw RGB and an awk pass (script in §2.1), because the visual reading of a downscale
+  contradicted itself. Result: the 2 px bright stroke on the shared vertical edge sits at **x = 1414–1415** and
+  exists only at **y = 96–134** and **y = 1255–1753**; between y = 135 and y = 1254 — 1120 px, 63 % of the
+  window height — **there is no stroke pixel at all** on that column. That is a real, repeated defect, not a
+  one-frame compositor artifact.
+
+Neither symptom can be reproduced end-to-end on orac: `kitten` and `kitty` are not installed
+(`which kitten kitty` → both missing), and there is no `DISPLAY`/`WAYLAND_DISPLAY`. So no GUI run and no real
+`kitten icat` byte capture is possible here; §7 says exactly what must be run, by whom, and what it must print.
+
+---
+
+### 1. Symptom A — `kitten icat` shows nothing
+
+#### 1.1 What the protocol path looks like in this tree
+
+`kitten icat` sends the file as an APC string through the pty: `ESC _ G <k=v,…>[;base64 payload] ESC \`, chunked
+(default 4096 bytes per chunk, `m=1` on every chunk but the last) and terminated with a transmit-and-display
+action (`a=T`), an image id (`i=…`) and PNG format (`f=100` for a `.png`). It first sends a **query**
+(`a=q,f=24,s=1,v=1,i=31`) and expects `ESC _ G i=31;OK ESC \` back; on an error it prints a message instead.
+
+ghostwave's side of that path:
+
+| link | code | state at `2128be3` |
+|---|---|---|
+| pty bytes reach the VT parser | `src/term.rs:594-625` (`poll_pty`) → `self.term.vt_write(&data)` at `src/term.rs:617` | **fine** — the whole byte stream, APC included, is forwarded unfiltered; there is no escape-sequence filter anywhere (`grep -rn 'x1b_G\|ESC _' src/` matches nothing outside `font_query.rs`'s own parser) |
+| kitty image storage is enabled | `src/term.rs:321-325` — `set_kitty_image_storage_limit(64 MiB)`, file / temp-file / shared-mem mediums allowed | **fine** |
+| PNG payloads can be decoded | `src/term.rs:1271-1305` — `install_png_decoder()` / `PngDecoder` | **never called** — see 1.2 |
+| the app answers the graphics query | libghostty's own APC handler | **fine** (it is the same handler that stores the image) |
+| placements are painted | `src/pane_canvas.rs:152-199` `paint_pane`, called from `src/panes_grid.rs:505-535` | **absent** — see 1.3 |
+
+#### 1.2 Defect 1: the PNG decoder is installed nowhere (load-bearing, greppable)
+
+```
+$ grep -rn 'install_png_decoder\|set_png_decoder' src/
+src/term.rs:1272:    graphics::set_png_decoder(Some(Box::new(PngDecoder)))?;
+src/term.rs:1271:pub fn install_png_decoder() -> Result<()> {
+```
+
+The only two hits are the body of the function and its own definition. `main()` (`src/main.rs:749-768`) calls
+`Config::load()`, `ui_fonts::init()`, builds the iced app and runs it; it does **not** call
+`install_png_decoder()`, and neither does `Term::new` (`src/term.rs:255`) nor `Pane::new`. The crate's own
+documentation for the setter is explicit: *"When cleared (`None` value), PNG decoding is unsupported and PNG image
+data will be rejected"* (`libghostty-vt-0.2.2/src/kitty/graphics.rs:820-826`).
+
+So every `kitten icat x.png` — the exact command in the owner's screenshot — has its payload **rejected at
+ingest**, before any question of painting arises. The dead `PngDecoder` (a correct RGBA8/STRIP_16 decoder,
+`src/term.rs:1277-1305`) is the intended fix that was never wired up. The crate ships `RustPngDecoder` but **has
+no public constructor** (struct at `graphics.rs:904`, no `new()`), which is why ghostwave wrote its own — so the
+fix is to *call* ours, not to delete it.
+
+#### 1.3 Defect 2: nothing ever paints a placement (also load-bearing, greppable)
+
+```
+$ grep -rn 'kitty_graphics\|PlacementIterator\|placement_boxes' src/
+$ echo $?
+1
+```
+
+The iced painter draws: background fill (`pane_canvas.rs:190-194`), then per-cell fg/bg/text (rows/cells iterators
+from `render_state.update(&term.term)` at `pane_canvas.rs:179-230`), underline/strike, selection band, cursor, and
+finally the frames (`panes_grid.rs:262-272`). Images are not in that list and cannot be: nothing in the tree
+iterates `Terminal::kitty_graphics()`.
+
+The crate exposes everything needed, so this is "not implemented", not "impossible":
+
+* `Terminal::kitty_graphics() -> Result<Graphics<'_>>` (`graphics.rs:246`)
+* `Graphics::image(id) -> Option<Image<'_>>`, `Image::{width, height, data, generation}` (`:329`, `:384-420`)
+* `PlacementIterator::new()`, `.update(&graphics)`, `.next()`, `.set_layer(Layer)` (`:428`, `:452`, `:478`, `:516`)
+* `PlacementIteration::placement_render_info(&image, &terminal) -> PlacementRenderInfo` (`:655`) carrying
+  `pixel_width`, `pixel_height`, `grid_cols`, `grid_rows`, `viewport_col`, `viewport_row`, `viewport_visible`,
+  `source_x/y/width/height` (`libghostty-vt-sys-0.2.2/src/bindings.rs:1831-1856`)
+* iced can draw it: `geometry::Frame::draw_image(bounds, image)` and `with_clip`
+  (`iced_graphics-0.14.0/src/geometry/frame.rs:98`, `:141`), with `image::Handle::from_rgba(w, h, bytes)`.
+
+So **A = two defects, both fatal, in that order**: (1) payloads rejected at ingest because the decoder is never
+installed; (2) even a stored image has no painter. Fixing only one of them changes nothing visible, which is
+exactly why this needs to be one chain with two sittings and one acceptance for the pair (§4, §6).
+
+#### 1.4 The one thing that is *not* broken, and why it matters
+
+`poll_pty` forwards raw bytes (`term.rs:617`), the storage limits are set (`term.rs:321-325`), and the query is
+answered by the VT layer. A plan that "forwards APC sequences" or "raises the APC limit" would be fixing a
+non-defect; the APC byte limit is not even overridden (`set_apc_max_bytes_kitty` is never called), so libghostty's
+default applies and a 4096-byte chunk is far under it. **First work item of the CODE stage is a measurement that
+keeps us honest** (§4.1): prove, with the test harness, that PNG is rejected *without* the decoder and accepted
+*with* it. If the first half comes back accepted, defect 1 is disproven and the chain narrows to defect 2 — the
+plan says so here so stage 3 does not "fix" a phantom.
+
+---
+
+### 2. Symptom B — "pane frame still overlaps borders sometimes"
+
+#### 2.1 What image 2 actually shows (measured, not guessed)
+
+The 2851×1787 PNG was decoded to `rgb24` (`ffmpeg -i … -f rawvideo -pix_fmt rgb24 raw.rgb`) and every pixel
+tested. A pixel counts as a **stroke** when `b > 150 && b > r+20 && b > g+10` — which selects the focused frame
+colour and nothing else in that shot:
+
+```bash
+# column X: the row ranges that carry a stroke pixel (W=2851, H=1787, rgb24)
+od -An -v -tu1 raw.rgb | awk -v W=2851 -v H=1787 -v X=1414 '
+{ for(i=1;i<=NF;i++){ m=n%3; n++
+  if(m==0) r=$i; else if(m==1) g=$i; else { b=$i
+    if (int((n-1)/3)%W == X) { y=int(int((n-1)/3)/W)
+      if (b>150 && b>r+20 && b>g+10) run[y]=1 } } } }
+END{ s=0; for(y=0;y<H;y++){ if(run[y]&&!s){p=y;s=1} else if(!run[y]&&s){printf "rows %d..%d (%d px)\n",p,y-1,y-p;s=0} } }'
+# → rows 96..134  (39 px)
+#   rows 1255..1753 (499 px)
+```
+
+Two adjacent columns carry it (**1414** and **1415**), i.e. one 1-px CSS stroke at the shared edge; 1120 rows in
+between carry **no stroke at all**. Two bands do carry it — one about a title band tall, one at the bottom. That
+"the stroke is there at the top and the bottom and gone in the middle" shape is why the low-res thumbnail read
+contradicted itself; the pixel pass is what made it a fact.
+
+#### 2.2 What the two earlier cards changed, and what is already pinned
+
+* `t_2a5f5dab` / PR #16 — `ed75985` "draw the frame on the edges two panes share" + `6b001cd` "grab splits only
+  when frames are on": the grid's 4 px gutter became `SPACING = 0.0` and the space between terminal areas became
+  each cell's own inset `PANE_INSET + PANE_GAP/2` (`src/panes_grid.rs:45-52`, `:97-146`), so the two cells' strokes
+  meet on the shared edge; the split stays grabbable through `SPLIT_GRAB_W` handed to `on_resize` only when
+  frames are on (`panes_grid.rs:278-284`).
+* `t_142a44ce` — `e9ece24` "keep a pane's canvas inside its frame stroke": the search-gutter marker is clamped
+  (`pane_canvas.rs:147-148`) and `paint_rect` (`panes_grid.rs:157-166`) gives back whatever it moved when it snaps
+  a fractional canvas origin, so the fill's far edge cannot sit past the canvas. Its commit message records the
+  measured fact that **this diff does not touch a shared-edge stroke**, and hands that symptom on.
+
+Its tests are the containment proof and are still green at `2128be3`:
+`panes_grid::tests::painted_fill_cannot_reach_a_shared_edge` (`panes_grid.rs:951`) asserts, from pane_grid's own
+`regions()` layout and for both focus states and both split axes, that a pane's worst-case fill reach
+(`cell far edge − padding + 0.5`) stays ≥ 3.5 px clear of its own stroke and ≥ 3.5 px + the neighbour's stroke
+clear of the neighbour. `paint_rect_stays_inside_the_canvas` (`:1023`) pins the snapping. So **the painter in
+this tree cannot paint over a neighbour's stroke** for the layouts those tests cover.
+
+#### 2.3 The defect that *is* ours: focus changes the terminal area's inset
+
+`cell_metrics` (`panes_grid.rs:126-146`) computes
+
+```
+frame   = focused ? FRAME_ACTIVE_W (2.0) : FRAME_INACTIVE_W (1.0)
+padding = inset(frames) + frame      →  6.0 when focused,   5.0 when not
+```
+
+`padding` is the container padding around the `Canvas` (`panes_grid.rs:234-239`). So **focusing a pane shrinks its
+canvas by 1 px on every side**: the canvas bounds handed to `PaneCanvas::draw` change, `bounds_to_cols_rows`
+(`panes_grid.rs:61-75`) re-derives `cols`/`rows`, `guard.resize` sends a new size to the terminal and a
+`SIGWINCH` to the pty, and the whole cell's content shifts by 1 px. At a shared edge that is a 1-px jump of the
+seam every time focus moves — which is exactly the "it overlaps *sometimes*" texture of the report (it depends on
+which pane has focus), it is ours, and it is cheap to pin and to fix: make `padding` independent of focus by
+always reserving the widest stroke, `inset(frames) + FRAME_ACTIVE_W`.
+
+This is *not* claimed to be the whole of image 2. It is the one glaring, reproducible cause in the tree, and the
+card asked for exactly that.
+
+#### 2.4 The rest of image 2 is not reproducible in our layer — say so, do not patch around it
+
+Following §2.2, in this tree a stroke on a shared edge can only be covered by
+
+1. a cell painted **over** its neighbour — impossible, `SPACING = 0` and iced's `Axis::split` rounds the split
+   so the cells are adjacent, not overlapping (`iced_widget-0.14.2/src/pane_grid/axis.rs:48-72`);
+2. a **content layer** reaching past the canvas — pinned away by `painted_fill_cannot_reach_a_shared_edge`;
+3. iced's **title bar** painting over the cell's own top stroke — it does not: `TitleBar::draw` paints
+   `theme.style(&self.class)` which is the inherited container default (transparent) unless we set one, and we do
+   not (`panes_grid.rs:234-270`);
+4. the **hover/drag highlight** (`grid_style`, `panes_grid.rs:354-380`, `picked_split`/`hovered_split` at
+   `FRAME_ACTIVE_W`) — painted only while dragging or hovering a split, and not in a static screenshot.
+
+The owner's own steer (dashboard comment on this card, 2026-11-19 05:46) is that the frame half may be a
+hyprland/wayland artifact of a compositor update. Nothing found here contradicts that: the measured 1120-px gap
+is on a **vertical** edge, and the only axes where iced can hand the cells a fractional boundary in this layout
+is y (the chrome bands above the grid are text-sized, so the grid's origin y is fractional — `Axis::split` rounds
+*extents*, not origins). So the frame chain fixes §2.3, ships **one measurement** that would prove or disprove an
+overlap in our layer at the owner's own geometry, and stops there rather than "fixing" the compositor. §6's
+acceptance for the reported stroke is therefore an owner-visible check, marked `NEEDS-OWNER-VERIFY`, not a green
+cargo test asserting a fix we cannot demonstrate.
+
+---
+
+### 3. Two chains, two branches, and why
+
+| | chain A | chain B |
+|---|---|---|
+| symptom | `kitten icat` paints nothing | frame stroke gone / seam jumps |
+| root cause | decoder never installed + no placement painter | focus-dependent inset (§2.3); the screenshot's missing band is **not** reproducible in our layer (§2.4) |
+| branch, off `origin/master` (`2128be3`) | `wt/fix-kitty-graphics` | `wt/fix-pane-frame-overlap` |
+| sittings | **2** (ingest wiring; placement painting) | **1** |
+| files touched | `src/main.rs`, `src/term.rs`, `src/pane_canvas.rs`, `src/pane.rs`, `src/panes_grid.rs` (clip only) | `src/panes_grid.rs` |
+| handed to PLAN REVIEW | **first** (clear, greppable cause; it is the owner's primary complaint) | second, after A's plan is approved |
+
+They share no code and no test, so they stay separate; merging them would put an unreproducible half in front of
+the reviewer of a solid one.
+
+**Branch mechanics (the relay's `kanban_create` cannot carry a branch, so the card body must).** This plan's own
+card `t_719da072` stays on `wt/fix-kitty-images-pane-frame`, which exists only to carry this `PLAN.md` and is
+**not** the branch either CODE card works on. Each CODE card is created with `workspace_kind="worktree"` +
+`workspace_path="/home/death916/code/ghostwave"` and its body starts with:
+
+```
+relay: job=t_deccf588
+BRANCH: wt/fix-kitty-graphics          # chain B: wt/fix-pane-frame-overlap
+Your worktree is on wt/<your card id> — run:
+  git fetch origin && git switch -c wt/fix-kitty-graphics origin/master
+then push with: bash ~/.hermes/scripts/fleet_push.sh dev "$PWD" origin wt/fix-kitty-graphics
+```
+
+`master`/`main` are never pushed to, nothing is merged, and no PR is opened against an upstream project.
+
+---
+
+### 4. Chain A — the change set (stage 3 executes these; order = commit order)
+
+#### 4.1 S1 — wire the decoder, and prove where the payload dies
+
+1. **Measure first (no code change).** Add the ingest test of §6.1 in two forms and paste both results: with the
+   decoder not installed and after `install_png_decoder()`. Expected: `None` then `Some`. If the first is already
+   `Some`, stop and comment on the card — defect 1 is disproven and S1 collapses to the startup call alone.
+2. **Make the install idempotent and impossible to forget.** `install_png_decoder()` (`term.rs:1271`) is
+   process-global (`graphics::set_png_decoder`, a `thread_local` in the crate, `graphics.rs:828-880`) and must run
+   on the same thread as the terminals, which for us is the iced main thread that creates every `Pane`. Call it
+   from `Term::new` (`src/term.rs:255`), immediately beside the existing
+   `set_kitty_image_storage_limit` chain, and return an error rather than panicking. Keep `main()` unchanged:
+   doing it per-pane means a remote/reconnected pane is covered too, and it survives a future second window.
+   Guard it with a `std::sync::Once` so 20 panes do not re-register 20 decoders.
+3. **Delete the lie in the comment.** `src/term.rs:1268-1270` says the crate's decoder "has no public constructor
+   (stale docs)"; that is still true at 0.2.2 (struct at `graphics.rs:904`, no `new()`), so keep our decoder and
+   correct the comment to say *why* it exists (no constructor) **and** that it must be installed once — the
+   missing install is precisely what a comment like the current one hid.
+
+#### 4.2 S2 — paint placements
+
+1. **A pure, iced-free geometry function in the library** so it can be unit-tested headlessly:
+   ```rust
+   // src/term.rs
+   pub struct PlacementBox { pub image_id: u32, pub x: f32, pub y: f32, pub w: f32, pub h: f32,
+                             pub source: (u32, u32, u32, u32), pub z: i32, pub layer: Layer }
+   pub fn placement_boxes(term: &Terminal<'_, '_>, cell: CellDims) -> Vec<PlacementBox>
+   ```
+   It iterates `kitty_graphics()` → `PlacementIterator::new()` → `update(&graphics)` → `next()`, skips
+   `!viewport_visible`, and converts `PlacementRenderInfo` to pane-local px: `x = viewport_col * cell.w`,
+   `y = viewport_row * cell.h` (both `i32`, negative when scrolled partly off — use them directly, the crate's own
+   doc says so), `w/h = pixel_width/pixel_height`, `source = (source_x, source_y, source_width, source_height)`.
+   Errors are swallowed to an empty vec: a pane must not lose its text because one placement is unreadable.
+2. **Draw them in `paint_pane`**, in the canvas' own coordinate space, i.e. inside the pane body — never in window
+   space — so an image physically cannot reach the frame stroke (this is also why chain B and chain A do not
+   collide):
+   * after the background `fill_rectangle` and before the cells for `Layer::BelowBg`/`BelowText`,
+   * after the cells for `Layer::AboveText`, matching kitty's z ordering (`Layer`, `graphics.rs:775-792`).
+   * `frame.with_clip(body_rect, |f| …)` around the image pass, belt and braces on top of the canvas' own clip.
+3. **RGBA cache.** `Image::data()` hands back the stored pixels; `format()` may be `Rgb`, `Rgba`, `Gray`,
+   `GrayAlpha` or `Png` (after decode libghostty stores RGBA — verify in S2's test and convert any of the four
+   raw formats to RGBA in our code, ~20 lines). Cache `iced::widget::image::Handle::from_rgba(w, h, bytes)` in
+   `RenderScratch` (`src/pane.rs:29-43`) keyed by image id with `Image::generation()` (`graphics.rs:401`) as the
+   validity stamp, so a scroll does not re-upload textures and an updated image re-uploads once. Bound the cache
+   (e.g. 32 images, drop the least-recently-used) — the storage limit is 64 MiB per pane and we must not mirror
+   that in GPU textures without a ceiling.
+4. **Source-rect cropping.** `Frame::draw_image` has no source rectangle, so crop the RGBA into a new handle when
+   `source` is not the full image (scrolled placements), and draw the full handle otherwise. This is the only
+   allocation per frame; keep it cached with the same key.
+5. **Not in S2** (state it in the commit): animation (`a=f` frames beyond the first), unicode-placeholder
+   placements (`U+10EEEE`), and `kitten icat --place`'s tiling. Static PNG and the first frame of an animation are
+   the acceptance.
+
+---
+
+### 5. Chain B — the change set
+
+1. **Focus must not resize the terminal area.** In `cell_metrics` (`panes_grid.rs:126-146`) reserve the widest
+   stroke always: `padding = inset(frames) + FRAME_ACTIVE_W` when `frames`, `0.0` when not. Keep `frame` as it is
+   (the stroke still grows on focus — that is the visible affordance). Update the doc comment to say the inset is
+   the worst case so a focus change never reflows the grid.
+2. **Measurement for the reported stroke (the card's "glaring issue" test).** Extend the existing debug logging
+   (`GHOST_ICED_DEBUG`, used in `pane_canvas.rs:163`) to print, once per layout generation, each cell's bounds,
+   `cell_metrics` and the stroke rects of both neighbours of every shared edge, plus a one-line
+   `overlap=<px>` when two panes' *painted* rects intersect. Nothing else: a log, not a fix.
+3. **Do not touch the frame drawing itself** unless the log shows `overlap>0` at the owner's geometry. If it does,
+   that is a new card with the log attached.
+
+---
+
+### 6. Tests — each one fails when the work is wrong
+
+Baseline at `2128be3`: **285** test functions in `src/` + **7** in `tests/` = **292**
+(`grep -rh '#\[test\]' src/ | wc -l`, `… tests/ | wc -l`).
+
+**Chain A**
+
+1. `term::tests::png_payload_is_rejected_without_a_decoder` (S1, RED first). Build a `Terminal` (as
+   `terminal_responds_to_probes` does, `term.rs:1317`), `vt_write` a hand-built APC for a 1×1 PNG
+   (`ESC _ G i=1,a=T,f=100;<base64> ESC \`), assert `kitty_graphics().image(1).is_none()`. Then, in a *separate
+   test binary run* (see 2), the same payload must be `Some`.
+2. `term::tests::a_fresh_process_accepts_a_kitty_png` (S1, RED first) — the one that pins the *wiring*, which is
+   the actual defect. The decoder is process-global and one-way, so a test that calls `install_png_decoder()` in
+   the same process cannot tell "wired at startup" from "the previous test installed it". Re-exec the test binary
+   (`std::env::current_exe()`), pass `GHOSTWAVE_KITTY_CHILD=1`, and in the child construct a `Term`, `vt_write`
+   the APC, and exit non-zero unless the image is present. Red today (child gets `None`), green after S1's
+   `Term::new` call. Add `--test-threads` independence by giving the child its own `CARGO_TARGET_DIR`-free path
+   (no build in the child).
+3. `term::tests::a_stored_placement_becomes_one_box` (S2, RED first — `placement_boxes` does not exist).
+   Install the decoder, `vt_write` a `a=T,i=7` PNG of 2×2 px with `c=2,r=1` so the grid size is known, assert
+   `placement_boxes(&term, cell)` returns exactly one box with `image_id == 7`, `w == 2`, `h == 2`,
+   `x == 0.0`, `y == 0.0` at the cursor origin, and that a second write with `a=p,i=7,p=…` adds a second box.
+4. `pane_canvas::tests::an_image_is_drawn_inside_the_pane_body` (S2). Pure arithmetic on the draw pass: for one
+   box and a pane rect, the destination rectangle is inside `rect` inset by `padding` — and therefore ≥ `padding`
+   from every edge, so it cannot touch a stroke. This is the guard that keeps chain A from re-opening chain B.
+5. The manual, owner-run check of §7.2 — a human check cannot exit non-zero, so it is a
+   checklist item marked `NEEDS-OWNER-VERIFY`, not a test.
+
+**Chain B**
+
+6. `panes_grid::tests::focus_does_not_change_the_inset` (RED first): `cell_metrics(true, true).padding ==
+   cell_metrics(true, false).padding`, and for a 600×400 cell the same `bounds_to_cols_rows` for both focus
+   states. Today: `6.0 != 5.0` and the col count can differ at a boundary cell width.
+7. `panes_grid::tests::painted_fill_cannot_reach_a_shared_edge` must stay green unchanged — it is the regression
+   gate for the whole frame geometry, and it must be re-run, not edited.
+8. `panes_grid::tests::shared_edge_stroke_is_drawn_for_both_focus_states` (pin, green before and after): asserts
+   from `regions()` that the two neighbours' stroke bands abut with no gap and no overlap for both focus
+   combinations — i.e. documents that the containment claim covered by (7) also holds at the stroke layer.
+
+---
+
+### 7. Verification — commands, expected output, build shell
+
+Every compile/test goes through the repo's own `shell.nix` **and** the build gate; `CARGO_TARGET_DIR` is per card
+under `/var/build` and never shared with another worktree.
+
+```bash
+# per card: /var/build/ghostwave-<this card id> — CODE cards use their own id, never this one
+export CARGO_TARGET_DIR=/var/build/ghostwavekitty      # chain A
+# export CARGO_TARGET_DIR=/var/build/ghostwaveframe    # chain B
+
+# 0. baseline, before the diff (paste it next to the after-run)
+grep -rh '#\[test\]' src/ | wc -l        # 285
+grep -rh '#\[test\]' tests/ | wc -l      # 7
+grep -rh '#\[test\]' ghostd/ | wc -l     # 0
+
+# 1. the suite, through the shell and the gate
+bash ~/.hermes/scripts/build_gate.sh nix-shell --run \
+  'CARGO_TARGET_DIR=/var/build/ghostwavekitty cargo test 2>&1 | tail -25'
+#   expect: "test result: ok. 292 passed; 0 failed; 0 ignored" (4 lines, one per target)
+#           chain A after: 292 + 4 = 296      chain B after: 292 + 2 = 294
+#   rc 3 from build_gate.sh = another heavy build holds the lock → comment on the card and block transient,
+#   never compile ungated. rc 4 = not enough free RAM → retry later.
+
+# 2. no new warnings
+bash ~/.hermes/scripts/build_gate.sh nix-shell --run \
+  'CARGO_TARGET_DIR=/var/build/ghostwavekitty cargo clippy --all-targets 2>&1 | tail -20'
+#   expect rc 0; the two pre-existing warnings in the touched files (paint_pane's argument count, `self.cell.h as f32`)
+#   are named in the base run and must not grow.
+```
+
+**7.1 the RED proof.** For each test in §6, run it alone on the base commit first and paste the failure:
+```bash
+bash ~/.hermes/scripts/build_gate.sh nix-shell --run \
+  'CARGO_TARGET_DIR=/var/build/ghostwavekitty cargo test focus_does_not_change_the_inset 2>&1 | tail -15'
+```
+A test that is green before the change is labelled a **pin** in the commit body (chain B's (7) and (8), chain A's
+(4)), never presented as evidence of a fix.
+
+**7.2 the owner-visible check — cannot be done on orac** (`kitten`/`kitty` not installed, no display), so it goes
+on the card as `NEEDS-OWNER-VERIFY` with the exact commands:
+
+```bash
+nix-shell --run 'cargo run'          # a ghostwave pane
+kitten icat ~/Pictures/sac.png       # → the PNG appears inside the pane, clipped to it,
+                                     #   cursor advances below it, no error text
+kitten icat --place 40x20@10x5 ~/Pictures/sac.png   # → inside the pane, never over a stroke
+# and the frame half: click between two panes and watch the seam — the terminal area must not
+# shift or reflow by a pixel on focus (chain B), and the shared stroke must not vanish (owner's call).
+```
+
+If the owner's image still does not appear **with** the decoder installed and the painter in, the next evidence to
+collect is `GHOST_ICED_DEBUG=1` output plus the terminal's reply to the graphics query — not another guess.
+
+---
+
+### 8. Risks and traps
+
+1. **Global, one-way decoder.** `set_png_decoder` is a `thread_local` (`graphics.rs:828-880`); it cannot be
+   uninstalled, and a test that installs it poisons every later test in the same process. Hence the subprocess test
+   in §6.2 and an explicit `Once` in the product path. Do **not** "fix" test order instead.
+2. **Lifetimes.** `Graphics<'_>`/`Image<'_>` are invalidated by the next mutating terminal call
+   (`graphics.rs:207-215`); `placement_render_info` borrows both the placement and the terminal for `'t`. Collect
+   everything into owned `PlacementBox`/`Vec<u8>` inside one function and let the borrows die there. Do not return
+   borrowed images into the iced layer.
+3. **Memory.** 64 MiB of stored images per pane, mirrored into GPU textures if we are careless. Bound the cache
+   (§4.2.3) and free entries whose `generation` changed or whose image id vanished (`Graphics::image` → `None`).
+4. **dpi/scale.** kitty sizes are in *device* pixels; ghostwave's `CellDims` are in CSS px. `xpixel/ypixel` are
+   already reported to the pty from `cols × cell.w` (`term.rs:297`), so the placement pixel size is correct in
+   CSS px by construction — assert this with §6.3's `w == 2` case rather than assuming.
+5. **Don't animate by accident.** `kitten icat nukes.gif` sends frames; drawing every frame of every placement each
+   frame pass would re-upload textures on every redraw. S2 draws the current frame placements only; animation is
+   explicitly out of scope and stated in the commit body.
+6. **Chain B's trap.** Changing `cell_metrics`' padding changes every pane's canvas size by ≤1 px, so
+   `painted_fill_cannot_reach_a_shared_edge` and `framed_panes_carry_their_frame_on_shared_edges` must be re-run,
+   not adjusted. If they need adjusting, the change is wrong.
+7. **Do not chase the compositor.** §2.4 is the boundary: chain B ships the measurement, not a speculative patch.
+
+---
+
+### 9. NOT doing (explicit)
+
+* No upstream contact, no PR/issue against `chrxh/alien` or any fork; no push to `master`/`main`; no merges.
+* No changes to `~/nixconfig`, `shell.nix`, `devenv.*` or the pinned toolchain (zig 0.15 / rustc 1.95 stay).
+* No `libghostty-vt` version bump: 0.2.2 has every API this needs (§1.3). The 1.4 question is its own plan
+  (`PLAN.md` §1-§5 of the earlier card).
+* No GIF animation, no unicode-placeholder images, no `kitten icat --place` tiling (§4.2.5).
+* No change to how frames are drawn, and no attempt to work around a compositor (§5.3, §2.4).
+* No new dependency: `png` and `iced` are already in `Cargo.toml`.
+
+---
+
+### 10. Ordered work items for stage 3
+
+**Chain A (`wt/fix-kitty-graphics`), sitting 1 of 2** — ingest wiring:
+1. Write §6.1 and §6.2, run both on `2128be3`, paste the RED output; if §6.1's "no decoder" half is already
+   `Some`, comment on the card and stop.
+2. Add the `Once`-guarded `install_png_decoder()` call to `Term::new` (`term.rs:255`); fix the comment at
+   `term.rs:1268-1270`; commit.
+3. Re-run §6.1/§6.2 (green), §7.1, §7.2's clippy; paste the full suite count.
+4. `PROGRESS.md` entry; push `wt/fix-kitty-graphics` with `fleet_push.sh`; open the PR; hand sitting 2 (a CODE card
+   on the same branch, `parents=[sitting 1]`) and make sure stage 4 is gated on the *last* sitting.
+
+**Chain A, sitting 2 of 2** — painting:
+5. `placement_boxes` + §6.3 (RED first, then green).
+6. Renderer pass in `paint_pane` + cache + §6.4; clip to the pane body.
+7. Full suite + clippy; `PROGRESS.md`; push; PR; hand stage 4 to `review`.
+
+**Chain B (`wt/fix-pane-frame-overlap`)** — one sitting:
+8. §6.6 (RED first, `6.0 != 5.0` pasted), then the `cell_metrics` change, then §6.7/§6.8 re-run unchanged.
+9. The `GHOST_ICED_DEBUG` layout log (§5.2) as its own commit, so the owner can run it.
+10. Full suite + clippy; `PROGRESS.md`; push; PR; hand stage 4 to `review` with `NEEDS-OWNER-VERIFY` named.
+
+---
+
+### 11. What stage 2 has to judge
+
+1. **Is defect 1 real?** §1.2 is a greppable claim: `install_png_decoder` is called nowhere. Challenge it if you
+   read it differently; the plan's first CODE step measures it either way and is allowed to come back negative.
+2. **Is the two-defect split honest?** Fixing only the decoder would still paint nothing (§1.3) — is one chain
+   with two sittings the right shape, or should the painter be its own job card?
+3. **Is the frame half correctly scoped?** §2.3 is the only reproducible cause; §2.4 says the reported stroke is
+   not reproducible in our layer and the acceptance for it is an owner check. Is that acceptable, or does the card
+   want a bigger investigation before any frame code lands?
+4. **Are the numbers right?** 292 base test functions, chain A → 296, chain B → 294; two pins declared as pins
+   (§6 (7), (8), (4)) rather than as fixes.
+5. **Are the branch mechanics safe?** Two branches off `2128be3`, no reuse of this plan's
+   `wt/fix-kitty-images-pane-frame`, no push to `master`, PRs opened but not merged.
