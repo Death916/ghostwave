@@ -17,7 +17,10 @@ path = "src/main.rs"
 # Ghostty terminal emulation, safe Rust bindings (vendored zig build of libghostty-vt)
 libghostty-vt = { version = "0.2.2", features = ["png"] }
 # the front-end: windowing, layout, widgets and the painting surface
-iced = { version = "0.14", features = ["canvas"] }
+# `image-without-codecs` is what makes `canvas::Frame::draw_image` available for
+# kitty placements; the `image` crate it pulls in is already resolved for
+# `arboard`, so this adds no dependency, only the feature.
+iced = { version = "0.14", features = ["canvas", "image-without-codecs"] }
 # PTY handling (forkpty, winsize) — pty module lives under the "term" feature
 nix = { version = "0.31.2", features = ["term", "fs", "signal", "process", "user", "ioctl", "poll"] }
 # font glyph coverage checks for the fallback chain

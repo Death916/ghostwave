@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex};
 
 use ghostwave::config::AiConfig;
 use ghostwave::keymap::KeyPress;
-use ghostwave::term::{CellDims, ReconnectState, RemoteSpec, TermPane};
+use ghostwave::term::{CellDims, PlacementBox, ReconnectState, RemoteSpec, TermPane};
 use libghostty_vt::key::{self, Mods};
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
+use libghostty_vt::Terminal;
 
 use crate::ai::AiPane;
 use crate::ui_config::{DynamicTitleMode, PaneTitleFormat};
@@ -30,6 +31,8 @@ pub struct RenderScratch {
     pub render_state: RenderState<'static>,
     pub row_it: RowIterator<'static>,
     pub cell_it: CellIterator<'static>,
+    /// Kitty placement textures, see [`ImageCache`].
+    pub images: ImageCache,
 }
 
 impl RenderScratch {
@@ -38,7 +41,81 @@ impl RenderScratch {
             render_state: RenderState::new()?,
             row_it: RowIterator::new()?,
             cell_it: CellIterator::new()?,
+            images: ImageCache::default(),
         })
+    }
+}
+
+/// How many placement textures one pane may keep.
+///
+/// The terminal stores up to 64 MiB of images per pane; mirroring that into GPU
+/// textures without a ceiling is not an option, so the cache holds a fixed
+/// number of the most recently drawn ones.
+const IMAGE_CACHE_CAP: usize = 32;
+
+/// A cached texture is identified by the image and the crop it was built for:
+/// scrolling a placement changes its source rectangle, not the image.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ImageKey {
+    image_id: u32,
+    source: (u32, u32, u32, u32),
+}
+
+struct ImageEntry {
+    key: ImageKey,
+    /// The image's content stamp when the texture was built.
+    generation: u64,
+    handle: iced::widget::image::Handle,
+}
+
+/// Least-recently-used cache of kitty placement textures.
+///
+/// Keyed by image id and source rectangle, invalidated by the image's own
+/// generation stamp, so a retransmitted image re-uploads once and a scroll does
+/// not re-upload at all.
+#[derive(Default)]
+pub struct ImageCache {
+    /// Most recently used last.
+    entries: Vec<ImageEntry>,
+}
+
+impl ImageCache {
+    /// The texture to draw `b` with, cropping the stored image when the
+    /// placement shows only part of it.
+    ///
+    /// `None` means the image is no longer stored or cannot be read, and the
+    /// pane simply paints nothing for that placement.
+    pub fn handle(&mut self, term: &Terminal<'_, '_>, b: &PlacementBox) -> Option<iced::widget::image::Handle> {
+        let key = ImageKey {
+            image_id: b.image_id,
+            source: b.source,
+        };
+
+        if let Some(pos) = self.entries.iter().position(|e| e.key == key) {
+            let fresh = ghostwave::term::image_generation(term, b.image_id);
+            if fresh == Some(self.entries[pos].generation) {
+                let hit = self.entries.remove(pos);
+                let handle = hit.handle.clone();
+                self.entries.push(hit);
+                return Some(handle);
+            }
+            // The image changed under the same id: rebuild below.
+            self.entries.remove(pos);
+        }
+
+        let rgba = ghostwave::term::placement_rgba(term, b)?;
+        let handle =
+            iced::widget::image::Handle::from_rgba(rgba.width, rgba.height, rgba.pixels);
+
+        if self.entries.len() >= IMAGE_CACHE_CAP {
+            self.entries.remove(0);
+        }
+        self.entries.push(ImageEntry {
+            key,
+            generation: rgba.generation,
+            handle: handle.clone(),
+        });
+        Some(handle)
     }
 }
 

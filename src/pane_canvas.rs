@@ -2,12 +2,13 @@
 //! per-cell fg/bg, text, underline/strikethrough, cursor, then the pane frames
 //! and their labels. Rects are canvas-local coordinates.
 
-use ghostwave::term::{CellDims, ReconnectState};
+use ghostwave::term::{CellDims, PlacementBox, ReconnectState, placement_boxes};
 use ghostwave::theme::Theme as GhostTheme;
 use iced::widget::canvas::{Frame, Text as CanvasText};
 use iced::widget::text;
 use iced::{Color, Font, Pixels, Point, Rectangle, Size, alignment, mouse};
 
+use libghostty_vt::kitty::graphics;
 use libghostty_vt::render::{CursorVisualStyle, Dirty};
 use libghostty_vt::style::{RgbColor, Underline};
 
@@ -148,6 +149,70 @@ fn marker_x(padding: f32, cell_w: f32) -> f32 {
     (padding - cell_w).max(0.0)
 }
 
+/// The canvas-space rectangle a placement's image covers.
+///
+/// A placement's geometry is anchored at the terminal's text origin, i.e. the
+/// pane rect inset by `padding` — carrying that inset here is what keeps image
+/// ink off the pane's frame stroke. Takes and returns plain numbers so the pass
+/// can be checked without a renderer.
+pub(crate) fn placement_rect(
+    b: &PlacementBox,
+    origin: (f32, f32),
+    padding: f32,
+) -> (f32, f32, f32, f32) {
+    (origin.0 + padding + b.x, origin.1 + padding + b.y, b.w, b.h)
+}
+
+/// A pane's rect plus the padding its frame reserves.
+///
+/// The image pass is clipped to `bounds` inset by `padding`, which is what keeps
+/// image ink off the pane's stroke no matter where a placement sits.
+#[derive(Clone, Copy)]
+pub(crate) struct PaneBody {
+    pub bounds: Rectangle,
+    pub padding: f32,
+}
+
+impl PaneBody {
+    /// The part of the canvas an image may cover.
+    fn clip(self) -> Rectangle {
+        let pad = self.padding;
+        Rectangle::new(
+            Point::new(self.bounds.x + pad, self.bounds.y + pad),
+            Size::new(
+                (self.bounds.width - 2.0 * pad).max(0.0),
+                (self.bounds.height - 2.0 * pad).max(0.0),
+            ),
+        )
+    }
+}
+
+/// Paints the placements one layer at a time, clipped to the pane body.
+///
+/// Kitty puts a placement either below the background, between background and
+/// text, or above text, and the pane has to paint the matching group before or
+/// after its cells to preserve that order.
+fn paint_placement_layer(
+    frame: &mut Frame,
+    images: &mut crate::pane::ImageCache,
+    term: &libghostty_vt::Terminal<'_, '_>,
+    boxes: &[PlacementBox],
+    body: PaneBody,
+    layer: graphics::Layer,
+) {
+    let clip = body.clip();
+    let origin = (body.bounds.x, body.bounds.y);
+    frame.with_clip(clip, |f| {
+        for b in boxes.iter().filter(|b| b.layer == layer) {
+            let Some(handle) = images.handle(term, b) else {
+                continue;
+            };
+            let (x, y, w, h) = placement_rect(b, origin, body.padding);
+            f.draw_image(Rectangle::new(Point::new(x, y), Size::new(w, h)), &handle);
+        }
+    });
+}
+
 /// Paints one pane's terminal content into `rect`, in frame-local coordinates.
 pub(crate) fn paint_pane(
     frame: &mut Frame,
@@ -169,6 +234,7 @@ pub(crate) fn paint_pane(
         render_state,
         row_it,
         cell_it,
+        images,
     } = scratch;
 
     let cw = cell.w;
@@ -192,6 +258,15 @@ pub(crate) fn paint_pane(
         Size::new(rect.width, rect.height),
         default_bg,
     );
+
+    // Kitty images: the two lower layers go under the cells, AboveText goes over
+    // them. Everything is clipped to the pane body, so a placement can never
+    // paint on the pane's frame stroke.
+    let boxes = placement_boxes(&term.term, cell);
+    let body = PaneBody { bounds: rect, padding };
+    for layer in [graphics::Layer::BelowBg, graphics::Layer::BelowText] {
+        paint_placement_layer(frame, images, &term.term, &boxes, body, layer);
+    }
 
     let mut rows = match row_it.update(&snapshot) {
         Ok(it) => it,
@@ -335,6 +410,17 @@ pub(crate) fn paint_pane(
         );
     }
 
+    // Placements in the top layer belong over the cells; see the note on the
+    // lower layers above.
+    paint_placement_layer(
+        frame,
+        images,
+        &term.term,
+        &boxes,
+        body,
+        graphics::Layer::AboveText,
+    );
+
     if debug {
         eprintln!(
             "[paint] pane={pane_id:?} rect=({:.1},{:.1} {:.1}x{:.1}) selected_cells={selected_cells} matches={}",
@@ -440,6 +526,63 @@ fn strip_ignorables(s: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghostwave::term::PlacementBox;
+    use libghostty_vt::kitty::graphics::Layer;
+
+    /// The image pass draws inside the pane body, so its ink cannot reach the
+    /// frame stroke.
+    ///
+    /// `paint_pane` gives the pass the pane's rect and the padding the frame
+    /// reserves, and a placement's own geometry starts at the text origin — so
+    /// the destination has to carry that inset. RED first: `PlacementBox` and
+    /// the pass did not exist when this test was written.
+    #[test]
+    fn an_image_is_drawn_inside_the_pane_body() {
+        let pane = (40.0, 12.0);
+        let (pane_w, pane_h) = (300.0, 200.0);
+        let padding = 6.0;
+        let b = PlacementBox {
+            image_id: 1,
+            x: 0.0,
+            y: 0.0,
+            w: 20.0,
+            h: 10.0,
+            source: (0, 0, 20, 10),
+            z: 0,
+            layer: Layer::AboveText,
+        };
+
+        let (x, y, w, h) = placement_rect(&b, pane, padding);
+        assert!(
+            x >= pane.0 + padding,
+            "image ink at x={x} starts left of the body inset {}",
+            pane.0 + padding
+        );
+        assert!(
+            y >= pane.1 + padding,
+            "image ink at y={y} starts above the body inset {}",
+            pane.1 + padding
+        );
+        assert!(
+            x + w <= pane.0 + pane_w - padding,
+            "image ink ends past the body's right edge"
+        );
+        assert!(
+            y + h <= pane.1 + pane_h - padding,
+            "image ink ends past the body's bottom edge"
+        );
+
+        // A placement scrolled partly off the top keeps the same origin: the
+        // negative offset shifts it, it does not drop the inset.
+        let scrolled = PlacementBox {
+            x: -3.0,
+            y: -5.0,
+            ..b
+        };
+        let (sx, sy, ..) = placement_rect(&scrolled, pane, padding);
+        assert_eq!(sx, pane.0 + padding - 3.0, "the body inset still applies");
+        assert_eq!(sy, pane.1 + padding - 5.0, "the body inset still applies");
+    }
 
     /// The marker's ink stays on the canvas, whatever the font makes a cell.
     ///
