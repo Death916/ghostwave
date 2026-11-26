@@ -16,7 +16,7 @@ use libghostty_vt::{
     Error as VtError,
     alloc::Bytes,
     key::{self, Key, Mods},
-    kitty::graphics::{self},
+    kitty::graphics::{self, Layer, PlacementIterator},
     mouse,
     render::{CellIterator, RenderState, RowIterator},
     screen::Screen,
@@ -58,6 +58,190 @@ pub struct CellDims {
     /// Baseline offset within the cell: glyph baseline y = cell_top + baseline.
     /// Keeps glyphs and the block cursor aligned in the same cell.
     pub baseline: f32,
+}
+
+/// Where one kitty placement puts its image on a pane's surface.
+///
+/// Geometry is in pane-local CSS pixels: `x`/`y` start at the terminal's text
+/// origin (the pane rect plus its padding) and are negative when the placement
+/// has partly scrolled off the top or left. `w`/`h` are the placement's rendered
+/// pixel size, which is the image's own pixel size unless the client asked for a
+/// cell grid.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlacementBox {
+    pub image_id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Source rectangle in image pixels: `(x, y, width, height)`.
+    pub source: (u32, u32, u32, u32),
+    pub z: i32,
+    pub layer: Layer,
+}
+
+/// Every placement the terminal is currently showing, in storage order.
+///
+/// Placements scrolled out of the viewport and virtual (unicode-placeholder)
+/// ones are skipped. Any error yields an empty list rather than propagating: a
+/// pane must not lose its text because one placement could not be read.
+pub fn placement_boxes(term: &Terminal<'_, '_>, cell: CellDims) -> Vec<PlacementBox> {
+    let Ok(graphics) = term.kitty_graphics() else {
+        return Vec::new();
+    };
+    let Ok(mut placements) = PlacementIterator::new() else {
+        return Vec::new();
+    };
+    let Ok(mut iter) = placements.update(&graphics) else {
+        return Vec::new();
+    };
+
+    let mut boxes = Vec::new();
+    while let Some(p) = iter.next() {
+        let Ok(image_id) = p.image_id() else { continue };
+        let Some(image) = graphics.image(image_id) else { continue };
+        let Ok(info) = p.placement_render_info(&image, term) else { continue };
+        if !info.viewport_visible {
+            continue;
+        }
+        let Ok(z) = p.z() else { continue };
+        boxes.push(PlacementBox {
+            image_id,
+            x: info.viewport_col as f32 * cell.w,
+            y: info.viewport_row as f32 * cell.h,
+            w: info.pixel_width as f32,
+            h: info.pixel_height as f32,
+            source: (
+                info.source_x,
+                info.source_y,
+                info.source_width,
+                info.source_height,
+            ),
+            z,
+            layer: layer_of(z),
+        });
+    }
+    boxes
+}
+
+/// The kitty z-layer a placement's index falls in.
+///
+/// The boundaries are the protocol's: below everything, between background and
+/// text, and above text.
+fn layer_of(z: i32) -> Layer {
+    if z < i32::MIN / 2 {
+        Layer::BelowBg
+    } else if z < 0 {
+        Layer::BelowText
+    } else {
+        Layer::AboveText
+    }
+}
+
+/// A stored image's pixels as RGBA8, cropped to a placement's source rectangle.
+pub struct PlacementRgba {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    /// The image's content stamp; a change means these pixels are stale.
+    pub generation: u64,
+}
+
+/// The content stamp of a stored image, or `None` if it is no longer stored.
+///
+/// The stamp changes when the image is retransmitted under the same id, so a
+/// texture cache keyed on it never shows stale pixels.
+pub fn image_generation(term: &Terminal<'_, '_>, image_id: u32) -> Option<u64> {
+    let graphics = term.kitty_graphics().ok()?;
+    graphics.image(image_id)?.generation().ok()
+}
+
+/// Copy one placement's image out as RGBA8, cropped to [`PlacementBox::source`].
+///
+/// libghostty stores decoded PNGs as RGBA, but the protocol also allows raw RGB,
+/// gray and gray-alpha payloads, so every format is widened here. `None` means
+/// the image is gone or in a format we cannot read; the pane then simply paints
+/// no image for it.
+pub fn placement_rgba(term: &Terminal<'_, '_>, b: &PlacementBox) -> Option<PlacementRgba> {
+    let graphics = term.kitty_graphics().ok()?;
+    let image = graphics.image(b.image_id)?;
+    let generation = image.generation().ok()?;
+    let (w, h) = (image.width().ok()?, image.height().ok()?);
+    let format = image.format().ok()?;
+    let full = widen_rgba(format, image.data().ok()?, w, h)?;
+
+    let (sx, sy, sw, sh) = b.source;
+    let cropped = if (sx, sy, sw, sh) == (0, 0, w, h) {
+        full
+    } else {
+        crop_rgba(&full, w, h, b.source)?
+    };
+
+    Some(PlacementRgba {
+        width: sw,
+        height: sh,
+        pixels: cropped,
+        generation,
+    })
+}
+
+/// Widen a stored image's pixels to RGBA8 (`w * h * 4` bytes).
+fn widen_rgba(
+    format: graphics::ImageFormat,
+    data: &[u8],
+    w: u32,
+    h: u32,
+) -> Option<Vec<u8>> {
+    use graphics::ImageFormat;
+    let px = (w as usize).checked_mul(h as usize)?;
+    let need = match format {
+        ImageFormat::Rgba => px * 4,
+        ImageFormat::Rgb => px * 3,
+        ImageFormat::GrayAlpha => px * 2,
+        ImageFormat::Gray => px,
+        // PNG is decoded at ingest, so it is never what storage reports.
+        _ => return None,
+    };
+    if data.len() < need {
+        return None;
+    }
+    let mut out = Vec::with_capacity(px * 4);
+    match format {
+        ImageFormat::Rgba => out.extend_from_slice(&data[..need]),
+        ImageFormat::Rgb => {
+            for c in data[..need].chunks_exact(3) {
+                out.extend_from_slice(&[c[0], c[1], c[2], 255]);
+            }
+        }
+        ImageFormat::GrayAlpha => {
+            for c in data[..need].chunks_exact(2) {
+                out.extend_from_slice(&[c[0], c[0], c[0], c[1]]);
+            }
+        }
+        ImageFormat::Gray => {
+            for &g in &data[..need] {
+                out.extend_from_slice(&[g, g, g, 255]);
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// Copy `(sx, sy, sw, sh)` out of a full `w × h` RGBA buffer.
+fn crop_rgba(full: &[u8], w: u32, h: u32, source: (u32, u32, u32, u32)) -> Option<Vec<u8>> {
+    let (sx, sy, sw, sh) = source;
+    if sw == 0 || sh == 0 || sx + sw > w || sy + sh > h {
+        return None;
+    }
+    let stride = w as usize * 4;
+    let row_len = sw as usize * 4;
+    let mut out = Vec::with_capacity(row_len * sh as usize);
+    for row in 0..sh as usize {
+        let start = (sy as usize + row) * stride + sx as usize * 4;
+        out.extend_from_slice(&full[start..start + row_len]);
+    }
+    Some(out)
 }
 
 /// Session-name prefix of a remote ghostd session: `ghostwave-<host token>`.
@@ -1452,6 +1636,126 @@ mod tests {
         assert!(
             stdout.contains("CHILD-IMAGE-PRESENT=true"),
             "child did not run or did not report a stored image\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    /// A `2×2` opaque PNG: red, green, blue, yellow, row-major.
+    fn two_pixel_png_b64() -> String {
+        let mut png = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut png, 2, 2);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().expect("png header");
+            writer
+                .write_image_data(&[
+                    255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+                ])
+                .expect("png data");
+        }
+        base64(&png)
+    }
+
+    /// RED-first: `placement_boxes` did not exist when this test was written.
+    ///
+    /// A stored `2×2` PNG must become exactly one pane-local box carrying the
+    /// image's own pixel size, and a second `a=p` placement for the same image
+    /// must add a second box. Runs in a child process because
+    /// `install_png_decoder` is a one-way thread-local: installing it on the
+    /// test thread would poison `png_payload_is_rejected_without_a_decoder`.
+    #[test]
+    fn a_stored_placement_becomes_one_box() {
+        const CHILD_ENV: &str = "GHOSTWAVE_KITTY_PLACEMENT_CHILD";
+
+        let cell = CellDims {
+            w: 10.0,
+            h: 26.0,
+            baseline: 20.0,
+        };
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let exe = std::env::current_exe().expect("current_exe");
+            let out = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "term::tests::a_stored_placement_becomes_one_box",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("spawn child test process");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "the child found no placement box\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            return;
+        }
+
+        let mut term =
+            Terminal::new(TerminalOptions { cols: 80, rows: 24, max_scrollback: 100 }).unwrap();
+        term.set_kitty_image_storage_limit(64 * 1024 * 1024).unwrap();
+        // A terminal has no pixel size until a resize, and a zero cell width
+        // makes every placement zero rows tall — i.e. invisible — so the pane's
+        // own resize has to be here for the count to mean anything.
+        term.resize(80, 24, cell.w as u32, cell.h as u32).unwrap();
+        install_png_decoder().unwrap();
+
+        let mut apc = format!("\x1b_Gi=7,a=T,f=100;{}\x1b\\", two_pixel_png_b64()).into_bytes();
+        term.vt_write(&apc);
+        let boxes = placement_boxes(&term, cell);
+        println!("boxes after a=T: {boxes:?}");
+        assert_eq!(boxes.len(), 1, "one stored placement must become one box");
+        let b = &boxes[0];
+        assert_eq!(b.image_id, 7, "the box carries the placement's image id");
+        assert_eq!(
+            (b.x, b.y),
+            (0.0, 0.0),
+            "no c/r on the write, so the placement sits at the cursor origin"
+        );
+        assert_eq!(
+            (b.w, b.h),
+            (2.0, 2.0),
+            "native pixel size, in the same CSS px the pty was told about"
+        );
+
+        apc = b"\x1b_Gi=7,a=p,p=1;\x1b\\".to_vec();
+        term.vt_write(&apc);
+        let boxes = placement_boxes(&term, cell);
+        println!("boxes after a=p: {boxes:?}");
+        assert_eq!(
+            boxes.len(),
+            2,
+            "a second placement of the same image adds a second box"
+        );
+        assert!(boxes.iter().all(|b| b.image_id == 7));
+
+        // The renderer draws from this: the stored pixels must come back as
+        // RGBA8 in the order the PNG was encoded, with a live generation stamp
+        // so the texture cache can tell a retransmit from a redraw.
+        let rgba = placement_rgba(&term, &boxes[0]).expect("the stored image is readable");
+        assert_eq!((rgba.width, rgba.height), (2, 2));
+        assert_eq!(
+            rgba.pixels,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255
+            ],
+            "row-major RGBA, red green blue yellow"
+        );
+        assert!(rgba.generation > 0, "a stored image has a content stamp");
+
+        // A placement that shows only the right column gets a cropped texture.
+        let cropped = PlacementBox {
+            source: (1, 0, 1, 2),
+            ..boxes[0]
+        };
+        let rgba = placement_rgba(&term, &cropped).expect("the crop is inside the image");
+        assert_eq!((rgba.width, rgba.height), (1, 2));
+        assert_eq!(
+            rgba.pixels,
+            vec![0, 255, 0, 255, 255, 255, 0, 255],
+            "the crop takes the source rectangle, one pixel column"
         );
     }
 
