@@ -1404,8 +1404,7 @@ mod tests {
             "storage must be enabled, or this control proves nothing"
         );
 
-        let _ = term.vt_write(&kitty_png_apc(1));
-
+        term.vt_write(&kitty_png_apc(1));
         assert!(
             term.kitty_graphics().unwrap().image(1).is_none(),
             "a PNG was accepted on a thread with no decoder installed"
@@ -1425,7 +1424,7 @@ mod tests {
             // spawn=false: no shell is needed to exercise the ingest path.
             let mut pane = TermPane::new(80, 24, cell, None, &[], None, 0, 0, false, None)
                 .expect("child: TermPane::new");
-            let _ = pane.term.vt_write(&kitty_png_apc(1));
+            pane.term.vt_write(&kitty_png_apc(1));
             let present = pane
                 .term
                 .kitty_graphics()
