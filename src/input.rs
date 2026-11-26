@@ -2602,4 +2602,25 @@ mod tests {
 
         assert_eq!(toast(&s), ghostwave::build_info::summary());
     }
+
+    #[test]
+    fn a_replay_sized_ingest_leaves_the_next_key_working() {
+        let mut s = state();
+
+        // One maximal output update, exactly as the bridge now delivers it.
+        {
+            let pane = s.active_pane().expect("a terminal pane");
+            let mut guard = pane.lock().unwrap();
+            guard.ingest(&vec![b'x'; 32 * 1024]);
+        }
+        fill_scrollback(&mut s, 100);
+
+        let (_, before, _) = scrollbar(&s);
+        press(&mut s, Key::PageUp, Mods::SHIFT);
+        let (_, after, _) = scrollbar(&s);
+        assert!(
+            after < before,
+            "the key after a 32 KiB ingest is still dispatched: {before} -> {after}"
+        );
+    }
 }
