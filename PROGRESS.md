@@ -1588,3 +1588,68 @@ hid.
   `nix-shell --run 'cargo run'`, then `kitten icat ~/Pictures/sac.png` (PNG inside the pane, cursor
   advances, no error text) and `kitten icat --place 40x20@10x5 ~/Pictures/sac.png`. After sitting 2,
   not now.
+
+### Kitty graphics: nothing painted a placement, now the pane draws them (card `t_18deeb61`, 2026-11-26)
+
+relay: job=t_deccf588 — chain A, sitting 2 of 2
+
+With the decoder wired in sitting 1 a PNG is finally *stored* — and still invisible, because nothing
+in the tree iterated `Terminal::kitty_graphics()`. This sitting is the painting half:
+
+- **`term::placement_boxes(term, cell)`** walks `kitty_graphics()` → `PlacementIterator::new()` →
+  `update()` → `next()`, skips `!viewport_visible` (and therefore virtual unicode-placeholder
+  placements), and converts each `PlacementRenderInfo` into a pane-local `PlacementBox`: `x/y` from
+  the viewport cell grid times the cell size (negative when scrolled partly off — kept, the crate's
+  own docs say to use them directly), `w/h` the rendered pixel size, `source` the resolved source
+  rect, plus `z` and its kitty layer. Every error becomes an empty list: a pane must not lose its
+  text because one placement could not be read.
+- **`term::placement_rgba`** copies a placement's pixels out as RGBA8 (widening `Rgb`/`Gray`/
+  `GrayAlpha`; decoded PNGs are already RGBA) and crops them to the source rect, which is what lets a
+  scrolled placement draw only the visible part — `Frame::draw_image` has no source rectangle.
+- **`pane::ImageCache`**, owned by `RenderScratch`, caches `image::Handle`s keyed by image id plus
+  source rect and invalidated by `Image::generation()`, LRU-capped at 32 entries so 64 MiB of stored
+  images cannot become an unbounded pile of GPU textures.
+- **`paint_pane`** draws them in the canvas' own coordinate space: `BelowBg`/`BelowText` after the
+  background fill and before the cells, `AboveText` after them, the whole pass inside
+  `frame.with_clip(body)`, where `body` is the pane rect inset by its padding. Image ink therefore
+  cannot reach the frame stroke, which is what keeps this chain from re-opening the frame chain.
+
+Measurements and tests (both new tests RED first, as required):
+
+- `term::tests::a_stored_placement_becomes_one_box` — a `2×2` PNG written as `a=T,i=7,f=100` becomes
+  exactly one box at the cursor origin with `w == 2`, `h == 2`, source `(0,0,2,2)`, layer
+  `AboveText`; a second `a=p` placement adds a second box; `placement_rgba` returns the pixels in
+  encoding order and the cropped half correctly. **RED**: at the start of this sitting the test did
+  not compile — `error[E0425]: cannot find function 'placement_boxes' in this scope` (src/term.rs).
+  It runs its body in a re-exec'd child (`GHOSTWAVE_KITTY_PLACEMENT_CHILD=1`) because
+  `install_png_decoder` is a one-way thread-local and installing it on the test thread would poison
+  `png_payload_is_rejected_without_a_decoder`.
+- `pane_canvas::tests::an_image_is_drawn_inside_the_pane_body` — the draw pass' destination for a
+  placement sits inside the pane rect inset by `padding`, on all four edges, and a scrolled placement
+  keeps that inset. **RED**: `error[E0425]: cannot find function 'placement_rect' in this scope`.
+- Two measured facts the test pins, both surprises worth recording: a raw `Terminal` has **no pixel
+  size until it is resized**, and a zero cell height makes `gridSize` return 0 rows, which makes
+  every placement `viewport_visible == false`; and `c=2,r=1` on a native `2×2` image renders
+  `cell_width × 2` by `cell_height` px, not the image's own pixels, so the pixel-size assertion uses
+  the native-size write.
+- **Suite**: 296 passed / 0 failed (95 lib + 194 bin + 1 `flood_throughput` + 6 `term_core` + 0 doc),
+  the base 294 + the two tests above. `ghostd` stays outside this count (12 `#[test]`).
+- **clippy**: `cargo clippy --all-targets` rc 0, 93 warnings — the base count, no new warning site
+  (the image pass takes its geometry in one struct precisely so it does not add a
+  too-many-arguments site).
+- **Dependency-tree disclosure**: drawing needs `canvas::Frame::draw_image`, which exists only behind
+  iced's `image` feature, so `Cargo.toml` now enables `image-without-codecs` on the `iced` already
+  there. No direct dependency was added, but the lockfile does grow by `kamadak-exif` and
+  `mutate_once` (pulled transitively by `iced_graphics`' image feature). The plan's "no new
+  dependency" line assumed the feature was free; it is not, and this is where it shows.
+- **Not in this sitting** (stated in the commit too): animation frames, unicode-placeholder
+  placements, `kitten icat --place` tiling; no change to how frames are drawn; no compositor work.
+- **Known limitation, measured**: iced composites *all* canvas images before *all* canvas text
+  (`iced_wgpu` `draw_geometry`: meshes → images → text), so an `AboveText` placement still sits under
+  the pane's glyphs. On blank cells — the `kitten icat` case — the image is fully visible; over
+  already-printed text the text shows through. Fixing that needs a different surface, not a bigger
+  diff here.
+- **NEEDS-OWNER-VERIFY** (§7.2, cannot run on orac — no `kitten`/`kitty`, no `DISPLAY`):
+  `nix-shell --run 'cargo run'`, then `kitten icat ~/Pictures/sac.png` (the PNG appears inside the
+  pane, clipped to it, cursor advances, no error text) and
+  `kitten icat --place 40x20@10x5 ~/Pictures/sac.png` (inside the pane, never over a stroke).
