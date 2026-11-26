@@ -3,8 +3,8 @@
 //! See the `ghostd` library for the shared machinery.
 
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, OpenOptions},
+    io::Write,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::net::{UnixListener, UnixStream},
@@ -30,11 +30,11 @@ use nix::{
 use ghostd::{
     bind_listener, clear_tombstone, daemonize, dcs_size_msg, die, fd_poll, fd_read, gdbg,
     install_term_handler, is_killed, kill_child_group, killed_path, log_path, pid_gone,
-    probe_session, read_pidfile, recover_session, remove_state_if_owned, set_nonblock,
-    set_term_size, socket_path, spawn_child, state_dir, term_size, truncate_log_front,
-    write_all_blocking, write_pidfile, write_tombstone, write_tombstone_none, ATTACH_ENDED,
-    ATTACH_KILLED, ATTACH_NO_SESSION, ATTACH_WEDGED, DEFAULT_FIRST_ATTACH_SECS, DEFAULT_LOG_CAP_MB,
-    KILL_SUPERSEDED, Probe, TERM_REQUESTED, VERSION,
+    probe_session, read_pidfile, recover_session, remove_state_if_owned, replay_tail,
+    set_nonblock, set_term_size, socket_path, spawn_child, state_dir, term_size,
+    truncate_log_front, write_all_blocking, write_pidfile, write_tombstone, write_tombstone_none,
+    ATTACH_ENDED, ATTACH_KILLED, ATTACH_NO_SESSION, ATTACH_WEDGED, DEFAULT_FIRST_ATTACH_SECS,
+    DEFAULT_LOG_CAP_MB, KILL_SUPERSEDED, Probe, REPLAY_TAIL_BYTES, TERM_REQUESTED, VERSION,
 };
 
 fn eprintln_exit(msg: &str) -> ! {
@@ -208,20 +208,11 @@ fn handle_client(
         return;
     }
 
-    // 3. Replay the log (history continuity, including the drop-gap).
-    if let Ok(mut f) = File::open(log_file) {
-        let mut buf = [0u8; 32768];
-        loop {
-            match f.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if write_all_blocking(stream.as_raw_fd(), &buf[..n]).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+    // 3. Replay a bounded tail of the log — history continuity without wedging
+    //    the attach on a huge scrollback (or re-replaying it on every retry).
+    let replay = replay_tail(log_file, REPLAY_TAIL_BYTES);
+    if !replay.is_empty() && write_all_blocking(stream.as_raw_fd(), &replay).is_err() {
+        return;
     }
     gdbg("daemon", &format!("{name}: client attached, relaying"));
 
